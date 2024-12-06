@@ -1,6 +1,23 @@
-# [`memchr`](https://github.com/BurntSushi/memchr) vs [`stringzilla`](https://github.com/ashvardanian/StringZilla)
+# StringWa.rs
 
-## Rust Substring Search Benchmarks 
+![StringWa.rs Thumbnail](https://github.com/ashvardanian/ashvardanian/blob/master/repositories/StringWa.rs.jpg?raw=true)
+
+_Not to pick a fight, but let there be String Wars!_ 😅
+Jokes aside, many __great__ libraries for string processing exist.
+_Mostly, of course, written in C and C++, but some in Rust as well._ 😅
+
+Where Rust decimates C and C++, however, is dependency management, making it perfect for comparing different systems-level projects to each other!
+So, to accelerate the development of the [`stringzilla`](https://github.com/ashvardanian/StringZilla) C library, I've created this repository to compare it against:
+
+- [`memchr`](https://github.com/BurntSushi/memchr) for substring search.
+- [`rapidfuzz`](https://github.com/rapidfuzz/rapidfuzz-rs) for edit distances.
+- [`aHash`](https://github.com/tkaitchuck/aHash) for hashing.
+- [`aho_corasick`](https://github.com/BurntSushi/aho-corasick) for multi-pattern search.
+
+Of course, the functionality of the projects is different, as are the APIs and the usage patterns.
+So, I focus on the workloads for which StringZilla was designed and compare the throughput of the core operations.
+
+## Substring Search Benchmarks 
 
 Substring search is one of the most common operations in text processing, and one of the slowest.
 StringZilla was designed to supersede LibC and implement those core operations in CPU-friendly manner, using branchless operations, SWAR, and SIMD assembly instructions.
@@ -31,7 +48,7 @@ Before running benchmarks, you can test your Rust environment running:
 
 ```bash
 cargo install cargo-criterion --locked
-HAYSTACK_PATH=README.md cargo criterion --jobs 8
+HAYSTACK_PATH=README.md cargo criterion bench_find --jobs 8
 ```
 
 On Windows using PowerShell you'd need to set the environment variable differently:
@@ -46,6 +63,8 @@ In every benchmark iteration, a new "needle" is taken from that array of tokens.
 All inclusions of that token in the haystack are counted, and the throughput is calculated.
 This generally results in very stable and predictable results.
 The benchmark also includes a warm-up, to ensure that the CPU caches are filled and the results are not affected by cold start or SIMD-related frequency scaling.
+
+## Datasets
 
 ### ASCII Corpus
 
