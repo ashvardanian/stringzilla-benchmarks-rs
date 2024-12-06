@@ -1,6 +1,7 @@
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 use std::env;
 use std::fs;
+
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
 use memchr::memmem;
 use stringzilla::StringZilla;
@@ -12,11 +13,11 @@ fn configure_bench() -> Criterion {
         .measurement_time(std::time::Duration::from_secs(120)) // Actual measurement time.
 }
 
-fn benchmarks(c: &mut Criterion) {
+fn bench_find(c: &mut Criterion) {
     // Get the haystack path from the environment variable.
-    let haystack_path =
-        env::var("HAYSTACK_PATH").expect("HAYSTACK_PATH environment variable not set");
-    let haystack_content = fs::read_to_string(&haystack_path).expect("Could not read haystack");
+    let dataset_path =
+        env::var("STRINGWARS_DATASET").expect("STRINGWARS_DATASET environment variable not set");
+    let haystack_content = fs::read_to_string(&dataset_path).expect("Could not read haystack");
 
     // Tokenize the haystack content by white space.
     let needles: Vec<&str> = haystack_content.split_whitespace().collect();
@@ -117,8 +118,8 @@ fn perform_reverse_benchmarks(
 }
 
 criterion_group! {
-    name = sz_bench;
+    name = bench_find_group;
     config = configure_bench();
-    targets = benchmarks
+    targets = bench_find
 }
-criterion_main!(sz_bench);
+criterion_main!(bench_find_group);
