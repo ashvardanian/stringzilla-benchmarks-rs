@@ -6,12 +6,14 @@ edition = "2018"
 [dependencies]
 rand = "0.8.5"
 criterion = "0.5.1"
-stringzilla = { version = "3.3.0" }
+# stringzilla = { version = "3.3.0" }
+stringzilla = { path = "../StringZilla-dev" }
 
 # Feature-based dependencies for benchmarks
 [features]
 bench_find = ["memchr"]
 bench_levenshtein = ["rapidfuzz"]
+bench_hash = ["ahash", "xxhash-rust"]
 
 [dependencies.memchr]
 version = "2.7.1"
@@ -21,6 +23,15 @@ optional = true
 [dependencies.rapidfuzz]
 version = "0.5.0"
 optional = true
+
+[dependencies.ahash]
+version = "0.8"
+optional = true
+
+[dependencies.xxhash-rust]
+version = "0.8"
+optional = true
+features = ["xxh3", "const_xxh3"]
 
 [[bench]]
 name = "bench_find"
@@ -33,3 +44,9 @@ name = "bench_levenshtein"
 path = "bench_levenshtein.rs"
 harness = false
 required-features = ["bench_levenshtein"]
+
+[[bench]]
+name = "bench_hash"
+path = "bench_hash.rs"
+harness = false
+required-features = ["bench_hash"]

@@ -1,9 +1,10 @@
 {
   "cSpell.words": [
-    "stringwars",
     "memchr",
     "memmem",
+    "rapidfuzz",
     "rfind",
+    "stringwars",
     "stringzilla"
   ]
 }

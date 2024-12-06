@@ -66,9 +66,13 @@ To run them on Linux and MacOS, pass the dataset path as an environment variable
 - Edit Distance:
 
     ```bash
-    STRINGWARS_MODE=lines STRINGWARS_DATASET=README.md cargo criterion --features bench_levenshtein bench_levenshtein --jobs 8
-    STRINGWARS_MODE=words STRINGWARS_DATASET=README.md cargo criterion --features bench_levenshtein bench_levenshtein --jobs 8
+    STRINGWARS_MODE=lines STRINGWARS_ERROR_BOUND=15 STRINGWARS_DATASET=README.md cargo criterion --features bench_levenshtein bench_levenshtein --jobs 8
+    STRINGWARS_MODE=words STRINGWARS_ERROR_BOUND=15 STRINGWARS_DATASET=README.md cargo criterion --features bench_levenshtein bench_levenshtein --jobs 8
     ```
+
+    Edit distance benchmarks compute the Levenshtein distance between consecutive pairs of whitespace-delimited words or newline-delimited lines.
+    They include byte-level and character-level operations and also run for the bounded case - when the maximum allowed distance is predefined.
+    By default, the maximum allowed distance is set to 15% of the longer string in each pair.
 
 - Hashing:
 
