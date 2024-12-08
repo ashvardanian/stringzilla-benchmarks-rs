@@ -5,6 +5,7 @@
     "rapidfuzz",
     "rfind",
     "stringwars",
-    "stringzilla"
+    "stringzilla",
+    "tfidf"
   ]
 }

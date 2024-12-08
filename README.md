@@ -13,6 +13,7 @@ So, to accelerate the development of the [`stringzilla`](https://github.com/ashv
 - [`rapidfuzz`](https://github.com/rapidfuzz/rapidfuzz-rs) for edit distances.
 - [`aHash`](https://github.com/tkaitchuck/aHash) for hashing.
 - [`aho_corasick`](https://github.com/BurntSushi/aho-corasick) for multi-pattern search.
+- [`tantivy`](https://github.com/quickwit-oss/tantivy) for document retrieval.
 
 Of course, the functionality of the projects is different, as are the APIs and the usage patterns.
 So, I focus on the workloads for which StringZilla was designed and compare the throughput of the core operations.
@@ -81,6 +82,15 @@ To run them on Linux and MacOS, pass the dataset path as an environment variable
     STRINGWARS_MODE=lines STRINGWARS_DATASET=README.md cargo criterion --features bench_hash bench_hash --jobs 8
     STRINGWARS_MODE=words STRINGWARS_DATASET=README.md cargo criterion --features bench_hash bench_hash --jobs 8
     ```
+
+- Document retrieval with [TF-IDF](https://en.wikipedia.org/wiki/Tf%E2%80%93idf):
+
+    ```bash
+    STRINGWARS_DATASET=README.md cargo criterion --features bench_tfidf bench_tfidf --jobs 8
+    ```
+
+    The TF-IDF benchmarks compute the term frequency-inverse document frequency for each word in the input file.
+    The benchmark relies on a hybrid of StringZilla and SimSIMD to achieve the best performance.
 
 On Windows using PowerShell you'd need to set the environment variable differently:
 
