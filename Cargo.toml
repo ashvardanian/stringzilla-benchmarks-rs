@@ -1,15 +1,52 @@
 [package]
-name = "memchr_vs_stringzilla"
+name = "stringwars"
 version = "0.1.0"
 edition = "2018"
 
 [dependencies]
 rand = "0.8.5"
 criterion = "0.5.1"
-memchr = { version = "2.7.1", default-features = false }
-stringzilla = { version = "3.3.0" }
+# stringzilla = { version = "3.3.0" }
+stringzilla = { path = "../StringZilla-dev" }
+
+# Feature-based dependencies for benchmarks
+[features]
+bench_find = ["memchr"]
+bench_levenshtein = ["rapidfuzz"]
+bench_hash = ["ahash", "xxhash-rust"]
+
+[dependencies.memchr]
+version = "2.7.1"
+default-features = false
+optional = true
+
+[dependencies.rapidfuzz]
+version = "0.5.0"
+optional = true
+
+[dependencies.ahash]
+version = "0.8"
+optional = true
+
+[dependencies.xxhash-rust]
+version = "0.8"
+optional = true
+features = ["xxh3", "const_xxh3"]
 
 [[bench]]
-name = "bench"
+name = "bench_find"
+path = "bench_find.rs"
 harness = false
-path = "bench.rs"
+required-features = ["bench_find"]
+
+[[bench]]
+name = "bench_levenshtein"
+path = "bench_levenshtein.rs"
+harness = false
+required-features = ["bench_levenshtein"]
+
+[[bench]]
+name = "bench_hash"
+path = "bench_hash.rs"
+harness = false
+required-features = ["bench_hash"]
