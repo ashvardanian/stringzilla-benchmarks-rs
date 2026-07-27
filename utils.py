@@ -1,14 +1,21 @@
-"""
-Shared utilities for StringWars Python benchmarking scripts.
+"""Shared harness for the StringWars Python suites. Mirrors `utils.rs`."""
 
-Common functions for dataset loading, tokenization, timing, and argument parsing
-used across bench_find.py, bench_hash.py, and other benchmarking scripts.
-"""
-
+import math
 import os
 import re
 import time
+import tomllib
+import zlib
+from collections import Counter, deque
 from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Literal
+
+# Closed vocabularies, mirroring the Rust enums. `Literal` rather than `Enum`: it
+# costs nothing at runtime and keeps call sites spelling `report="bytes"`.
+ReportUnit = Literal["bytes", "cups", "hashes", "bits", "comparisons"]
+TokensMode = Literal["lines", "words", "file"]
+RowStatus = Literal["ok", "refused", "skipped", "filtered"]
 
 # region: Environment Variable Helpers
 # Standardized functions for fetching environment variables consistently.
@@ -39,20 +46,6 @@ def get_env_parsed[T](name: str, default: T, parser: Callable[[str], T] = int) -
         return default
 
 
-def get_env_parsed_opt[T](name: str, parser: Callable[[str], T] = int) -> T | None:
-    """
-    Get an optional environment variable parsed to a type.
-    Returns None if the variable is not set or cannot be parsed.
-    """
-    value = os.environ.get(name)
-    if value is None:
-        return None
-    try:
-        return parser(value)
-    except (ValueError, TypeError):
-        return None
-
-
 def get_env_bool(name: str) -> bool:
     """
     Get a boolean environment variable.
@@ -66,125 +59,27 @@ def get_env_bool(name: str) -> bool:
 # endregion: Environment Variable Helpers
 
 
-def now_nanoseconds() -> int:
-    """Get current time in nanoseconds for benchmarking."""
-    return time.monotonic_ns()
+_FILTER: re.Pattern[str] | None = None
+
+
+def set_filter(expression: str | None) -> None:
+    """Compile `STRINGWARS_FILTER` once, at startup, for the whole process."""
+    global _FILTER
+    _FILTER = re.compile(expression) if expression else None
 
 
 # region: Benchmark loop profile
 
-# Reporting stride: the smallest number of operations to run between progress logging
-# and clock reads, so the cost of terminal rendering and timer syscalls is amortized
-# away. This is independent of batch size. Benchmarks come in two shapes:
-#
-# - One item at a time: a single element per call, logged every LOGGING_STEP calls.
-# - Batched: many items per call, where one batch already spans many items.
-#
-# Batched benchmarks use clamped_subranges to slice the input and hand each slice to a
-# kernel that consumes a whole batch. One-at-a-time benchmarks use paced_items, which
-# walks a single iterator and checks the clock from inside the loop, so it never builds
-# a slice and works on any iterable.
-LOGGING_STEP = 1024
+# Default window for suites whose kernel consumes a batch rather than one item.
+# This is a batching knob, not a pacing one: the clock is read twice per sample and
+# never inside a window, so the window size cannot affect timing overhead.
 
 
-def clamped_subranges(count: int, stride: int = LOGGING_STEP):
-    """Yield (low, high) index windows covering [0, count) in stride-sized steps.
-
-    Used by the batched benchmarks: slice the input with the returned indices, hand
-    each slice to a kernel, then read the clock and repaint progress once per window.
-    Pass stride explicitly to use the batch size as the window.
-    """
-    for low in range(0, count, stride):
-        yield low, min(low + stride, count)
-
-
-# Target wall-time between deadline clock reads in paced_items. The clock read costs tens of
-# nanoseconds, so reading it once per ~1 ms of work keeps its overhead negligible (~0.01%).
-PACING_TARGET_BETWEEN_CHECKS_NS = 1_000_000
-
-
-def paced_items(items, deadline_nanoseconds: int, step: int = LOGGING_STEP, progress=None):
-    """Yield items from a single iterator, checking the deadline from inside the loop.
-
-    The companion to clamped_subranges for one-at-a-time benchmarks. It walks one
-    iterator, repainting progress every step items, and stops once the deadline passes.
-    Works on any iterable, such as a list, a zip of two lists, or an itertools.cycle,
-    and never builds a slice.
-
-    The cadence is *adaptive* rather than a fixed step. A fixed step would either read the
-    clock too often on fine-grained items (e.g. hashing words) or overshoot the time limit
-    on few-but-huge items (e.g. one whole file in `file` tokenization mode, where there is a
-    single item). So `stride` — the number of items between checkpoints — starts at 1 and
-    doubles toward `step` whenever a stride ran faster than `PACING_TARGET_BETWEEN_CHECKS_NS`:
-    cheap items climb to the fully-amortized `step`, while a slow item leaves `stride` at 1
-    and is checked every iteration, so the deadline cannot overshoot by more than one item.
-    Progress repaint and the deadline check share the checkpoint, so the hot path is a single
-    countdown — the same per-item cost as a non-adaptive loop.
-    """
-    stride = 1  # items between checkpoints; doubles toward `step` for cheap items
-    countdown = 1
-    last_check_nanoseconds = now_nanoseconds()
-    for item in items:
-        yield item
-        countdown -= 1
-        if countdown:
-            continue
-        current_nanoseconds = now_nanoseconds()
-        if progress is not None:
-            progress.update(stride)
-        if current_nanoseconds >= deadline_nanoseconds:
-            return
-        if current_nanoseconds - last_check_nanoseconds < PACING_TARGET_BETWEEN_CHECKS_NS and stride < step:
-            stride = min(stride * 2, step)
-        last_check_nanoseconds = current_nanoseconds
-        countdown = stride
-
-
-def reduce_in_windows(
-    function,
-    *columns,
-    deadline_nanoseconds: int,
-    step: int = LOGGING_STEP,
-    combine=sum,
-    progress=None,
-):
-    """Apply function across the zipped columns one window at a time and reduce each window.
-
-    The shared home for the trick of pushing a per-item loop into C: every window is
-    handled by combine(map(...)), so the function calls and the reduction run in C with
-    no Python bytecode per item, and the deadline and optional progress are checked once
-    per window. This runs about 1.5 to 1.9 times faster than an explicit Python loop on
-    real kernels, but only when the body is "call a function on each item and reduce the
-    results" with no per-item side effect.
-
-    The window size is *adaptive*, exactly like paced_items: it starts at 1 and doubles toward
-    `step` whenever a window ran faster than PACING_TARGET_BETWEEN_CHECKS_NS. A window of
-    few-but-huge items (e.g. one full-haystack find per call) stays small, so the deadline is
-    re-checked promptly and cannot overshoot by more than one window's worth of a single item;
-    cheap items climb to the fully-amortized `step` and keep the C-map speedup.
-
-    Pass several equal-length sequences to vary more than one argument, for example two
-    string columns. Pin a fixed argument with a leading functools.partial or a constant
-    column such as [fixed] * n. Returns (reduced_total, processed_count).
-    """
-    count = min((len(column) for column in columns), default=0)
-    total = 0
-    low = 0
-    window = 1  # items per checkpoint; doubles toward `step` for cheap items
-    last_check_nanoseconds = now_nanoseconds()
-    while low < count:
-        if now_nanoseconds() >= deadline_nanoseconds:
-            break
-        high = min(low + window, count)
-        total += combine(map(function, *(column[low:high] for column in columns)))
-        if progress is not None:
-            progress.update(high - low)
-        current_nanoseconds = now_nanoseconds()
-        if current_nanoseconds - last_check_nanoseconds < PACING_TARGET_BETWEEN_CHECKS_NS and window < step:
-            window = min(window * 2, step)
-        last_check_nanoseconds = current_nanoseconds
-        low = high
-    return total, low
+def resolve_core_count(available: int | None = None) -> int:
+    """Logical cores for a multi-core scope, overridable with `STRINGWARS_CPU_CORES`."""
+    available = available or os.cpu_count() or 1
+    override = get_env_parsed("STRINGWARS_CPU_CORES", 0)
+    return max(1, override if override > 0 else available)
 
 
 def items_per_core(base: int | None = None, default_base: int = 128) -> int:
@@ -230,7 +125,9 @@ def gpu_multiprocessor_count(device_index: int = 0) -> int | None:
             continue
         count = ctypes.c_int(0)
         status = library.cudaDeviceGetAttribute(
-            ctypes.byref(count), ctypes.c_int(multiprocessor_count_attribute), ctypes.c_int(device_index)
+            ctypes.byref(count),
+            ctypes.c_int(multiprocessor_count_attribute),
+            ctypes.c_int(device_index),
         )
         if status == 0 and count.value > 0:
             return count.value
@@ -277,136 +174,106 @@ def format_si_rate(rate: float, unit: str, space_before_unit: bool) -> str:
     return f"{value:.2f} {prefix} {unit}" if space_before_unit else f"{value:.2f} {prefix}{unit}"
 
 
-def format_seconds(value_seconds: float) -> str:
-    """Render a duration with an appropriate sub-second unit, matching the Rust reporter."""
-    if value_seconds < 1e-6:
-        return f"{value_seconds * 1e9:.2f} ns"
-    if value_seconds < 1e-3:
-        return f"{value_seconds * 1e6:.2f} µs"
-    if value_seconds < 1.0:
-        return f"{value_seconds * 1e3:.2f} ms"
-    return f"{value_seconds:.2f} s"
-
-
-def report_stats(
-    name: str,
-    report: str,
-    elapsed_seconds: float,
-    elements: int,
-    total_bytes: int,
-    latencies_seconds: list[float] | None = None,
-) -> None:
-    """Print the single canonical result line for one variant.
-
-    `report` selects the primary unit: "bytes", "cups", "hashes", "bits", or "comparisons". bytes/s is
-    always shown as the secondary metric (unless the primary already is bytes/s). Columns are
-    joined by " | " in a fixed order, and columns that cannot be computed are omitted, never
-    reformatted, so the layout matches the Rust harness line-for-line.
-    """
-    seconds = max(elapsed_seconds, 1e-12)
-    columns: list[str] = []
-
-    elements_per_second = elements / seconds
-    bytes_per_second = total_bytes / seconds
-    if report == "bytes":
-        columns.append(format_byte_rate(bytes_per_second))
-    elif report == "cups":
-        columns.append(format_si_rate(elements_per_second, "CUPS", False))
-    elif report == "hashes":
-        columns.append(format_si_rate(elements_per_second, "hashes/s", True))
-    elif report == "bits":
-        columns.append(format_si_rate(elements_per_second, "bits/s", True))
-    elif report == "comparisons":
-        columns.append(format_si_rate(elements_per_second, "cmp/s", True))
-    else:
-        raise ValueError(f"Unknown report unit: {report!r}")
-
-    if report != "bytes" and total_bytes > 0:
-        columns.append(format_byte_rate(bytes_per_second))
-
-    if latencies_seconds:
-        ordered = sorted(latencies_seconds)
-
-        def quantile(fraction: float) -> float:
-            rank = round(fraction * (len(ordered) - 1))
-            return ordered[min(rank, len(ordered) - 1)]
-
-        columns.append(f"p50 {format_seconds(quantile(0.5))} p99 {format_seconds(quantile(0.99))}")
-
-    print(f"{name:<{REPORT_NAME_WIDTH}} {' | '.join(columns)}")
-
-
 # endregion: Reporting
 
 
 def parse_size(size_str: str) -> int:
     """
-    Parse a size string like '128mb', '1gb', '500kb' into bytes.
+    Parse a size string like '128MB', '1GB', '500kB' into bytes.
 
-    Supports: b, kb, mb, gb (case insensitive)
-    Returns size in bytes.
+    Decimal SI, matching how throughput is reported: 1 kB = 1000 B. The previous
+    implementation was 1024-based while `scale_si` renders 1000-based, so a
+    '128mb' budget read 134,217,728 bytes and printed as "134.22 MB".
     """
     if not size_str:
         raise ValueError("Size string cannot be empty")
 
-    # Match number followed by optional unit
     match = re.match(r"^(\d+(?:\.\d+)?)\s*(b|kb|mb|gb)?$", size_str.lower().strip())
     if not match:
-        raise ValueError(f"Invalid size format: {size_str}. Use formats like '128mb', '1gb', '500kb'")
+        raise ValueError(f"Invalid size format: {size_str}. Use formats like '128MB', '1GB', '500kB'")
 
     number, unit = match.groups()
-    number = float(number)
-
-    # Convert to bytes
-    multipliers = {
-        None: 1,
-        "b": 1,
-        "kb": 1024,
-        "mb": 1024 * 1024,
-        "gb": 1024 * 1024 * 1024,
-    }
-
-    return int(number * multipliers[unit])
+    multipliers = {None: 1, "b": 1, "kb": 1000, "mb": 1000**2, "gb": 1000**3}
+    return int(float(number) * multipliers[unit])
 
 
-def load_dataset(
-    dataset_path: str | None = None,
-    as_bytes: bool = False,
-    size_limit: str | None = None,
-) -> str | bytes:
-    """
-    Load dataset from file path or environment variable.
+# region: Manifest
 
-    Args:
-        dataset_path: Path to dataset file (uses STRINGWARS_DATASET env var if None)
-        as_bytes: If True, return bytes; if False, return str
-        size_limit: Maximum size to read (e.g., "128mb", "1gb"). If None, read entire file.
 
-    Returns:
-        Dataset contents as str or bytes based on as_bytes parameter
-    """
-    if dataset_path is None:
-        dataset_path = get_env("STRINGWARS_DATASET")
-        if dataset_path is None:
-            raise ValueError("No dataset path provided and STRINGWARS_DATASET not set")
+def manifest() -> dict:
+    """`stringwars.toml` — the single source of defaults shared with `utils.rs`."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stringwars.toml")
+    with open(path, "rb") as handle:
+        return tomllib.load(handle)
 
-    # Parse size limit if provided
-    max_bytes = None
-    if size_limit:
-        max_bytes = parse_size(size_limit)
 
-    if as_bytes:
-        with open(dataset_path, "rb") as f:
-            if max_bytes is not None:
-                return f.read(max_bytes)
-            else:
-                return f.read()
-    else:
-        with open(dataset_path, encoding="utf-8", errors="ignore") as f:
-            if max_bytes is not None:
-                return f.read(max_bytes)
-            else:
-                return f.read()
+@dataclass(frozen=True)
+class Limits:
+    """Global measurement limits, mirroring the Rust `Limits` struct field for field."""
+
+    bytes: int
+    min_sample_ms: float
+    min_samples: int
+    min_seconds: float
+    max_seconds: float
+    target_spread: float
+    warmup_max_seconds: float
+
+
+@dataclass(frozen=True)
+class SuiteSettings:
+    """One suite's dataset, token mode and working-set budget."""
+
+    dataset: str | None
+    tokens: TokensMode
+    bytes: int
+
+
+def limits() -> Limits:
+    """Global measurement limits, with `STRINGWARS_*` overrides applied."""
+    values = dict(manifest()["limits"])
+    # Every limit is overridable; the previous loop silently omitted min_sample_ms
+    # and min_seconds, so those two knobs did nothing.
+    for key, parser in (
+        ("bytes", str),
+        ("min_sample_ms", float),
+        ("min_samples", int),
+        ("min_seconds", float),
+        ("max_seconds", float),
+        ("target_spread", float),
+        ("warmup_max_seconds", float),
+    ):
+        raw = get_env("STRINGWARS_" + key.upper())
+        if raw is not None:
+            values[key] = parser(raw)
+    budget = values["bytes"]
+    return Limits(
+        # Parsed here, once, rather than by each caller.
+        bytes=parse_size(budget) if isinstance(budget, str) else int(budget),
+        min_sample_ms=float(values["min_sample_ms"]),
+        min_samples=int(values["min_samples"]),
+        min_seconds=float(values["min_seconds"]),
+        max_seconds=float(values["max_seconds"]),
+        target_spread=float(values["target_spread"]),
+        warmup_max_seconds=float(values["warmup_max_seconds"]),
+    )
+
+
+def suite_settings(suite: str) -> SuiteSettings:
+    """One suite's dataset, token mode, and working-set budget in bytes."""
+    entry = manifest().get("suite", {}).get(suite, {})
+    budget = get_env("STRINGWARS_BYTES") or entry.get("bytes")
+    return SuiteSettings(
+        dataset=get_env("STRINGWARS_DATASET") or entry.get("dataset"),
+        tokens=get_env("STRINGWARS_TOKENS") or entry.get("tokens", "lines"),
+        bytes=(parse_size(budget) if isinstance(budget, str) else int(budget)) if budget else limits().bytes,
+    )
+
+
+# endregion: Manifest
+
+
+_ASCII_WHITESPACE = b" \n\t\r\v\f"
 
 
 def tokenize_dataset(
@@ -415,15 +282,14 @@ def tokenize_dataset(
     unique: bool | None = None,
 ) -> list[str] | list[bytes]:
     """
-    Tokenize haystack based on mode from argument or environment variable.
+    Split a buffer into tokens. Normative definition, shared with `utils.rs`:
 
-    Args:
-        haystack: Input data to tokenize (str or bytes)
-        tokens_mode: Tokenization mode ('lines', 'words', 'file') or None to use env var
-        unique: If True, deduplicate tokens (preserving order). If None, uses STRINGWARS_UNIQUE.
+      lines  split on \\n, drop empty
+      words  split on ASCII whitespace {space \\n \\t \\r \\v \\f}, drop empty
+      file   one token, the whole buffer
 
-    Returns:
-        List of tokens in the same type as input (List[str] or List[bytes])
+    Both harnesses must produce identical token counts and bytes; the pre-commit
+    conformance test asserts it.
     """
     if tokens_mode is None:
         tokens_mode = get_env_or_default("STRINGWARS_TOKENS", "lines")
@@ -431,11 +297,12 @@ def tokenize_dataset(
     is_bytes = isinstance(haystack, bytes)
 
     if tokens_mode == "lines":
-        # Split on LF only
         tokens = haystack.split(b"\n" if is_bytes else "\n")
+        tokens = [token for token in tokens if token]
     elif tokens_mode == "words":
-        # Use default split() which handles all whitespace
-        tokens = haystack.split()
+        separators = _ASCII_WHITESPACE if is_bytes else _ASCII_WHITESPACE.decode("ascii")
+        pattern = b"[" + re.escape(_ASCII_WHITESPACE) + b"]+" if is_bytes else "[" + re.escape(separators) + "]+"
+        tokens = [token for token in re.split(pattern, haystack) if token]
     elif tokens_mode == "file":
         tokens = [haystack]
     else:
@@ -444,22 +311,492 @@ def tokenize_dataset(
     if unique is None:
         unique = get_env_bool("STRINGWARS_UNIQUE")
 
-    # Deduplicate, preserving the order of first appearance.
+    # Deduplicate first, then cap — the reverse order yields "up to N tokens, then
+    # deduplicated", which is fewer than N unique tokens.
     if tokens_mode != "file" and unique:
         tokens = list(dict.fromkeys(tokens))
 
     return tokens
 
 
-def resolve_tokens(cli_value: str | None, default: str) -> str:
-    """Resolve the token granularity with precedence: an explicit --tokens flag wins, then the
-    STRINGWARS_TOKENS environment variable, then the bench's own default. Each bench passes the
-    granularity its kernel measures (e.g. "words" for hashing/similarity, "lines" for
-    normalization/fingerprinting), matching the Rust `load_dataset_with_default_mode`.
+@dataclass(frozen=True)
+class Dataset:
+    """A pinned working set. `token_bytes` is the denominator of every bytes/s figure."""
+
+    tokens: list
+    token_bytes: int
+    token_count: int
+    fingerprint: int
+    mode: str
+    path: str
+
+
+def _token_bytes(token) -> int:
+    return len(token) if isinstance(token, (bytes, bytearray)) else len(token.encode("utf-8"))
+
+
+def _read_within_budget(handle, budget: int, mode: str) -> bytes:
+    """Read only what the budget can consume. Mirrors utils.rs::read_within_budget."""
+    if mode == "file":
+        return handle.read(budget)
+    if get_env_bool("STRINGWARS_UNIQUE"):
+        # Dedup precedes the cap, so unique-token counts genuinely need the whole corpus.
+        return handle.read()
+
+    separators = b"\n" if mode == "lines" else _ASCII_WHITESPACE
+
+    # The budget counts token bytes but a read returns raw bytes, and separators are
+    # not free: `budget` bytes of xlsum.csv yields only ~1.80 MB of words per 2 MB.
+    # `translate(None, ...)` drops the separators in one C pass; counting only the
+    # newly-read segment keeps the loop linear.
+    buffer = bytearray(handle.read(budget))
+    token_bytes = len(bytes(buffer).translate(None, separators))
+    while len(buffer) >= budget and token_bytes < budget:
+        more = handle.read(budget - token_bytes + (1 << 16))
+        if not more:
+            break
+        token_bytes += len(more.translate(None, separators))
+        buffer += more
+
+    # Complete the straddling token so the cap can judge it on its true length.
+    tail = handle.read(1 << 20)
+    cut = min(
+        (position for position in (tail.find(bytes([sep])) for sep in separators) if position >= 0),
+        default=len(tail),
+    )
+    buffer += tail[:cut]
+    return bytes(buffer)
+
+
+def resolve_dataset(suite: str, as_bytes: bool = True, dataset_path: str | None = None) -> Dataset:
     """
-    if cli_value is not None:
-        return cli_value
-    return get_env_or_default("STRINGWARS_TOKENS", default)
+    Resolve the working set for one suite.
+
+    Normative algorithm, implemented identically in `utils.rs`: read the file,
+    tokenize, then accumulate whole tokens and stop *before* the first token that
+    would push the running total of token bytes past the budget. Never a torn
+    token. The budget counts token bytes rather than file bytes, so the two
+    languages share an exact denominator regardless of separator overhead.
+    """
+    settings = suite_settings(suite)
+    dataset_path = dataset_path or settings.dataset
+    if dataset_path is None:
+        raise ValueError(f"No dataset for suite {suite!r}: set STRINGWARS_DATASET or add one to stringwars.toml")
+
+    budget = settings.bytes
+    # Always read binary. The old text path used `f.read(n)` on a TextIOWrapper,
+    # which counts codepoints, so the byte budget silently varied with the script.
+    with open(dataset_path, "rb") as handle:
+        raw = _read_within_budget(handle, budget, settings.tokens)
+
+    if settings.tokens == "file":
+        # The one mode where the budget must truncate: a single token cannot be dropped
+        # without emptying the working set, so the "never tear a token" rule would leave
+        # `file` mode unbounded — Rust capped and Python did not, silently comparing a
+        # 128 MB working set against a 1 MB one. Back off to a UTF-8 boundary so both
+        # harnesses cap at the same byte.
+        end = min(budget, len(raw))
+        while 0 < end < len(raw) and (raw[end] & 0b1100_0000) == 0b1000_0000:
+            end -= 1
+        raw = raw[:end]
+
+    haystack = raw if as_bytes else raw.decode("utf-8", errors="ignore")
+
+    kept, used = [], 0
+    for token in tokenize_dataset(haystack, settings.tokens):
+        size = _token_bytes(token)
+        if used + size > budget and kept:
+            break
+        kept.append(token)
+        used += size
+
+    if not kept:
+        raise ValueError(f"No tokens from {dataset_path} in mode {settings.tokens}")
+
+    dataset = Dataset(
+        tokens=kept,
+        token_bytes=used,
+        token_count=len(kept),
+        fingerprint=fingerprint_tokens(kept),
+        mode=settings.tokens,
+        path=dataset_path,
+    )
+
+    global _RUN
+    _RUN = {
+        "lang": "python",
+        "suite": suite,
+        "dataset": dataset_path,
+        "mode": dataset.mode,
+        "tokens": dataset.token_count,
+        "token_bytes": dataset.token_bytes,
+        "crc": f"0x{dataset.fingerprint:08x}",
+    }
+    return dataset
+
+
+# What every record is stamped with, captured once when the working set resolves.
+# Module-level because `measure` is handed only the row it is timing, and threading
+# run context through every call site would be noise.
+_RUN: dict | None = None
+
+# The closed set of report units, mirroring Rust's `ReportAs` variants. A `Literal`
+# rather than an `Enum`: it costs nothing at runtime and keeps the 20 call sites
+# spelling `report="bytes"` instead of `ReportAs.BYTES`.
+
+# name for the record, display unit, whether a space precedes a word unit
+_REPORT_UNITS: dict[str, tuple[str, str, bool]] = {
+    "bytes": ("bytes/s", "B/s", False),
+    "cups": ("CUPS", "CUPS", False),
+    "hashes": ("hashes/s", "hashes/s", True),
+    "bits": ("bits/s", "bits/s", True),
+    "comparisons": ("cmp/s", "cmp/s", True),
+}
+
+
+# Every row the run reached, in order, with what became of it. A row that vanishes
+# silently is indistinguishable from a row that was never written: `similarities`
+# lost four whole tables behind a `--bio` gate and the output looked complete.
+_ROSTER: list[tuple[str, str]] = []
+
+
+def note_unavailable(name: str, reason: str) -> None:
+    """
+    Record a contender that could not run at all — a missing optional dependency, a
+    gated backend. Prints a line so the absence is in the output rather than implied
+    by a gap in the table.
+    """
+    print(f"{name:<{REPORT_NAME_WIDTH}} SKIPPED: {reason}")
+    _ROSTER.append((name, "skipped"))
+
+
+def finish() -> None:
+    """Print the roster tally; exit non-zero if a row that was asked to run produced nothing."""
+    import sys
+
+    tally = Counter(status for _, status in _ROSTER)
+    print(
+        f"\nRoster: {tally['ok']} measured, {tally['refused']} refused, "
+        f"{tally['too_slow']} too slow, {tally['skipped']} skipped, {tally['filtered']} filtered",
+    )
+    refused = [name for name, status in _ROSTER if status == "refused"]
+    if refused:
+        for name in refused:
+            print(f"  refused: {name}")
+        sys.exit(1)
+
+
+def _record_outcome(outcome: "Outcome", spec: "MeasureSpec", bytes_per_second: float) -> None:
+    """
+    Append one NDJSON record per row when `STRINGWARS_RESULTS_DIR` is set.
+
+    Records exist so a published number can be traced back to the working set that
+    produced it. They never touch a README, whose tables stay hand-written.
+    """
+    directory = os.environ.get("STRINGWARS_RESULTS_DIR")
+    if not directory or _RUN is None or outcome.status == "filtered":
+        return
+    import json
+
+    os.makedirs(directory, exist_ok=True)
+    record = dict(_RUN)
+    record.update(
+        row=outcome.name,
+        unit=_REPORT_UNITS[spec.report][0],
+        rate=outcome.median_rate,
+        bytes_per_second=bytes_per_second,
+        spread=outcome.spread,
+        samples=outcome.samples,
+        passes_per_sample=outcome.passes_per_sample,
+        concurrency=spec.concurrency,
+        status=outcome.status,
+    )
+    with open(os.path.join(directory, f"{_RUN['suite']}.ndjson"), "a") as handle:
+        handle.write(json.dumps(record) + "\n")
+
+
+@dataclass(frozen=True)
+class MeasureSpec:
+    """
+    What one pass over the pinned working set costs, declared up front.
+
+    Declared rather than accumulated: counting work per call costs a Python-level
+    increment per item, which at ~50-80 ns swamps a short kernel.
+    """
+
+    report: ReportUnit
+    elements: int
+    total_bytes: int
+    concurrency: int = 1
+
+
+@dataclass
+class Outcome:
+    name: str
+    median_rate: float
+    spread: float
+    samples: int
+    passes_per_sample: int
+    status: str
+
+
+def clock_overhead_nanoseconds() -> float:
+    """
+    Cost of one `time.monotonic_ns()`. The harness reads the clock exactly twice
+    per sample, so this over `min_sample_ms` is the whole timing overhead.
+    """
+    rounds = 10_000
+    start = time.monotonic_ns()
+    for _ in range(rounds):
+        time.monotonic_ns()
+    return (time.monotonic_ns() - start) / rounds
+
+
+def log_timing_overhead() -> None:
+    """Proof obligation behind "the harness does not perturb the measurement"."""
+    per_clock = clock_overhead_nanoseconds()
+    floor_nanoseconds = limits().min_sample_ms * 1e6
+    print(
+        f"Timing: {per_clock:.0f} ns/clock, {limits().min_sample_ms:.1f} ms sample floor "
+        f"-> harness overhead <= {200.0 * per_clock / floor_nanoseconds:.4f}%",
+    )
+
+
+def _quantile(ordered: list[float], fraction: float) -> float:
+    """
+    Select a sample by rank, using a rule written out rather than delegated.
+
+    Python's `round` breaks ties to even and Rust's `f64::round` breaks them away
+    from zero, so the two harnesses picked different samples: at n = 10 — the modal
+    terminating count, since `min_samples` is 10 and the convergence gate fires as
+    soon as it is met — Python took the 5th-smallest and Rust the 6th. Every median
+    rate and spread is derived from this, so the disagreement was systematic.
+    """
+    if not ordered:
+        return 0.0
+    rank = math.floor(fraction * (len(ordered) - 1) + 0.5)
+    return ordered[min(rank, len(ordered) - 1)]
+
+
+def _round_to_earned_digits(value: float, relative_halfwidth: float) -> float:
+    """Round to the significant figures the measured dispersion justifies."""
+    if value == 0.0 or not math.isfinite(value):
+        return value
+    digits = 1
+    for candidate in range(1, 5):
+        if 10.0 ** (-(candidate - 1)) >= relative_halfwidth:
+            digits = candidate
+    magnitude = math.floor(math.log10(abs(value)))
+    scale = 10.0 ** (digits - 1 - magnitude)
+    # Half-up, spelled out, for the same reason as `_quantile`: rates are positive,
+    # so this is the tie rule both harnesses can state rather than inherit.
+    return math.floor(value * scale + 0.5) / scale
+
+
+def measure(
+    name: str,
+    spec: MeasureSpec,
+    pass_fn: Callable[[], None],
+    setup: Callable[[], None] | None = None,
+) -> Outcome:
+    """
+    Times `pass_fn` over the pinned working set and reports one row.
+
+    A sample is `passes_per_sample` complete traversals bracketed by exactly two
+    clock reads; the count is chosen during warm-up so a sample lasts at least
+    `min_sample_ms`. There is no per-call clock and therefore no adaptive stride,
+    and the loop between the two reads contains no harness bookkeeping.
+
+    `setup` runs before each sample and outside the clock, for kernels that consume
+    their input. It forces one pass per sample, since a rebuild between passes would
+    land inside the timed span.
+    """
+
+    def run_sample(passes: int) -> float:
+        if setup is not None:
+            setup()
+        started = time.monotonic_ns()
+        for _ in range(passes):
+            pass_fn()
+        return time.monotonic_ns() - started
+
+    def too_slow(seconds: float) -> Outcome:
+        """One pass rules out the three samples a dispersion estimate needs."""
+        rate = spec.total_bytes / max(seconds, 1e-9)
+        print(
+            f"{name:<{REPORT_NAME_WIDTH}} TOO SLOW: ~{format_byte_rate(_round_to_earned_digits(rate, 1.0))}"
+            f", one pass ~{seconds:.0f}s against a {resolved.max_seconds:.0f}s cap"
+        )
+        # An expected outcome, not a failure: its own bucket, so `finish` does not exit 1.
+        _ROSTER.append((name, "too_slow"))
+        return Outcome(name, 0.0, float("nan"), 1, 0, "too_slow")
+
+    def refuse(status: str, samples: int) -> Outcome:
+        # A refusal must be as visible as a result; printing nothing is how a row
+        # goes missing for weeks without anyone noticing.
+        if status != "filtered":
+            print(f"{name:<{REPORT_NAME_WIDTH}} REFUSED: {status}")
+        # `should_run` already noted a filtered row; only refusals are ours to record.
+        if status != "filtered":
+            _ROSTER.append((name, "refused"))
+        return Outcome(name, 0.0, float("nan"), samples, 0, status)
+
+    if not should_run(name):
+        return refuse("filtered", 0)
+
+    resolved = limits()
+    floor_nanoseconds = resolved.min_sample_ms * 1e6
+
+    passes = 1
+    took = 0
+    while setup is None:
+        took = run_sample(passes)
+        if took >= floor_nanoseconds or passes >= 1 << 40:
+            break
+        passes = min(max(2, math.ceil(floor_nanoseconds / max(took, 1))) * passes, 1 << 40)
+
+    # Calibration is the first moment the cost of a pass is known. If one pass already
+    # rules out the three samples a dispersion estimate needs, stop here rather than
+    # after warm-up and a measured sample have each paid it again.
+    pass_seconds = took / 1e9 / max(passes, 1)
+    if pass_seconds * 3.0 > resolved.max_seconds:
+        return too_slow(pass_seconds)
+
+    warmup_deadline = time.monotonic_ns() + int(resolved.warmup_max_seconds * 1e9)
+    recent: deque[float] = deque(maxlen=3)
+    # A single pass longer than the deadline used to yield zero warm-up samples, so the
+    # row entered measurement cold - what warm-up exists to prevent.
+    while len(recent) < 3 or time.monotonic_ns() < warmup_deadline:
+        recent.append(run_sample(passes) / 1e9)
+        if len(recent) == 3 and (max(recent) - min(recent)) / max(recent) <= resolved.target_spread:
+            break
+
+    measure_start = time.monotonic_ns()
+    cap_nanoseconds = resolved.max_seconds * 1e9
+    seconds_per_sample: list[float] = []
+    while True:
+        seconds_per_sample.append(run_sample(passes) / 1e9)
+
+        elapsed = time.monotonic_ns() - measure_start
+        if len(seconds_per_sample) >= resolved.min_samples and elapsed / 1e9 >= resolved.min_seconds:
+            ordered = sorted(seconds_per_sample)
+            median = _quantile(ordered, 0.5)
+            halfwidth = (_quantile(ordered, 0.9) - _quantile(ordered, 0.1)) / (2.0 * max(median, 1e-12))
+            if halfwidth <= resolved.target_spread:
+                break
+        if elapsed >= cap_nanoseconds:
+            break
+
+    if len(seconds_per_sample) < 3:
+        return refuse(f"{len(seconds_per_sample)} samples in {resolved.max_seconds:.0f}s cap (need 3)", 0)
+
+    ordered = sorted(seconds_per_sample)
+    median_seconds = _quantile(ordered, 0.5)
+    spread = (_quantile(ordered, 0.9) - _quantile(ordered, 0.1)) / max(median_seconds, 1e-12)
+    mean_seconds = sum(seconds_per_sample) / len(seconds_per_sample)
+    gap = abs(mean_seconds - median_seconds) / max(median_seconds, 1e-12)
+
+    if gap > 2.0 * resolved.target_spread:
+        status = f"NON-STATIONARY {100.0 * gap:.0f}%"
+    elif spread / 2.0 > resolved.target_spread:
+        status = f"UNCONVERGED {100.0 * spread:.0f}%"
+    else:
+        status = "converged"
+
+    elements_per_second = spec.elements * passes / median_seconds
+    bytes_per_second = spec.total_bytes * passes / median_seconds
+    primary = bytes_per_second if spec.report == "bytes" else elements_per_second
+
+    halfwidth = spread / 2.0
+    columns = [_format_primary(spec.report, _round_to_earned_digits(primary, halfwidth))]
+    if spec.report != "bytes" and spec.total_bytes > 0:
+        columns.append(format_byte_rate(_round_to_earned_digits(bytes_per_second, halfwidth)))
+    columns.append(f"+-{100.0 * halfwidth:.1f}% n={len(seconds_per_sample)}")
+    if status != "converged":
+        columns.append(status)
+    print(f"{name:<{REPORT_NAME_WIDTH}} {' | '.join(columns)}")
+
+    outcome = Outcome(name, primary, spread, len(seconds_per_sample), passes, status)
+    _record_outcome(outcome, spec, bytes_per_second)
+    _ROSTER.append((name, "ok"))
+    return outcome
+
+
+def measure_with_setup(
+    name: str,
+    spec: MeasureSpec,
+    setup: Callable[[], object],
+    body: Callable[[object], object],
+) -> Outcome:
+    """
+    Like `measure`, for kernels that consume their input — sorting, in-place edits.
+
+    A thin wrapper over `measure` rather than a second implementation: the copy this
+    replaced had no warm-up, no pass calibration, no `min_sample_ms` floor and no
+    non-stationary test, printed a different refusal wording, and recorded
+    `status="converged"` into the NDJSON even when the line it had just printed said
+    `UNCONVERGED` — so the record contradicted the console.
+    """
+    state: dict = {}
+
+    def prepare() -> None:
+        state["input"] = setup()
+
+    return measure(name, spec, lambda: body(state["input"]), setup=prepare)
+
+
+def pass_over(function: Callable, *columns) -> Callable[[], None]:
+    """
+    Build a pass that drives `function` across whole columns inside C.
+
+    The interpreter must not appear in the measured loop: a Python-level `for` body
+    costs ~50-80 ns per item, which swamps a short kernel and gets attributed to it.
+    `deque(..., maxlen=0)` drains the `map` at C speed and keeps no results.
+    """
+    from collections import deque
+
+    def run() -> None:
+        deque(map(function, *columns), maxlen=0)
+
+    return run
+
+
+def _format_primary(report: str, value: float) -> str:
+    """Render the primary column. Unknown units raise rather than silently print `cmp/s`."""
+    if report == "bytes":
+        return format_byte_rate(value)
+    if report not in _REPORT_UNITS:
+        raise ValueError(f"Unknown report unit {report!r}; expected one of {sorted(_REPORT_UNITS)}")
+    _, unit, spaced = _REPORT_UNITS[report]
+    return format_si_rate(value, unit, spaced)
+
+
+def log_dataset(dataset: "Dataset") -> None:
+    """
+    Print the working set's identity, in the same format as `utils.rs`.
+
+    This line is what makes the two harnesses checkable against each other: same
+    mode, count, bytes and CRC means they resolved the same working set. They
+    silently diverged for months (Rust split words on ASCII bytes, Python's
+    `str.split()` also split U+3000 in the CJK corpora) and nothing in the output
+    would have shown it.
+    """
+    gigabytes = dataset.token_bytes / 1e9
+    print(f"Dataset: {dataset.token_count:,} tokens, {dataset.token_bytes:,} bytes ({gigabytes:.2f} GB)")
+    print(f"  Identity: mode {dataset.mode} crc 0x{dataset.fingerprint:08x}")
+
+
+def fingerprint_tokens(tokens) -> int:
+    """
+    Identity of a resolved working set: CRC32 over the tokens joined by a NUL.
+
+    Deterministic across processes (unlike `hash()`, which is seed-randomized) and
+    trivially mirrored in Rust with `crc32fast`, which the tree already depends on.
+    Digesting the tokens rather than the file means capping the working set does
+    not require re-hashing gigabytes.
+    """
+    blob = b"\x00".join(token if isinstance(token, (bytes, bytearray)) else token.encode("utf-8") for token in tokens)
+    return zlib.crc32(blob) & 0xFFFFFFFF
 
 
 def add_common_args(parser):
@@ -494,9 +831,63 @@ def add_common_args(parser):
     )
 
 
-def should_run(name: str, pattern: re.Pattern | None) -> bool:
-    """Check if benchmark should run based on filter pattern."""
-    if pattern is None:
+def should_run(name: str) -> bool:
+    """Whether a row passes `STRINGWARS_FILTER`, recording the skip as it decides."""
+    if _FILTER is None:
         return True
-    assert hasattr(pattern, "search"), "Pattern must be a compiled regex"
-    return bool(pattern.search(name))
+    matches = bool(_FILTER.search(name))
+    if not matches:
+        # Recorded here rather than in `measure` because several suites consult the
+        # filter themselves and return early; those rows used to vanish from the
+        # tally entirely instead of being counted as filtered.
+        _ROSTER.append((name, "filtered"))
+    return matches
+
+
+def check_conformance(directory: str) -> int:
+    """
+    Verify the two harnesses resolved the same working set, from the records they wrote.
+
+    Run both languages of a suite with `STRINGWARS_RESULTS_DIR` pointed here, then
+    `python utils.py <dir>`. A mismatch means the numbers in that suite's table are
+    not comparable, however plausible they look side by side — Rust and Python
+    silently disagreed on tokenization for months and no output showed it.
+
+    Records append, so a directory accumulates history. Only each language's most
+    recent identity is compared: otherwise a since-fixed disagreement keeps failing.
+    """
+    import glob
+    import json
+
+    failures = 0
+    for path in sorted(glob.glob(os.path.join(directory, "*.ndjson"))):
+        suite = os.path.basename(path).removesuffix(".ndjson")
+        identities = {}
+        for line in open(path):
+            record = json.loads(line)
+            identities[record["lang"]] = (
+                record["dataset"],
+                record["mode"],
+                record["tokens"],
+                record["token_bytes"],
+                record["crc"],
+            )
+        distinct = set(identities.values())
+        if len(identities) < 2:
+            print(f"{suite:<16} SKIP  only {'/'.join(identities) or 'no'} records")
+        elif len(distinct) == 1:
+            dataset, mode, tokens, token_bytes, crc = distinct.pop()
+            print(f"{suite:<16} OK    {mode} {tokens:,} tokens, {token_bytes:,} bytes, crc {crc}")
+        else:
+            failures += 1
+            print(f"{suite:<16} FAIL  harnesses resolved different working sets")
+            for lang, values in sorted(identities.items()):
+                for value in sorted(values):
+                    print(f"                  {lang:<8} {value}")
+    return failures
+
+
+if __name__ == "__main__":
+    import sys
+
+    raise SystemExit(check_conformance(sys.argv[1] if len(sys.argv) > 1 else "results"))

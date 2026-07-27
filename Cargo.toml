@@ -11,6 +11,15 @@ readme = "README.md"
 repository = "https://github.com/ashvardanian/StringWars"
 version = "1.8.3"
 
+# The harness is a real library target rather than a `#[path]` include, so it
+# compiles once instead of ten times, `pub` means something, and the normative
+# tokenizer can carry unit tests. `doc = false` keeps it off docs.rs: it is
+# internal scaffolding, not part of what this crate publishes.
+[lib]
+name = "stringwars"
+path = "utils.rs"
+doc = false
+
 [dependencies]
 stringtape = "2.4.1"
 
@@ -57,7 +66,6 @@ bench_hash = [
   "xxhash-rust",  # xxHash
   "wyhash",       # wyhash
   "blake3",       # Blake3
-  "crc32fast",    # CRC32
   "murmurhash32", # MurmurHash32
   "foldhash",     # FoldHash
   "sha2",         # SHA256
@@ -183,8 +191,10 @@ version = "0.10.81"
 optional = true
 version = "0.2"
 
+[dependencies.toml]
+version = "0.8"
+
 [dependencies.crc32fast]
-optional = true
 version = "1.5.0"
 
 [dependencies.murmurhash32]

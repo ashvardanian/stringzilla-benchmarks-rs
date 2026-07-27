@@ -1,0 +1,76 @@
+# Single source of truth for both harnesses. `utils.rs` and `utils.py` hold no
+# defaults of their own — they read this file, so the two cannot drift.
+
+[limits]
+# Working-set budget, counted in *token bytes* (the denominator of every bytes/s
+# figure), decimal SI.
+#
+# Two things bound this, and they pull against each other:
+#
+#   residency — a budget below the last-level cache measures the cache, not the
+#     memory hierarchy. A Xeon 8480+ has 105 MB of L3 and a Zen5 X3D part has more
+#     than 500 MB, so no fixed number is "past cache" everywhere. Portability is the
+#     reason this is not tuned per machine: a machine-derived budget would also make
+#     the identity CRC machine-dependent and destroy the cross-machine check.
+#
+#   collectability — a pass must be short enough that the slowest contender in the
+#     suite yields `min_samples` inside `max_seconds`. The ceiling is roughly
+#     `slowest_rate * min_seconds * min_samples`, and for a 10 MB/s pure-Python
+#     baseline that is tens of megabytes, not hundreds.
+#
+# Where the two conflict, collectability wins and the suite carries its own `bytes`
+# below with the reason. Do not read the global value as a residency guarantee: it
+# is not one for `sequence`, `normalization`, `tokenization` or `fingerprints`.
+#
+# `similarities` is a third case. A 100x100 Levenshtein pair does 10,000 cell updates
+# over 200 input bytes, so the inputs belong in L1 and the DP band is the real
+# working set. There `bytes` bounds only the pool a batch is drawn from and is not
+# the denominator of anything.
+bytes = "256MB"
+
+# A sample is one or more complete passes over the working set. It must last long
+# enough that the two clock reads bracketing it are noise: 2 x ~25ns / 1ms = 0.005%.
+min_sample_ms = 1.0
+
+# Below ~10 samples a dispersion estimate is meaningless.
+min_samples = 10
+min_seconds = 1.0
+max_seconds = 60.0
+
+# The smallest claim the READMEs make is "1.2x"; distinguishing that from 1.0x
+# needs a few percent per side.
+target_spread = 0.025
+warmup_max_seconds = 10.0
+
+# `dataset` and `tokens` are what a suite runs on when STRINGWARS_DATASET and
+# STRINGWARS_TOKENS are unset, and record what its published numbers were taken
+# with. Suites whose tables have several dataset columns name the first one here.
+# `bytes` overrides the global budget where a pass would otherwise be too slow to
+# collect `min_samples` inside `max_seconds`.
+[suite]
+containers = { dataset = "xlsum.csv", tokens = "words" }
+find = { dataset = "xlsum.csv", tokens = "words" }
+hash = { dataset = "xlsum.csv", tokens = "words" }
+memory = { dataset = "xlsum.csv", tokens = "lines" }
+encryption = { dataset = "acgt_100.txt", tokens = "lines" }
+# A cross-product touches `2 * side` tokens - 32 at the default pair budget - so the
+# pool only has to be large enough to draw a batch from. `take_within_budget` keeps
+# tokens in file order, so a smaller pool hands the kernels byte-identical inputs
+# while dropping a 256 MB read, a CRC over 2.56 M tokens, and a 256 MB unified
+# allocation. `bytes` here bounds the pool; it is not the denominator of anything.
+similarities = { dataset = "acgt_100.txt", tokens = "words", bytes = "8MB" }
+
+# Sorting is O(N log N) and the slowest engine here runs ~110 M compares/s, so a
+# 256MB pass would be tens of seconds.
+sequence = { dataset = "xlsum.csv", tokens = "lines", bytes = "32MB" }
+
+# Whole-corpus passes; the pure-Python normalization baseline runs at 5-40 MB/s,
+# so 256MB would be a ~50s pass.
+normalization = { dataset = "leipzig1M_en.txt", tokens = "file", bytes = "16MB" }
+tokenization = { dataset = "leipzig1M_en.txt", tokens = "file", bytes = "16MB" }
+
+# Sweeps NDIM 64/128/256/512, so a pass is paid four times over. `serial::MinHash`
+# runs at ~0.23 MB/s, which puts the collectability ceiling near 1 MB — three orders
+# below anything resident. This is the widest gap in the repo and the clearest case
+# of collectability overriding residency.
+fingerprints = { dataset = "acgt_100.txt", tokens = "lines", bytes = "1MB" }
