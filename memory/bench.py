@@ -7,22 +7,12 @@
 #   "opencv-python",
 # ]
 # ///
-"""
-Python memory-centric benchmarks analogous to bench_memory.rs.
-
-Includes two groups:
-- Lookup-table transforms (256-byte LUT): bytes.translate, stringzilla.Str.translate, OpenCV LUT, NumPy indexing
-- Random byte generation: NumPy PCG64, NumPy Philox, and PyCryptodome AES-CTR
-
-Examples:
-  uv run memory/bench.py --dataset README.md --tokens lines
-  uv run memory/bench.py --dataset README.md --tokens words -k "translate|LUT|AES-CTR|PCG64|Philox"
-"""
+"""Low-level memory benchmarks in Python: lookup tables, PRNG fills, copies. Mirrors `memory/bench.rs`."""
 
 import argparse
-import re
 import sys
 from collections.abc import Callable, Iterable
+from itertools import repeat
 
 import Crypto as pycryptodome
 import cv2
@@ -31,14 +21,15 @@ import stringzilla as sz
 from Crypto.Cipher import AES as PyCryptoDomeAES
 
 from utils import (
+    MeasureSpec,
     add_common_args,
-    load_dataset,
-    now_nanoseconds,
-    paced_items,
-    reduce_in_windows,
-    report_stats,
-    should_run,
-    tokenize_dataset,
+    finish,
+    log_dataset,
+    log_timing_overhead,
+    measure,
+    pass_over,
+    resolve_dataset,
+    set_filter,
 )
 
 
@@ -64,7 +55,6 @@ def sz_translate_inplace(haystack: memoryview, look_up_table: bytes) -> int:
 
 
 def bytes_translate(haystack_bytes: bytes, lut: bytes) -> int:
-    """Python bytes.translate (always allocating)."""
     result = haystack_bytes.translate(lut)
     return len(result)
 
@@ -110,45 +100,24 @@ def bench_translate(
     tokens,
     table: bytes,
     operation: Callable[[object, bytes], int],
-    time_limit_seconds: float,
 ) -> None:
-    start_time = now_nanoseconds()
-    deadline_nanoseconds = start_time + int(time_limit_seconds * 1e9)
-
-    # The table is fixed and trailing, so broadcast it as a constant column (a list of
-    # references to one object) and reduce the per-token byte counts in C windows.
-    tables = [table] * len(tokens)
-    produced_bytes, requested = reduce_in_windows(
-        operation,
-        tokens,
-        tables,
-        deadline_nanoseconds=deadline_nanoseconds,
+    # The broadcast table column used to be built *inside* the timed region, so a
+    # multi-million-element list allocation was charged to every contender.
+    work = MeasureSpec(
+        report="bytes",
+        elements=len(tokens),
+        total_bytes=sum(len(token) for token in tokens),
     )
-
-    seconds = (now_nanoseconds() - start_time) / 1e9
-    report_stats(name, "bytes", seconds, requested, produced_bytes)
+    measure(name, work, pass_over(operation, tokens, repeat(table)))
 
 
 def sizes_from_tokens(tokens: Iterable[bytes]) -> list[int]:
     return [len(token) for token in tokens if len(token) > 0]
 
 
-def bench_generator(
-    name: str, sizes: list[int], generate_bytes: Callable[[int], bytes], time_limit_seconds: float
-) -> None:
-    start = now_nanoseconds()
-    deadline = start + int(time_limit_seconds * 1e9)
-
-    processed = 0
-    total_bytes = 0
-
-    for size in paced_items(sizes, deadline):
-        _ = generate_bytes(size)
-        processed += 1
-        total_bytes += size
-
-    seconds = (now_nanoseconds() - start) / 1e9
-    report_stats(name, "bytes", seconds, processed, total_bytes)
+def bench_generator(name: str, sizes: list[int], generate_bytes: Callable[[int], bytes]) -> None:
+    work = MeasureSpec(report="bytes", elements=len(sizes), total_bytes=sum(sizes))
+    measure(name, work, pass_over(generate_bytes, sizes))
 
 
 def make_pycryptodome_aes_ctr():
@@ -156,7 +125,6 @@ def make_pycryptodome_aes_ctr():
     cipher = PyCryptoDomeAES.new(key, PyCryptoDomeAES.MODE_CTR, nonce=b"")
 
     def generate_bytes(size: int) -> bytes:
-        # Generate keystream by encrypting zero bytes
         return cipher.encrypt(b"\x00" * size)
 
     return generate_bytes
@@ -198,7 +166,6 @@ def make_numpy_philox():
 _main_epilog = """
 Examples:
 
-  # Benchmark lookup-table transforms and random generation
   %(prog)s --dataset README.md --tokens lines
 
   # Filter to only translations
@@ -216,25 +183,14 @@ def main() -> int:
     args = parser.parse_args()
 
     # Dataset
-    text = load_dataset(args.dataset, as_bytes=False, size_limit=args.dataset_limit)
-    data = text.encode("utf-8", errors="ignore")
-    tokens_b = tokenize_dataset(data, args.tokens, unique=False)
-    if not tokens_b:
-        print("No tokens found in dataset")
-        return 1
-
-    total_bytes = sum(len(token) for token in tokens_b)
-    avg_len = total_bytes / len(tokens_b)
-    print(f"Dataset: {len(tokens_b):,} tokens, {total_bytes:,} bytes, {avg_len:.1f} avg token length")
+    dataset = resolve_dataset("memory", as_bytes=True, dataset_path=args.dataset)
+    tokens_b = dataset.tokens
+    log_dataset(dataset)
+    log_timing_overhead()
     log_system_info()
 
     # Compile filter
-    pattern: re.Pattern[str] | None = None
-    if args.filter:
-        try:
-            pattern = re.compile(args.filter)
-        except re.error as e:
-            parser.error(f"Invalid regex for --filter: {e}")
+    set_filter(args.filter)
 
     # Disable OpenCV multithreading for more consistent results
     cv2.setNumThreads(1)
@@ -243,66 +199,51 @@ def main() -> int:
     print()
     print("LUT Transforms")
 
-    # Create reverse LUT
     reverse = bytes(reversed(range(256)))
     reverse_np = np.arange(255, -1, -1, dtype=np.uint8)
 
-    # Convert tokens to numpy arrays for token-based benchmarks
     tokens_np = [np.array(np.frombuffer(token, dtype=np.uint8)) for token in tokens_b]
     tokens_mv = [memoryview(bytearray(token)) for token in tokens_b]
 
     # Python bytes.translate (always allocating)
-    if should_run("lookup-table/bytes.translate<new>", pattern):
-        bench_translate("bytes.translate<new>", tokens_b, reverse, bytes_translate, args.time_limit)
+    bench_translate("lookup-table/bytes.translate<new>", tokens_b, reverse, bytes_translate)
 
     # OpenCV allocating
-    if should_run("lookup-table/opencv.LUT<new>", pattern):
-        bench_translate("opencv.LUT<new>", tokens_np, reverse_np, opencv_lut_allocating, args.time_limit)
+    bench_translate("lookup-table/opencv.LUT<new>", tokens_np, reverse_np, opencv_lut_allocating)
 
     # OpenCV in-place
-    if should_run("lookup-table/opencv.LUT<inplace>", pattern):
-        bench_translate("opencv.LUT<inplace>", tokens_np, reverse_np, opencv_lut_inplace, args.time_limit)
+    bench_translate("lookup-table/opencv.LUT<inplace>", tokens_np, reverse_np, opencv_lut_inplace)
 
     # NumPy indexing allocating
-    if should_run("lookup-table/numpy.indexing<new>", pattern):
-        bench_translate("numpy.indexing<new>", tokens_np, reverse_np, numpy_lut_indexing_allocating, args.time_limit)
+    bench_translate("lookup-table/numpy.indexing<new>", tokens_np, reverse_np, numpy_lut_indexing_allocating)
 
     # NumPy indexing in-place
-    if should_run("lookup-table/numpy.indexing<inplace>", pattern):
-        bench_translate("numpy.indexing<inplace>", tokens_np, reverse_np, numpy_lut_indexing_inplace, args.time_limit)
+    bench_translate("lookup-table/numpy.indexing<inplace>", tokens_np, reverse_np, numpy_lut_indexing_inplace)
 
     # NumPy take allocating
-    if should_run("lookup-table/numpy.take<new>", pattern):
-        bench_translate("numpy.take<new>", tokens_np, reverse_np, numpy_lut_take_allocating, args.time_limit)
+    bench_translate("lookup-table/numpy.take<new>", tokens_np, reverse_np, numpy_lut_take_allocating)
 
     # NumPy take in-place
-    if should_run("lookup-table/numpy.take<inplace>", pattern):
-        bench_translate("numpy.take<inplace>", tokens_np, reverse_np, numpy_lut_take_inplace, args.time_limit)
+    bench_translate("lookup-table/numpy.take<inplace>", tokens_np, reverse_np, numpy_lut_take_inplace)
 
     # StringZilla allocating
-    if should_run("lookup-table/stringzilla.translate<new>", pattern):
-        bench_translate("stringzilla.translate<new>", tokens_b, reverse, sz_translate_allocating, args.time_limit)
+    bench_translate("lookup-table/stringzilla.translate<new>", tokens_b, reverse, sz_translate_allocating)
 
     # StringZilla in-place (need memoryviews for each token)
-    if should_run("lookup-table/stringzilla.translate<inplace>", pattern):
-        bench_translate("stringzilla.translate<inplace>", tokens_mv, reverse, sz_translate_inplace, args.time_limit)
+    bench_translate("lookup-table/stringzilla.translate<inplace>", tokens_mv, reverse, sz_translate_inplace)
 
     # Random byte generation
     print()
     print("Random Byte Generation")
     sizes = sizes_from_tokens(tokens_b)
 
-    if should_run("generate-random/pycryptodome.AES-CTR", pattern):
-        bench_generator("pycryptodome.AES-CTR", sizes, make_pycryptodome_aes_ctr(), args.time_limit)
-    if should_run("generate-random/stringzilla.fill_random", pattern):
-        bench_generator("stringzilla.fill_random", sizes, make_stringzilla_fill_random(), args.time_limit)
-    if should_run("generate-random/stringzilla.random", pattern):
-        bench_generator("stringzilla.random", sizes, sz.random, args.time_limit)
-    if should_run("generate-random/numpy.PCG64", pattern):
-        bench_generator("numpy.PCG64", sizes, make_numpy_pcg64(), args.time_limit)
-    if should_run("generate-random/numpy.Philox", pattern):
-        bench_generator("numpy.Philox", sizes, make_numpy_philox(), args.time_limit)
+    bench_generator("generate-random/pycryptodome.AES-CTR", sizes, make_pycryptodome_aes_ctr())
+    bench_generator("generate-random/stringzilla.fill_random", sizes, make_stringzilla_fill_random())
+    bench_generator("generate-random/stringzilla.random", sizes, sz.random)
+    bench_generator("generate-random/numpy.PCG64", sizes, make_numpy_pcg64())
+    bench_generator("generate-random/numpy.Philox", sizes, make_numpy_philox())
 
+    finish()
     return 0
 
 

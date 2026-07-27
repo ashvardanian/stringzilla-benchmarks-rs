@@ -6,26 +6,9 @@
 #   "pynacl",
 # ]
 # ///
-"""
-AEAD encryption/decryption benchmarks in Python, mirroring encryption/bench.rs.
-
-Both files compare the two AEAD ciphers that dominate TLS 1.3 and the Noise framework — AES-256-GCM
-(hardware-accelerated) and ChaCha20-Poly1305 (software-optimized) — across the common Python crypto
-libraries: `cryptography` (OpenSSL backend), `pycryptodome`, and `pynacl` (libsodium).
-
-Throughput is reported in bytes/s over the plaintext, encrypting/decrypting one token per call.
-
-Environment variables:
-- STRINGWARS_DATASET: Path to input dataset file
-- STRINGWARS_TOKENS: Tokenization mode ('lines', 'words', 'file')
-
-Examples:
-  uv run encryption/bench.py --dataset acgt_100.txt --tokens lines
-  uv run encryption/bench.py --dataset acgt_1k.txt --tokens lines -k "chacha"
-"""
+"""AEAD benchmarks in Python across cryptography, pycryptodome and libsodium. Mirrors `encryption/bench.rs`."""
 
 import argparse
-import re
 import sys
 from collections.abc import Callable
 
@@ -34,14 +17,16 @@ from Crypto.Cipher import AES, ChaCha20_Poly1305
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 
 from utils import (
+    MeasureSpec,
     add_common_args,
-    load_dataset,
-    now_nanoseconds,
-    paced_items,
-    report_stats,
-    resolve_tokens,
+    finish,
+    log_dataset,
+    log_timing_overhead,
+    measure,
+    pass_over,
+    resolve_dataset,
+    set_filter,
     should_run,
-    tokenize_dataset,
 )
 
 KEY = bytes(32)  # 256-bit key (all zeros — content is irrelevant to throughput)
@@ -62,18 +47,15 @@ def log_system_info():
     print()
 
 
-def bench_encrypt(name: str, tokens: list[bytes], encrypt: Callable[[bytes, bytes], object], time_limit: float):
-    """Encrypt one token per call under the time budget; report bytes/s over the plaintext."""
-    start = now_nanoseconds()
-    deadline = start + int(time_limit * 1e9)
-    count = 0
-    total_bytes = 0
-    for token in paced_items(tokens, deadline):
-        encrypt(token, nonce_for(count))
-        count += 1
-        total_bytes += len(token)
-    seconds = (now_nanoseconds() - start) / 1e9
-    report_stats(name, "bytes", seconds, count, total_bytes)
+def bench_encrypt(name: str, tokens: list[bytes], encrypt: Callable[[bytes, bytes], object]):
+    """One pass encrypts every token; bytes/s is over the plaintext."""
+    nonces = [nonce_for(index) for index in range(len(tokens))]
+    work = MeasureSpec(
+        report="bytes",
+        elements=len(tokens),
+        total_bytes=sum(len(token) for token in tokens),
+    )
+    measure(name, work, pass_over(encrypt, tokens, nonces))
 
 
 def bench_decrypt(
@@ -81,24 +63,11 @@ def bench_decrypt(
     blobs: list[object],
     plaintext_lengths: list[int],
     decrypt: Callable[[object, bytes], object],
-    time_limit: float,
 ):
-    """Decrypt one previously-encrypted token per call; report bytes/s over the original plaintext."""
-    start = now_nanoseconds()
-    deadline = start + int(time_limit * 1e9)
-    count = 0
-    total_bytes = 0
-    index = 0
-    end = start
-    while True:
-        decrypt(blobs[index], nonce_for(index))
-        total_bytes += plaintext_lengths[index]
-        count += 1
-        index = (index + 1) % len(blobs)
-        end = now_nanoseconds()
-        if end >= deadline:
-            break
-    report_stats(name, "bytes", (end - start) / 1e9, count, total_bytes)
+    """One pass decrypts every blob; bytes/s is over the original plaintext."""
+    nonces = [nonce_for(index) for index in range(len(blobs))]
+    work = MeasureSpec(report="bytes", elements=len(blobs), total_bytes=sum(plaintext_lengths))
+    measure(name, work, pass_over(decrypt, blobs, nonces))
 
 
 # Each cipher is a (label, encrypt, decrypt) triple. `encrypt(data, nonce)` returns an opaque blob;
@@ -164,21 +133,12 @@ def main():
     add_common_args(parser)
     args = parser.parse_args()
 
-    filter_pattern = None
-    if args.filter:
-        try:
-            filter_pattern = re.compile(args.filter)
-        except re.error as error:
-            parser.error(f"Invalid regex for --filter: {error}")
+    set_filter(args.filter)
 
-    dataset = load_dataset(args.dataset, as_bytes=True, size_limit=args.dataset_limit)
-    tokens = tokenize_dataset(dataset, resolve_tokens(args.tokens, "lines"))
-    if not tokens:
-        print("No tokens found in dataset")
-        return 1
-
-    total_bytes = sum(len(token) for token in tokens)
-    print(f"Dataset: {len(tokens):,} tokens, {total_bytes:,} bytes, {total_bytes / len(tokens):.1f} avg token length")
+    dataset = resolve_dataset("encryption", as_bytes=True, dataset_path=args.dataset)
+    tokens = dataset.tokens
+    log_dataset(dataset)
+    log_timing_overhead()
     log_system_info()
 
     plaintext_lengths = [len(token) for token in tokens]
@@ -186,16 +146,16 @@ def main():
     print("\n# encryption")
     for build in CIPHERS:
         label, encrypt, _ = build()
-        if should_run(f"encryption/{label}", filter_pattern):
-            bench_encrypt(label, tokens, encrypt, args.time_limit)
+        bench_encrypt(f"encryption/{label}", tokens, encrypt)
 
     print("\n# decryption")
     for build in CIPHERS:
         label, encrypt, decrypt = build()
-        if should_run(f"decryption/{label}", filter_pattern):
+        if should_run(f"decryption/{label}"):
             blobs = [encrypt(token, nonce_for(index)) for index, token in enumerate(tokens)]
-            bench_decrypt(label, blobs, plaintext_lengths, decrypt, args.time_limit)
+            bench_decrypt(f"decryption/{label}", blobs, plaintext_lengths, decrypt)
 
+    finish()
     return 0
 
 

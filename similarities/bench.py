@@ -15,45 +15,10 @@
 #   "numpy",
 # ]
 # ///
-"""
-Similarity benchmarks in Python: MCUPS for string similarity operations.
-
-The input file is tokenized into lines or words. The StringZilla engines evaluate a square
-``side x side`` cross-product: the first ``side`` tokens (queries) against the next ``side``
-disjoint tokens (candidates), producing a dense ``side x side`` similarity matrix in one native
-call. As most algorithms have quadratic complexity and use Dynamic Programming techniques, their
-throughput is reported in CUPS (Cell Updates Per Second). This mirrors the Rust harness `bench.rs`.
-
-- Edit Distance baselines: rapidfuzz, python-Levenshtein, jellyfish, editdistance, nltk, edlib, polyleven
-- StringZilla cross-product: szs.LevenshteinDistances, szs.LevenshteinDistancesUTF8,
-  szs.NeedlemanWunschScores, szs.SmithWatermanScores
-- BioPython: PairwiseAligner baseline (unary match/mismatch scoring)
-- cuDF: GPU-accelerated edit distance (optional)
-
-Environment variables (identical to bench.rs / the C++ harness):
-- STRINGWARS_DATASET: Path to the input dataset file
-- STRINGWARS_TOKENS: Tokenization mode ('lines', 'words', 'file')
-- STRINGWARS_MAX_TOKENS: Limit on the number of tokens loaded
-- STRINGWARS_BATCH_PER_CORE: Pairs processed per core (default: 256)
-- STRINGWARS_TIME: Wall-time budget per benchmark variant (seconds)
-- STRINGWARS_WARMUP: Uncounted warm-up budget per variant (seconds)
-- STRINGWARS_SEED: Seed for the token shuffle
-- STRINGWARS_FILTER: Regex selecting which benchmark variants run
-
-A CPU core counts as one core; a GPU streaming multiprocessor (SM) counts as one core. The
-per-device pair budget is ``STRINGWARS_BATCH_PER_CORE * cores``, and the square cross-product side
-is ``round(sqrt(budget))`` clamped so queries ``[0, side)`` and candidates ``[side, 2*side)`` stay
-disjoint, i.e. ``2 * side <= num_tokens``.
-
-Examples:
-  uv run --with stringzillas-cpus similarities/bench.py --dataset README.md
-  STRINGWARS_DATASET=data.txt STRINGWARS_TOKENS=lines uv run --with stringzillas-cpus similarities/bench.py
-"""
+"""String-similarity benchmarks in Python, reported in CUPS. Mirrors `similarities/bench.rs`."""
 
 import argparse
-import os
 import random
-import re
 import sys
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -65,16 +30,21 @@ import stringzilla as sz
 import stringzillas as szs
 
 from utils import (
+    MeasureSpec,
     add_common_args,
     auto_batch_size,
+    finish,
     get_env_parsed,
     gpu_multiprocessor_count,
-    load_dataset,
-    now_nanoseconds,
-    report_stats,
-    resolve_tokens,
+    log_dataset,
+    log_timing_overhead,
+    measure,
+    note_unavailable,
+    pass_over,
+    resolve_core_count,
+    resolve_dataset,
+    set_filter,
     should_run,
-    tokenize_dataset,
 )
 
 # Edit-distance baselines (each optional so a missing wheel skips just its row).
@@ -200,109 +170,26 @@ def measure_crossproduct(
     compute: Callable[[], None],
     total_cells: int,
     total_bytes: int,
-    warmup_seconds: float,
-    time_limit_seconds: float,
 ) -> None:
-    """Run `compute` (one full cross-product per call) for a wall-time budget and report CUPS.
-
-    The matrix/output buffer lives inside `compute`'s closure and is reused across iterations, so no
-    allocation happens in the measured loop. After an uncounted warm-up the kernel is cycled until
-    the deadline; throughput is the TRUE aggregate cell count divided by elapsed time. Mirrors the
-    Rust `measure_throughput` cross-product blocks.
-    """
-    # Uncounted warm-up so caches and CPU frequency settle.
-    if warmup_seconds > 0:
-        warmup_deadline = now_nanoseconds() + int(warmup_seconds * 1e9)
-        while now_nanoseconds() < warmup_deadline:
-            compute()
-
-    deadline_nanoseconds = now_nanoseconds() + int(time_limit_seconds * 1e9)
-    start_nanoseconds = now_nanoseconds()
-    iterations = 0
+    """One pass is one full cross-product; the output buffer lives in `compute`'s closure."""
+    work = MeasureSpec(report="cups", elements=total_cells, total_bytes=total_bytes)
     try:
-        # At least one measured iteration, even with a zero time budget (smoke tests).
-        while True:
-            compute()
-            iterations += 1
-            if now_nanoseconds() >= deadline_nanoseconds:
-                break
+        measure(name, work, compute)
     except KeyboardInterrupt:
         print(f"\n{name}: SKIPPED (interrupted by user)")
-        return
-
-    elapsed_seconds = (now_nanoseconds() - start_nanoseconds) / 1e9
-    processed_cells = total_cells * iterations
-    processed_bytes = total_bytes * iterations
-    report_stats(name, "cups", elapsed_seconds, processed_cells, processed_bytes)
 
 
 def measure_pairwise_baseline(
     name: str,
-    scalar_function: Callable[[Any, Any], int],
-    queries: Sequence,
-    candidates: Sequence,
-    side: int,
-    query_lengths: np.ndarray,
-    candidate_lengths: np.ndarray,
-    query_byte_lengths: np.ndarray,
-    candidate_byte_lengths: np.ndarray,
-    warmup_seconds: float,
-    time_limit_seconds: float,
+    scalar_function: Callable[[Any, Any], Any],
+    queries: list,
+    candidates: list,
+    total_cells: int,
+    total_bytes: int,
 ) -> None:
-    """Benchmark a one-pair-at-a-time baseline along the cross-product diagonal.
-
-    Baselines (rapidfuzz, jellyfish, edlib, biopython, ...) have no cross-product API, so they are
-    measured exactly as bench.rs measures them: one ``(query[index], candidate[index])`` pair per
-    call, cycling the diagonal ``index in [0, side)``. Each call's true cells (length product) are
-    accumulated, so the reported CUPS are directly comparable to the StringZilla matrix engines.
-    """
-    if side <= 0:
-        print(f"{name}: No pairs to process")
-        return
-
-    if warmup_seconds > 0:
-        warmup_deadline = now_nanoseconds() + int(warmup_seconds * 1e9)
-        pair_index = 0
-        while now_nanoseconds() < warmup_deadline:
-            scalar_function(queries[pair_index], candidates[pair_index])
-            pair_index = (pair_index + 1) % side
-
-    deadline_nanoseconds = now_nanoseconds() + int(time_limit_seconds * 1e9)
-    start_nanoseconds = now_nanoseconds()
-    checksum = 0
-    processed_cells = 0
-    processed_bytes = 0
-    pair_index = 0
-    # Adaptive cadence: check the clock every `stride` pairs, doubling toward the cap so cheap
-    # pairs amortize the timer syscall while a slow pair cannot overshoot the deadline much.
-    stride = 1
-    countdown = 1
-    pacing_cap = 1024
-    pacing_target_nanoseconds = 1_000_000
-    last_check_nanoseconds = start_nanoseconds
-    try:
-        while True:
-            checksum += int(scalar_function(queries[pair_index], candidates[pair_index]))
-            processed_cells += int(query_lengths[pair_index]) * int(candidate_lengths[pair_index])
-            processed_bytes += int(query_byte_lengths[pair_index]) + int(candidate_byte_lengths[pair_index])
-            pair_index = (pair_index + 1) % side
-            countdown -= 1
-            if countdown:
-                continue
-            current_nanoseconds = now_nanoseconds()
-            if current_nanoseconds >= deadline_nanoseconds:
-                break
-            if current_nanoseconds - last_check_nanoseconds < pacing_target_nanoseconds and stride < pacing_cap:
-                stride = min(stride * 2, pacing_cap)
-            last_check_nanoseconds = current_nanoseconds
-            countdown = stride
-    except KeyboardInterrupt:
-        print(f"\n{name}: SKIPPED (interrupted by user)")
-        return
-
-    elapsed_seconds = (now_nanoseconds() - start_nanoseconds) / 1e9
-    report_stats(name, "cups", elapsed_seconds, processed_cells, processed_bytes)
-    print(f"  {name} checksum={checksum}", file=sys.stderr)
+    """One pass scores every query/candidate pair, so the pair mixture cancels exactly."""
+    work = MeasureSpec(report="cups", elements=total_cells, total_bytes=total_bytes)
+    measure(name, work, pass_over(scalar_function, queries, candidates))
 
 
 def unary_class_costs(match_cost: int, mismatch_cost: int) -> tuple[np.ndarray, np.ndarray]:
@@ -335,7 +222,7 @@ def build_device_variants(num_tokens: int, batch_size_override: int | None) -> l
     clamped to the available tokens. The GPU variant is included only when a GPU DeviceScope can be
     created. Mirrors the Rust side derivation.
     """
-    cpu_cores = os.cpu_count() or 1
+    cpu_cores = resolve_core_count()
     variants: list[DeviceVariant] = []
 
     single_cpu_budget = auto_batch_size(1, base=batch_size_override, default_base=DEFAULT_BATCH_PER_CORE)
@@ -344,7 +231,7 @@ def build_device_variants(num_tokens: int, batch_size_override: int | None) -> l
             "<1cpu>",
             szs.DeviceScope(cpu_cores=1),
             crossproduct_side(single_cpu_budget, num_tokens),
-        )
+        ),
     )
 
     all_cpu_budget = auto_batch_size(cpu_cores, base=batch_size_override, default_base=DEFAULT_BATCH_PER_CORE)
@@ -353,7 +240,7 @@ def build_device_variants(num_tokens: int, batch_size_override: int | None) -> l
             f"<{cpu_cores}cpu>",
             szs.DeviceScope(cpu_cores=cpu_cores),
             crossproduct_side(all_cpu_budget, num_tokens),
-        )
+        ),
     )
 
     try:
@@ -378,9 +265,6 @@ def benchmark_stringzillas_distances(
     byte_lengths: np.ndarray,
     metric_lengths: np.ndarray,
     is_utf8: bool,
-    warmup_seconds: float,
-    time_limit_seconds: float,
-    filter_pattern: re.Pattern | None,
 ) -> None:
     """Cross-product benchmark for a StringZilla edit-distance engine (Levenshtein / UTF-8).
 
@@ -392,7 +276,7 @@ def benchmark_stringzillas_distances(
     """
     for variant in device_variants:
         full_name = f"{engine_name}{variant.label}"
-        if not should_run(f"{category}/{full_name}", filter_pattern):
+        if not should_run(f"{category}/{full_name}"):
             continue
 
         side = variant.side
@@ -430,7 +314,7 @@ def benchmark_stringzillas_distances(
             print(f"{full_name}: SKIPPED ({compute_error})")
             continue
 
-        measure_crossproduct(full_name, compute, total_cells, total_bytes, warmup_seconds, time_limit_seconds)
+        measure_crossproduct(full_name, compute, total_cells, total_bytes)
 
 
 def benchmark_stringzillas_scores(
@@ -444,9 +328,6 @@ def benchmark_stringzillas_scores(
     gap_open: int,
     gap_extend: int,
     byte_lengths: np.ndarray,
-    warmup_seconds: float,
-    time_limit_seconds: float,
-    filter_pattern: re.Pattern | None,
 ) -> None:
     """Cross-product benchmark for a StringZilla scoring engine (Needleman-Wunsch / Smith-Waterman).
 
@@ -456,7 +337,7 @@ def benchmark_stringzillas_scores(
     """
     for variant in device_variants:
         full_name = f"{engine_name}{variant.label}"
-        if not should_run(f"{category}/{full_name}", filter_pattern):
+        if not should_run(f"{category}/{full_name}"):
             continue
 
         side = variant.side
@@ -500,7 +381,7 @@ def benchmark_stringzillas_scores(
             print(f"{full_name}: SKIPPED ({compute_error})")
             continue
 
-        measure_crossproduct(full_name, compute, total_cells, total_bytes, warmup_seconds, time_limit_seconds)
+        measure_crossproduct(full_name, compute, total_cells, total_bytes)
 
 
 def benchmark_edit_distance_baselines(
@@ -508,9 +389,6 @@ def benchmark_edit_distance_baselines(
     baseline_side: int,
     codepoint_lengths: np.ndarray,
     byte_lengths: np.ndarray,
-    warmup_seconds: float,
-    time_limit_seconds: float,
-    filter_pattern: re.Pattern | None,
     batch_size_override: int | None,
 ) -> None:
     """Third-party edit-distance baselines along the single-CPU cross-product diagonal."""
@@ -523,51 +401,68 @@ def benchmark_edit_distance_baselines(
     candidate_bytes = byte_lengths[baseline_side : 2 * baseline_side]
 
     def run(name: str, scalar_function: Callable[[Any, Any], int], length_metric: tuple[np.ndarray, np.ndarray]):
-        if not should_run(f"levenshtein/{name}", filter_pattern):
+        if not should_run(f"levenshtein/{name}"):
             return
+        # These baselines score the diagonal pairs, not a cross-product, so the work is
+        # summed pairwise: cells are len(query_i) * len(candidate_i) under whichever
+        # length metric the library uses, bytes are what is actually fed to the kernel.
+        query_lengths, candidate_lengths = length_metric
+        total_cells = int((query_lengths * candidate_lengths).sum())
+        total_bytes = int(query_bytes.sum()) + int(candidate_bytes.sum())
         measure_pairwise_baseline(
             name,
             scalar_function,
             queries,
             candidates,
-            baseline_side,
-            length_metric[0],
-            length_metric[1],
-            query_bytes,
-            candidate_bytes,
-            warmup_seconds,
-            time_limit_seconds,
+            total_cells,
+            total_bytes,
         )
 
     codepoint_metric = (query_codepoints, candidate_codepoints)
     byte_metric = (query_bytes, candidate_bytes)
 
-    if RAPIDFUZZ_AVAILABLE:
+    if not RAPIDFUZZ_AVAILABLE:
+        note_unavailable("levenshtein/rapidfuzz.Levenshtein.distance", "rapidfuzz not installed")
+    else:
         run("rapidfuzz.Levenshtein.distance", rapidfuzz_levenshtein.distance, codepoint_metric)
-    if PYTHON_LEVENSHTEIN_AVAILABLE:
+    if not PYTHON_LEVENSHTEIN_AVAILABLE:
+        note_unavailable("levenshtein/Levenshtein.distance", "python-Levenshtein not installed")
+    else:
         run("Levenshtein.distance", python_levenshtein.distance, codepoint_metric)
-    if JELLYFISH_AVAILABLE:
+    if not JELLYFISH_AVAILABLE:
+        note_unavailable("levenshtein/jellyfish.levenshtein_distance", "jellyfish not installed")
+    else:
         run("jellyfish.levenshtein_distance", jellyfish.levenshtein_distance, codepoint_metric)
-    if EDITDISTANCE_AVAILABLE:
+    if not EDITDISTANCE_AVAILABLE:
+        note_unavailable("levenshtein/editdistance.eval", "editdistance not installed")
+    else:
         run("editdistance.eval", editdistance.eval, codepoint_metric)
-    if NLTK_AVAILABLE:
+    if not NLTK_AVAILABLE:
+        note_unavailable("levenshtein/nltk.edit_distance", "nltk not installed")
+    else:
         run("nltk.edit_distance", nltk_edit_distance, codepoint_metric)
-    if EDLIB_AVAILABLE:
+    if not EDLIB_AVAILABLE:
+        note_unavailable("levenshtein/edlib.align", "edlib not installed")
+    else:
 
         def edlib_distance(first_string: str, second_string: str) -> int:
             return edlib.align(first_string, second_string, mode="NW", task="distance")["editDistance"]
 
         run("edlib.align", edlib_distance, byte_metric)
-    if POLYLEVEN_AVAILABLE:
+    if not POLYLEVEN_AVAILABLE:
+        note_unavailable("levenshtein/polyleven.levenshtein", "polyleven not installed")
+    else:
         run("polyleven.levenshtein", polyleven.levenshtein, byte_metric)
 
     # cuDF batched GPU edit distance: it scores a whole batch per call, but exposes no cross-product,
     # so it is benchmarked over the diagonal pairs as a batched array kernel.
-    if CUDF_AVAILABLE:
+    if not CUDF_AVAILABLE:
+        note_unavailable("levenshtein/cudf.edit_distance<1gpu>", "cudf not installed")
+    else:
         gpu_cores = gpu_multiprocessor_count(0) or 64
         gpu_batch_size = auto_batch_size(gpu_cores, base=batch_size_override, default_base=DEFAULT_BATCH_PER_CORE)
         name = f"cudf.edit_distance<1gpu,batch={gpu_batch_size}>"
-        if should_run(f"levenshtein/{name}", filter_pattern):
+        if should_run(f"levenshtein/{name}"):
             _benchmark_cudf_edit_distance(
                 name,
                 queries,
@@ -576,8 +471,6 @@ def benchmark_edit_distance_baselines(
                 candidate_codepoints,
                 query_bytes,
                 candidate_bytes,
-                warmup_seconds,
-                time_limit_seconds,
             )
 
 
@@ -589,8 +482,6 @@ def _benchmark_cudf_edit_distance(
     candidate_codepoints: np.ndarray,
     query_bytes: np.ndarray,
     candidate_bytes: np.ndarray,
-    warmup_seconds: float,
-    time_limit_seconds: float,
 ) -> None:
     """cuDF GPU edit-distance baseline over the diagonal pairs (one batched call per iteration)."""
     query_series = cudf.Series(queries)
@@ -603,23 +494,8 @@ def _benchmark_cudf_edit_distance(
         results = query_series.str.edit_distance(candidate_series)
         return int(results.to_arrow().to_numpy().sum())
 
-    if warmup_seconds > 0:
-        warmup_deadline = now_nanoseconds() + int(warmup_seconds * 1e9)
-        while now_nanoseconds() < warmup_deadline:
-            compute()
-
-    deadline_nanoseconds = now_nanoseconds() + int(time_limit_seconds * 1e9)
-    start_nanoseconds = now_nanoseconds()
-    iterations = 0
-    checksum = 0
-    while True:
-        checksum += compute()
-        iterations += 1
-        if now_nanoseconds() >= deadline_nanoseconds:
-            break
-    elapsed_seconds = (now_nanoseconds() - start_nanoseconds) / 1e9
-    report_stats(name, "cups", elapsed_seconds, diagonal_cells * iterations, diagonal_bytes * iterations)
-    print(f"  {name} checksum={checksum}", file=sys.stderr)
+    work = MeasureSpec(report="cups", elements=diagonal_cells, total_bytes=diagonal_bytes)
+    measure(name, work, compute)
 
 
 def benchmark_biopython_baseline(
@@ -630,9 +506,6 @@ def benchmark_biopython_baseline(
     gap_extend: int,
     category: str,
     mode: str,
-    warmup_seconds: float,
-    time_limit_seconds: float,
-    filter_pattern: re.Pattern | None,
 ) -> None:
     """BioPython PairwiseAligner baseline (global or local) over the cross-product diagonal.
 
@@ -640,9 +513,10 @@ def benchmark_biopython_baseline(
     are comparable. `mode` selects global (Needleman-Wunsch) or local (Smith-Waterman) alignment.
     """
     if not BIOPYTHON_AVAILABLE:
+        note_unavailable(f"{category}/biopython.PairwiseAligner.{mode}", "biopython not installed")
         return
     name = f"biopython.PairwiseAligner.{mode}"
-    if not should_run(f"{category}/{name}", filter_pattern):
+    if not should_run(f"{category}/{name}"):
         return
 
     aligner = Align.PairwiseAligner()
@@ -657,19 +531,9 @@ def benchmark_biopython_baseline(
     query_bytes = byte_lengths[:baseline_side]
     candidate_bytes = byte_lengths[baseline_side : 2 * baseline_side]
 
-    measure_pairwise_baseline(
-        name,
-        aligner.score,
-        queries,
-        candidates,
-        baseline_side,
-        query_bytes,
-        candidate_bytes,
-        query_bytes,
-        candidate_bytes,
-        warmup_seconds,
-        time_limit_seconds,
-    )
+    total_cells = int((query_bytes * candidate_bytes).sum())
+    total_bytes = int(query_bytes.sum()) + int(candidate_bytes.sum())
+    measure_pairwise_baseline(name, aligner.score, queries, candidates, total_cells, total_bytes)
 
 
 def perform_uniform_benchmarks(
@@ -677,9 +541,6 @@ def perform_uniform_benchmarks(
     device_variants: list[DeviceVariant],
     codepoint_lengths: np.ndarray,
     byte_lengths: np.ndarray,
-    warmup_seconds: float,
-    time_limit_seconds: float,
-    filter_pattern: re.Pattern | None,
     batch_size_override: int | None,
 ) -> None:
     """Uniform-cost group: classic Levenshtein (match=0, mismatch=1, open=1, extend=1)."""
@@ -690,9 +551,6 @@ def perform_uniform_benchmarks(
         baseline_side,
         codepoint_lengths,
         byte_lengths,
-        warmup_seconds,
-        time_limit_seconds,
-        filter_pattern,
         batch_size_override,
     )
 
@@ -706,9 +564,6 @@ def perform_uniform_benchmarks(
         byte_lengths,
         byte_lengths,  # binary metric: cells = byte_length product
         is_utf8=False,
-        warmup_seconds=warmup_seconds,
-        time_limit_seconds=time_limit_seconds,
-        filter_pattern=filter_pattern,
     )
 
     benchmark_stringzillas_distances(
@@ -721,9 +576,6 @@ def perform_uniform_benchmarks(
         byte_lengths,
         codepoint_lengths,  # UTF-8 metric: cells = codepoint_length product
         is_utf8=True,
-        warmup_seconds=warmup_seconds,
-        time_limit_seconds=time_limit_seconds,
-        filter_pattern=filter_pattern,
     )
 
 
@@ -734,9 +586,6 @@ def perform_score_benchmarks(
     group_name: str,
     gap_open: int,
     gap_extend: int,
-    warmup_seconds: float,
-    time_limit_seconds: float,
-    filter_pattern: re.Pattern | None,
 ) -> None:
     """NW/SW score group (linear or affine) with unary match=+2 / mismatch=-1 scoring."""
     byte_to_class, class_substitution_costs = unary_class_costs(2, -1)
@@ -749,9 +598,6 @@ def perform_score_benchmarks(
         gap_extend,
         "needleman-wunsch",
         "global",
-        warmup_seconds,
-        time_limit_seconds,
-        filter_pattern,
     )
     benchmark_stringzillas_scores(
         tokens,
@@ -764,9 +610,6 @@ def perform_score_benchmarks(
         gap_open,
         gap_extend,
         byte_lengths,
-        warmup_seconds,
-        time_limit_seconds,
-        filter_pattern,
     )
 
     benchmark_biopython_baseline(
@@ -777,9 +620,6 @@ def perform_score_benchmarks(
         gap_extend,
         "smith-waterman",
         "local",
-        warmup_seconds,
-        time_limit_seconds,
-        filter_pattern,
     )
     benchmark_stringzillas_scores(
         tokens,
@@ -792,19 +632,14 @@ def perform_score_benchmarks(
         gap_open,
         gap_extend,
         byte_lengths,
-        warmup_seconds,
-        time_limit_seconds,
-        filter_pattern,
     )
 
 
 _main_epilog = """
 Examples:
 
-  # Benchmark with a file
   %(prog)s --dataset leipzig1M.txt
 
-  # Benchmark protein sequences with BioPython scoring baselines
   %(prog)s --bio --dataset acgt_1k.txt
 
   # Custom time limit
@@ -835,30 +670,15 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    if not args.dataset and not os.environ.get("STRINGWARS_DATASET"):
-        parser.error("Dataset is required (use --dataset or STRINGWARS_DATASET env var)")
-
-    filter_pattern = None
-    if args.filter:
-        try:
-            filter_pattern = re.compile(args.filter)
-        except re.error as compile_error:
-            parser.error(f"Invalid regex for --filter: {compile_error}")
+    set_filter(args.filter)
 
     seed = get_env_parsed("STRINGWARS_SEED", 42)
     random.seed(seed)
 
-    # Wall-time budget per variant: --time-limit / STRINGWARS_TIME for measurement, STRINGWARS_WARMUP
-    # for the uncounted warm-up. The CLI flag wins, then the env var, then the default.
-    time_limit_seconds = get_env_parsed("STRINGWARS_TIME", args.time_limit, parser=float)
-    warmup_seconds = get_env_parsed("STRINGWARS_WARMUP", 0.0, parser=float)
-
-    # Load and tokenize the dataset; STRINGWARS_MAX_TOKENS caps the token count.
-    dataset = load_dataset(args.dataset, size_limit=args.dataset_limit)
-    tokens = tokenize_dataset(dataset, tokens_mode=resolve_tokens(args.tokens, "words"))
-    max_tokens = get_env_parsed("STRINGWARS_MAX_TOKENS", None, parser=int)
-    if max_tokens is not None and max_tokens > 0:
-        tokens = tokens[:max_tokens]
+    dataset = resolve_dataset("similarities", as_bytes=False, dataset_path=args.dataset)
+    tokens = list(dataset.tokens)
+    log_dataset(dataset)
+    log_timing_overhead()
 
     if len(tokens) < 2:
         parser.error("Dataset must contain at least two tokens for the cross-product")
@@ -878,7 +698,6 @@ def main() -> int:
         side = variant.side
         print(f"- {variant.label}: {side}x{side} cross-product ({side * side:,} pairs)")
     print(f"- Tokens available: {num_tokens:,}")
-    print(f"- Time budget per variant: {time_limit_seconds}s (warmup {warmup_seconds}s), seed {seed}")
     print()
 
     print("# uniform")
@@ -887,9 +706,6 @@ def main() -> int:
         device_variants,
         codepoint_lengths,
         byte_lengths,
-        warmup_seconds,
-        time_limit_seconds,
-        filter_pattern,
         args.batch_size,
     )
 
@@ -902,9 +718,6 @@ def main() -> int:
             "linear",
             gap_open=-2,
             gap_extend=-2,
-            warmup_seconds=warmup_seconds,
-            time_limit_seconds=time_limit_seconds,
-            filter_pattern=filter_pattern,
         )
 
         print("\n# affine")
@@ -915,11 +728,9 @@ def main() -> int:
             "affine",
             gap_open=-5,
             gap_extend=-1,
-            warmup_seconds=warmup_seconds,
-            time_limit_seconds=time_limit_seconds,
-            filter_pattern=filter_pattern,
         )
 
+    finish()
     return 0
 
 

@@ -1,32 +1,9 @@
-#![doc = r#"# StringWars: String Sequence Operations Benchmarks
+#![doc = r#"# StringWars: Sequence
 
-This file benchmarks various libraries for processing string-identifiable collections. Including sorting arrays of
-strings:
-
-- StringZilla's `sz::argsort` (byte order and Unicode case-folded `uncased` order)
-- The standard library's stable `sort_by_key` / `sort_by` (byte order, and `sz::utf8_uncased_order` folding comparator)
-- Apache Arrow's `lexsort_to_indices`, and Polars `Series`/`DataFrame` sorts
-
-Intersecting string collections, similar to "STRICT INNER JOIN" in SQL databases.
-
-## Usage Example
-
-The benchmarks use two environment variables to control the input dataset and mode:
-
-- `STRINGWARS_DATASET`: Path to the input dataset file.
-- `STRINGWARS_TOKENS`: Specifies how to interpret the input. Allowed values:
-  - `lines`: Process the dataset line by line.
-  - `words`: Process the dataset word by word.
-
-To run the benchmarks with the appropriate CPU features enabled, you can use the following commands:
+Sorting benchmarks: argsort and full sorts over the token tape, reported in comparisons/s.
 
 ```sh
-RUSTFLAGS="-C target-cpu=native" \
-    RAYON_NUM_THREADS=1 \
-    POLARS_MAX_THREADS=1 \
-    STRINGWARS_DATASET=README.md \
-    STRINGWARS_TOKENS=lines \
-    cargo bench --features bench_sequence --bench bench_sequence
+STRINGWARS_DATASET=README.md cargo bench --features bench_sequence --bench bench_sequence
 ```
 "#]
 
@@ -41,36 +18,39 @@ use polars::prelude::*;
 use stringzilla::sz;
 use stringzilla::sz::ArgsortOptions;
 
-#[path = "../utils.rs"]
-mod utils;
-use utils::{
-    install_panic_hook, load_dataset_with_default_mode, log_stringzilla_metadata,
-    measure_throughput, reclaim_memory, should_run, BenchBudget, ReportAs, ResultExt, WorkUnits,
+use stringwars::{
+    finish, install_panic_hook, log_stringzilla_metadata, log_timing_overhead, measure,
+    measure_with_setup, reclaim_memory, resolve_dataset, should_run, MeasureSpec, ResultExt, Unit,
+    WorkUnits,
 };
 
 fn measure_argsort<Sort: FnMut(&[&str], &mut Vec<usize>)>(
     name: &str,
-    budget: &BenchBudget,
     references: &[&str],
     comparisons_estimate: u64,
     total_bytes: u64,
-    indices: &mut Vec<usize>,
     mut sort: Sort,
 ) {
-    if !should_run(name) {
-        return;
-    }
     let count = references.len();
-    measure_throughput(name, ReportAs::Comparisons, budget, || {
-        indices.clear();
-        indices.extend(0..count);
-        sort(references, indices);
-        black_box(&indices);
-        WorkUnits::new(comparisons_estimate, total_bytes)
-    });
+    // Rebuilding the index vector is setup, not the kernel: sorting consumes its
+    // input, so a second pass would sort already-sorted data. Excluding it here is
+    // what the Python suite always did; Rust used to time it and the two argsort
+    // rows were never comparable.
+    measure_with_setup(
+        name,
+        MeasureSpec::new(
+            Unit::Comparisons,
+            WorkUnits::new(comparisons_estimate, total_bytes),
+        ),
+        || (0..count).collect::<Vec<usize>>(),
+        |indices| {
+            sort(references, indices);
+            black_box(&indices);
+        },
+    );
 }
 
-fn bench_argsort(budget: &BenchBudget, unsorted: &CharsCowsAuto<'static>) {
+fn bench_argsort(unsorted: &CharsCowsAuto<'static>) {
     // For comparison-based sorting algorithms, we report throughput in terms of comparisons,
     // which is proportional to the number of elements in the array multiplied by the logarithm of
     // the number of elements. Each full sort accomplishes one batch of `comparisons_estimate`
@@ -78,8 +58,6 @@ fn bench_argsort(budget: &BenchBudget, unsorted: &CharsCowsAuto<'static>) {
     let count = unsorted.len();
     let comparisons_estimate = (count as f64 * (count as f64).log2()) as u64;
     let total_bytes: u64 = unsorted.iter().map(|token| token.len() as u64).sum();
-
-    let mut reusable_indices = Vec::with_capacity(count);
 
     // StringZilla's sort is always stable, so every competitor is configured for a stable sort
     // too: Polars keeps `maintain_order: true` (its default leaves equal keys in arbitrary order).
@@ -99,14 +77,11 @@ fn bench_argsort(budget: &BenchBudget, unsorted: &CharsCowsAuto<'static>) {
     // data structures and are handled separately below.
     let unsorted_references: Vec<&str> = unsorted.iter().collect();
 
-    // Benchmark: StringZilla's argsort
     measure_argsort(
         "argsort/stringzilla::argsort",
-        budget,
         &unsorted_references,
         comparisons_estimate,
         total_bytes,
-        &mut reusable_indices,
         |references, indices| {
             sz::argsort(references, indices, ArgsortOptions::default())
                 .expect("StringZilla argsort failed");
@@ -117,11 +92,9 @@ fn bench_argsort(budget: &BenchBudget, unsorted: &CharsCowsAuto<'static>) {
     // StringZilla orders by `sz_sequence_argsort_utf8_uncased` without materializing folded keys.
     measure_argsort(
         "argsort/stringzilla::argsort<uncased>",
-        budget,
         &unsorted_references,
         comparisons_estimate,
         total_bytes,
-        &mut reusable_indices,
         |references, indices| {
             sz::argsort(references, indices, ArgsortOptions::default().uncased())
                 .expect("StringZilla uncased argsort failed");
@@ -133,11 +106,9 @@ fn bench_argsort(budget: &BenchBudget, unsorted: &CharsCowsAuto<'static>) {
     // keep the head-to-head honest — both preserve the input order of equal keys.
     measure_argsort(
         "argsort/std::sort_by_key",
-        budget,
         &unsorted_references,
         comparisons_estimate,
         total_bytes,
-        &mut reusable_indices,
         |references, indices| {
             indices.sort_by_key(|&index| references[index]);
         },
@@ -149,11 +120,9 @@ fn bench_argsort(budget: &BenchBudget, unsorted: &CharsCowsAuto<'static>) {
     // variable — the sort algorithm (std's stable mergesort vs StringZilla's radix argsort).
     measure_argsort(
         "argsort/std::sort_by<uncased>",
-        budget,
         &unsorted_references,
         comparisons_estimate,
         total_bytes,
-        &mut reusable_indices,
         |references, indices| {
             indices.sort_by(|&left, &right| {
                 sz::utf8_uncased_order(references[left], references[right])
@@ -169,10 +138,12 @@ fn bench_argsort(budget: &BenchBudget, unsorted: &CharsCowsAuto<'static>) {
     if should_run("argsort/arrow::lexsort_to_indices") {
         let array = Arc::new(LargeStringArray::from_iter_values(unsorted.iter())) as ArrayRef;
 
-        measure_throughput(
+        measure(
             "argsort/arrow::lexsort_to_indices",
-            ReportAs::Comparisons,
-            budget,
+            MeasureSpec::new(
+                Unit::Comparisons,
+                WorkUnits::new(comparisons_estimate, total_bytes),
+            ),
             || {
                 let column_to_sort = SortColumn {
                     values: array.clone(),
@@ -185,7 +156,6 @@ fn bench_argsort(budget: &BenchBudget, unsorted: &CharsCowsAuto<'static>) {
                     Ok(indices) => black_box(indices),
                     Err(error) => panic!("Arrow lexsort failed: {:?}", error),
                 };
-                WorkUnits::new(comparisons_estimate, total_bytes)
             },
         );
 
@@ -198,14 +168,15 @@ fn bench_argsort(budget: &BenchBudget, unsorted: &CharsCowsAuto<'static>) {
     if should_run("argsort/polars::Series::sort") {
         // Polars can create Series from an iterator of &str
         let polars_series = Series::new(COLUMN_NAME.into(), unsorted.iter().collect::<Vec<&str>>());
-        measure_throughput(
+        measure(
             "argsort/polars::Series::sort",
-            ReportAs::Comparisons,
-            budget,
+            MeasureSpec::new(
+                Unit::Comparisons,
+                WorkUnits::new(comparisons_estimate, total_bytes),
+            ),
             || {
                 let sorted = polars_series.sort(POLARS_SORT_OPTIONS).unwrap();
                 let _ = black_box(sorted);
-                WorkUnits::new(comparisons_estimate, total_bytes)
             },
         );
         drop(polars_series);
@@ -215,14 +186,15 @@ fn bench_argsort(budget: &BenchBudget, unsorted: &CharsCowsAuto<'static>) {
     // Benchmark: Polars Series argsort (returning indices)
     if should_run("argsort/polars::Series::arg_sort") {
         let polars_series = Series::new(COLUMN_NAME.into(), unsorted.iter().collect::<Vec<&str>>());
-        measure_throughput(
+        measure(
             "argsort/polars::Series::arg_sort",
-            ReportAs::Comparisons,
-            budget,
+            MeasureSpec::new(
+                Unit::Comparisons,
+                WorkUnits::new(comparisons_estimate, total_bytes),
+            ),
             || {
                 let indices = polars_series.arg_sort(POLARS_SORT_OPTIONS);
                 black_box(indices);
-                WorkUnits::new(comparisons_estimate, total_bytes)
             },
         );
         drop(polars_series);
@@ -239,16 +211,17 @@ fn bench_argsort(budget: &BenchBudget, unsorted: &CharsCowsAuto<'static>) {
         )
         .unwrap();
 
-        measure_throughput(
+        measure(
             "argsort/polars::DataFrame::sort",
-            ReportAs::Comparisons,
-            budget,
+            MeasureSpec::new(
+                Unit::Comparisons,
+                WorkUnits::new(comparisons_estimate, total_bytes),
+            ),
             || {
                 let sorted = polars_dataframe
                     .sort([COLUMN_NAME], polars_sort_multiple_options.clone())
                     .unwrap();
                 black_box(sorted);
-                WorkUnits::new(comparisons_estimate, total_bytes)
             },
         );
 
@@ -262,16 +235,15 @@ fn main() {
     install_panic_hook();
     log_stringzilla_metadata();
 
-    // Load the dataset defined by the environment variables
-    let tokens_bytes = load_dataset_with_default_mode("lines").unwrap_nice();
-    // Leak BytesCowsAuto to get 'static lifetime, then cast to CharsCowsAuto for UTF-8 string benchmarks
+    let tokens_bytes = resolve_dataset("sequence").unwrap_nice();
+    log_timing_overhead();
     let tokens_bytes_static: &'static _ = Box::leak(Box::new(tokens_bytes));
     let tokens = tokens_bytes_static
         .as_chars()
         .expect("Dataset must be valid UTF-8");
 
-    let budget = BenchBudget::from_env(5.0, 10.0);
-
     println!("# argsort");
-    bench_argsort(&budget, &tokens);
+    bench_argsort(&tokens);
+
+    finish();
 }

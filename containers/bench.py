@@ -7,32 +7,9 @@
 #   "numpy",
 # ]
 # ///
-"""
-Multi-way word hashing and probabilistic membership benchmarks, mirroring containers/bench.rs.
-
-Layer 1 produces a {128, 256, 512, 1024}-bit digest of independent hash bits per word, reported as
-digest bits/s. Every variant writes into one preallocated NumPy buffer (no per-call list), so only
-the hashing differs:
-- StringZilla `hash_multiseed` fills `digest_bits / 64` 64-bit slots in one native call.
-- StringZilla `hash` called once per seed, re-preparing the input every 64 bits.
-- `xxh3_128` once per seed, using the full 128 bits, re-preparing the input every 128 bits. The cheap
-  double-hashing shortcut is not measured — its extra bits are linearly dependent.
-
-Layer 2 builds a pyprobables Bloom filter two ways — its default FNV-1a hashing versus StringZilla's
-`hash_multiseed` handed to `add_alt`/`check_alt` as precomputed hashes (the same filter, hash source
-swapped) — then queries a held-out set to measure the false-positive rate.
-
-Environment variables:
-- STRINGWARS_DATASET: Path to input dataset file
-- STRINGWARS_TOKENS: Tokenization mode ('lines', 'words', 'file')
-
-Examples:
-  uv run containers/bench.py --dataset xlsum.csv --tokens words
-  uv run containers/bench.py --dataset data.txt --tokens words -k "multiseed"
-"""
+"""Hash-container benchmarks in Python: multi-seed digests and filters. Mirrors `containers/bench.rs`."""
 
 import argparse
-import re
 import sys
 from array import array
 from collections.abc import Callable
@@ -43,14 +20,15 @@ import xxhash
 from probables import BloomFilter
 
 from utils import (
+    MeasureSpec,
     add_common_args,
-    load_dataset,
-    now_nanoseconds,
-    paced_items,
-    report_stats,
-    resolve_tokens,
-    should_run,
-    tokenize_dataset,
+    finish,
+    log_dataset,
+    log_timing_overhead,
+    measure,
+    pass_over,
+    resolve_dataset,
+    set_filter,
 )
 
 # Sixteen fixed odd seeds shared by every multi-hash variant, matching containers/bench.rs.
@@ -89,51 +67,38 @@ def bench_multihash(
     tokens: list[bytes],
     produce: Callable[[bytes], object],
     digest_bits: int,
-    time_limit: float,
 ):
-    """Time one multi-hash variant, calling `produce` once per word to emit `digest_bits` digest bits."""
-    start = now_nanoseconds()
-    deadline = start + int(time_limit * 1e9)
-    count = 0
-    total_bytes = 0
-    for token in paced_items(tokens, deadline):
-        produce(token)
-        count += 1
-        total_bytes += len(token)
-    seconds = (now_nanoseconds() - start) / 1e9
-    report_stats(name, "bits", seconds, count * digest_bits, total_bytes)
+    """One pass emits `digest_bits` digest bits for every token."""
+    work = MeasureSpec(
+        report="bits",
+        elements=len(tokens) * digest_bits,
+        total_bytes=sum(len(token) for token in tokens),
+    )
+    measure(name, work, pass_over(produce, tokens))
 
 
-def bench_build(name: str, count: int, total_bytes: int, build: Callable[[], object], time_limit: float):
-    """Time filter construction, rebuilding from every key on each pass."""
-    start = now_nanoseconds()
-    deadline = start + int(time_limit * 1e9)
-    passes = 0
-    while True:
-        build()
-        passes += 1
-        if now_nanoseconds() >= deadline:
-            break
-    seconds = (now_nanoseconds() - start) / 1e9
-    report_stats(name, "hashes", seconds, passes * count, passes * total_bytes)
+def bench_build(name: str, count: int, total_bytes: int, build: Callable[[], object]):
+    """One pass rebuilds the whole filter from every key."""
+    work = MeasureSpec(report="hashes", elements=count, total_bytes=total_bytes)
+    measure(name, work, build)
 
 
-def bench_query(name: str, probes: list[bytes], query: Callable[[bytes], bool], time_limit: float):
-    """Time membership queries, cycling one probe per call."""
-    start = now_nanoseconds()
-    deadline = start + int(time_limit * 1e9)
-    count = 0
-    total_bytes = 0
-    for token in paced_items(probes, deadline):
-        query(token)
-        count += 1
-        total_bytes += len(token)
-    seconds = (now_nanoseconds() - start) / 1e9
-    report_stats(name, "hashes", seconds, count, total_bytes)
+def bench_query(name: str, probes: list[bytes], query: Callable[[bytes], bool]):
+    """One pass queries every probe."""
+    work = MeasureSpec(
+        report="hashes",
+        elements=len(probes),
+        total_bytes=sum(len(probe) for probe in probes),
+    )
+    measure(name, work, pass_over(query, probes))
 
 
 def report_quality(
-    label: str, num_bits: int, inserted_count: int, absent: list[bytes], contains: Callable[[bytes], bool]
+    label: str,
+    num_bits: int,
+    inserted_count: int,
+    absent: list[bytes],
+    contains: Callable[[bytes], bool],
 ):
     """Report the measured false-positive rate over the held-out absent words plus bits-per-key."""
     false_positives = sum(1 for token in absent if contains(token))
@@ -142,7 +107,7 @@ def report_quality(
     print(f"    {label:<38} {bits}, measured FPR {rate:.3f}%")
 
 
-def run_multihash(tokens: list[bytes], filter_pattern: re.Pattern | None, time_limit: float):
+def run_multihash(tokens: list[bytes]):
     for digest_bits in (128, 256, 512, 1024):
         print(f"# multihash ({digest_bits}-bit digest)")
         sz_hashes = digest_bits // 64
@@ -151,34 +116,36 @@ def run_multihash(tokens: list[bytes], filter_pattern: re.Pattern | None, time_l
         # One preallocated digest buffer reused every call, so no variant pays per-call allocation.
         out = np.empty(sz_hashes, dtype=np.uint64)
 
-        if should_run("multihash/stringzilla.hash_multiseed", filter_pattern):
-            bench_multihash(
-                "multihash/stringzilla.hash_multiseed",
-                tokens,
-                lambda token, seeds=seeds, out=out: sz.hash_multiseed(token, seeds, out),
-                digest_bits,
-                time_limit,
-            )
-        if should_run("multihash/stringzilla.hash", filter_pattern):
+        bench_multihash(
+            "multihash/stringzilla.hash_multiseed",
+            tokens,
+            lambda token, seeds=seeds, out=out: sz.hash_multiseed(token, seeds, out),
+            digest_bits,
+        )
 
-            def sz_hash_fill(token, seeds=seeds, out=out):
-                for index, seed in enumerate(seeds):
-                    out[index] = sz.hash(token, seed)
+        def sz_hash_fill(token, seeds=seeds, out=out):
+            for index, seed in enumerate(seeds):
+                out[index] = sz.hash(token, seed)
 
-            bench_multihash("multihash/stringzilla.hash", tokens, sz_hash_fill, digest_bits, time_limit)
-        if should_run("multihash/xxhash.xxh3_128", filter_pattern):
-            # One full 128-bit xxh3 hash per seed — every bit is independent, no double-hashing —
-            # split across two 64-bit slots of the shared buffer.
-            def xxh3_fill(token, n=xxh3_calls, out=out):
-                for index in range(n):
-                    wide = xxhash.xxh3_128_intdigest(token, seed=SEEDS[index])
-                    out[2 * index] = wide & MASK_64
-                    out[2 * index + 1] = wide >> 64
+        bench_multihash(
+            "multihash/stringzilla.hash",
+            tokens,
+            sz_hash_fill,
+            digest_bits,
+        )
 
-            bench_multihash("multihash/xxhash.xxh3_128", tokens, xxh3_fill, digest_bits, time_limit)
+        # One full 128-bit xxh3 hash per seed — every bit is independent, no double-hashing —
+        # split across two 64-bit slots of the shared buffer.
+        def xxh3_fill(token, n=xxh3_calls, out=out):
+            for index in range(n):
+                wide = xxhash.xxh3_128_intdigest(token, seed=SEEDS[index])
+                out[2 * index] = wide & MASK_64
+                out[2 * index + 1] = wide >> 64
+
+        bench_multihash("multihash/xxhash.xxh3_128", tokens, xxh3_fill, digest_bits)
 
 
-def run_filters(unique: list[bytes], filter_pattern: re.Pattern | None, time_limit: float):
+def run_filters(unique: list[bytes]):
     inserted_count = min(len(unique) * 8 // 10, 1_000_000) or 1
     inserted = unique[:inserted_count]
     absent = unique[inserted_count:]
@@ -190,16 +157,14 @@ def run_filters(unique: list[bytes], filter_pattern: re.Pattern | None, time_lim
     for token in inserted:
         bloom.add(token)
     report_quality("bloom/pyprobables<fnv>", bloom.number_bits, inserted_count, absent, bloom.check)
-    if should_run("bloom/pyprobables.add<fnv>", filter_pattern):
 
-        def build_bloom():
-            filter_ = BloomFilter(est_elements=inserted_count, false_positive_rate=TARGET_FALSE_POSITIVE_RATE)
-            for token in inserted:
-                filter_.add(token)
+    def build_bloom():
+        filter_ = BloomFilter(est_elements=inserted_count, false_positive_rate=TARGET_FALSE_POSITIVE_RATE)
+        for token in inserted:
+            filter_.add(token)
 
-        bench_build("bloom/pyprobables.add<fnv>", inserted_count, inserted_bytes, build_bloom, time_limit)
-    if should_run("bloom/pyprobables.check<fnv>", filter_pattern):
-        bench_query("bloom/pyprobables.check<fnv>", inserted, bloom.check, time_limit)
+    bench_build("bloom/pyprobables.add<fnv>", inserted_count, inserted_bytes, build_bloom)
+    bench_query("bloom/pyprobables.check<fnv>", inserted, bloom.check)
 
     # Same filter, fed StringZilla's `hash_multiseed` digest through the precomputed-hash API: one
     # native call fills the reused buffer, then `add_alt`/`check_alt` consume it — no per-key callback.
@@ -220,18 +185,18 @@ def run_filters(unique: list[bytes], filter_pattern: re.Pattern | None, time_lim
         absent,
         lambda t: bloom_sz.check_alt(sz_digest(t)),
     )
-    if should_run("bloom/pyprobables.add<stringzilla>", filter_pattern):
 
-        def build_bloom_sz():
-            filter_ = BloomFilter(est_elements=inserted_count, false_positive_rate=TARGET_FALSE_POSITIVE_RATE)
-            for token in inserted:
-                filter_.add_alt(sz_digest(token))
+    def build_bloom_sz():
+        filter_ = BloomFilter(est_elements=inserted_count, false_positive_rate=TARGET_FALSE_POSITIVE_RATE)
+        for token in inserted:
+            filter_.add_alt(sz_digest(token))
 
-        bench_build("bloom/pyprobables.add<stringzilla>", inserted_count, inserted_bytes, build_bloom_sz, time_limit)
-    if should_run("bloom/pyprobables.check<stringzilla>", filter_pattern):
-        bench_query(
-            "bloom/pyprobables.check<stringzilla>", inserted, lambda t: bloom_sz.check_alt(sz_digest(t)), time_limit
-        )
+    bench_build("bloom/pyprobables.add<stringzilla>", inserted_count, inserted_bytes, build_bloom_sz)
+    bench_query(
+        "bloom/pyprobables.check<stringzilla>",
+        inserted,
+        lambda t: bloom_sz.check_alt(sz_digest(t)),
+    )
 
 
 def main():
@@ -242,15 +207,12 @@ def main():
     add_common_args(parser)
     args = parser.parse_args()
 
-    filter_pattern = None
-    if args.filter:
-        try:
-            filter_pattern = re.compile(args.filter)
-        except re.error as error:
-            parser.error(f"Invalid regex for --filter: {error}")
+    set_filter(args.filter)
 
-    dataset = load_dataset(args.dataset, as_bytes=True, size_limit=args.dataset_limit)
-    tokens = tokenize_dataset(dataset, resolve_tokens(args.tokens, "words"))
+    dataset = resolve_dataset("containers", as_bytes=True, dataset_path=args.dataset)
+    log_dataset(dataset)
+    log_timing_overhead()
+    tokens = dataset.tokens
     if not tokens:
         print("No tokens found in dataset")
         return 1
@@ -260,8 +222,9 @@ def main():
     print(f"Dataset: {len(tokens):,} tokens, {total_bytes:,} bytes, {len(unique):,} unique")
     log_system_info()
 
-    run_multihash(tokens, filter_pattern, args.time_limit)
-    run_filters(unique, filter_pattern, args.time_limit)
+    run_multihash(tokens)
+    run_filters(unique)
+    finish()
     return 0
 
 

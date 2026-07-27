@@ -8,50 +8,30 @@
 #   "tqdm",
 # ]
 # ///
-"""
-Fingerprinting benchmarks in Python: docs/s for MinHash operations.
-
-- MinHash: datasketch.MinHash, stringzillas.Fingerprints, cudf.minhash_ngrams,
-  and cudf.minhash64_ngrams (if RAPIDS cuDF is installed).
-
-Environment variables:
-- STRINGWARS_DATASET: Path to input dataset file
-- STRINGWARS_TOKENS: Tokenization mode ('lines', 'words', 'file')
-- STRINGWARS_BATCH_PER_CORE: Items processed per core (default: 128)
-
-The only batch knob is STRINGWARS_BATCH_PER_CORE (items per core); the per-device batch is
-auto-derived from the hardware core count — one CPU core is a core, one GPU streaming
-multiprocessor (SM) is a core — so each device is fed enough work without manual scaling.
-The --batch-size flag overrides STRINGWARS_BATCH_PER_CORE as the per-core base.
-
-Examples:
-  uv run --with stringzillas-cpus fingerprints/bench.py --dataset README.md --tokens lines
-  uv run --with stringzillas-cpus fingerprints/bench.py --dataset xlsum.csv --tokens words -k "datasketch"
-  STRINGWARS_DATASET=data.txt STRINGWARS_TOKENS=lines uv run --with stringzillas-cpus fingerprints/bench.py
-"""
+"""MinHash fingerprinting benchmarks in Python across CPU and GPU. Mirrors `fingerprints/bench.rs`."""
 
 import argparse
-import os
-import re
 import sys
 
 import numpy as np
 import stringzilla as sz
 import stringzillas as szs
 from datasketch import MinHash
-from tqdm import tqdm
 
 from utils import (
+    MeasureSpec,
     add_common_args,
     auto_batch_size,
-    clamped_subranges,
+    finish,
     gpu_multiprocessor_count,
-    load_dataset,
-    now_nanoseconds,
-    report_stats,
-    resolve_tokens,
+    log_dataset,
+    log_timing_overhead,
+    measure,
+    note_unavailable,
+    resolve_core_count,
+    resolve_dataset,
+    set_filter,
     should_run,
-    tokenize_dataset,
 )
 
 # For RAPIDS cuDF GPU-accelerated MinHash
@@ -81,38 +61,27 @@ def log_system_info():
     print()  # Add blank line
 
 
-def bench_fingerprint(name, documents, kernel, doc_bytes, dimensions, time_limit_seconds, batch_size):
-    """Time kernel over documents in batches until the deadline; report hashes/s and bytes/s."""
+def bench_fingerprint(name, documents, kernel, doc_bytes, dimensions, batch_size):
+    """One pass sketches every document, in batches; reports hashes/s and bytes/s."""
     count = len(documents)
-    deadline_nanoseconds = now_nanoseconds() + int(time_limit_seconds * 1e9)
-    start_time = now_nanoseconds()
-    processed = 0
-    bar = tqdm(total=count, desc=name, unit="docs", leave=False)
-    try:
-        for low, high in clamped_subranges(count, batch_size):
-            if now_nanoseconds() >= deadline_nanoseconds:
-                break
-            kernel(documents[low:high])
-            processed = high
-            bar.update(high - low)
-    finally:
-        bar.close()
+    total_bytes = int(doc_bytes.sum())
+    # Hash operations mirror the Rust harness: `dimensions` hash updates per byte.
+    work = MeasureSpec(report="hashes", elements=dimensions * total_bytes, total_bytes=total_bytes)
 
-    elapsed_seconds = (now_nanoseconds() - start_time) / 1e9
-    processed_bytes = int(doc_bytes[:processed].sum())
-    # Hash operations mirror the Rust harness: dimensions hash updates per byte of each
-    # processed document, so total_hash_ops = dimensions * bytes spanned by processed docs.
-    total_hash_ops = dimensions * processed_bytes
-    report_stats(name, "hashes", elapsed_seconds, total_hash_ops, processed_bytes)
+    def one_pass() -> None:
+        for low in range(0, count, batch_size):
+            kernel(documents[low : min(low + batch_size, count)])
+
+    measure(name, work, one_pass)
 
 
 def document_byte_lengths(documents):
     return np.fromiter((len(document.encode("utf-8")) for document in documents), dtype=np.int64, count=len(documents))
 
 
-def benchmark_stringzillas(documents, dimensions, batch_size, time_limit_seconds, filter_pattern):
+def benchmark_stringzillas(documents, dimensions, batch_size):
     """StringZilla Fingerprints on 1 core, all cores, and the GPU (if present)."""
-    cpu_cores = os.cpu_count()
+    cpu_cores = resolve_core_count()
     default_scope = szs.DeviceScope()
     cpu_scope = szs.DeviceScope(cpu_cores=cpu_cores)
     try:
@@ -125,7 +94,9 @@ def benchmark_stringzillas(documents, dimensions, batch_size, time_limit_seconds
 
     all_cpu_batch_size = auto_batch_size(cpu_cores, base=batch_size, default_base=DEFAULT_BATCH_PER_CORE)
     gpu_batch_size = auto_batch_size(
-        gpu_multiprocessor_count(0) or 64, base=batch_size, default_base=DEFAULT_BATCH_PER_CORE
+        gpu_multiprocessor_count(0) or 64,
+        base=batch_size,
+        default_base=DEFAULT_BATCH_PER_CORE,
     )
 
     def run_variant(suffix, scope, variant_batch_size):
@@ -140,31 +111,31 @@ def benchmark_stringzillas(documents, dimensions, batch_size, time_limit_seconds
             kernel,
             doc_bytes,
             dimensions,
-            time_limit_seconds,
             variant_batch_size,
         )
 
-    if should_run("minhash/stringzillas.Fingerprints<1cpu>", filter_pattern):
-        run_variant("<1cpu>", default_scope, 1)
-    if should_run(f"minhash/stringzillas.Fingerprints<{cpu_cores}cpu,batch={all_cpu_batch_size}>", filter_pattern):
+    run_variant("<1cpu>", default_scope, 1)
+    if should_run(f"minhash/stringzillas.Fingerprints<{cpu_cores}cpu,batch={all_cpu_batch_size}>"):
         run_variant(f"<{cpu_cores}cpu,batch={all_cpu_batch_size}>", cpu_scope, all_cpu_batch_size)
     if gpu_scope is not None and should_run(
-        f"minhash/stringzillas.Fingerprints<1gpu,batch={gpu_batch_size}>", filter_pattern
+        f"minhash/stringzillas.Fingerprints<1gpu,batch={gpu_batch_size}>",
     ):
         run_variant(f"<1gpu,batch={gpu_batch_size}>", gpu_scope, gpu_batch_size)
 
 
-def benchmark_datasketch(documents, dimensions, batch_size, time_limit_seconds, filter_pattern):
+def benchmark_datasketch(documents, dimensions, batch_size):
     """datasketch MinHash on CPU: the common data-science baseline, n-grams built in Python."""
-    if not should_run("minhash/datasketch.MinHash", filter_pattern):
+    if not should_run("minhash/datasketch.MinHash"):
         return
     cpu_batch_size = auto_batch_size(1, base=batch_size, default_base=DEFAULT_BATCH_PER_CORE)
     per_width = max(1, dimensions // len(NGRAM_WIDTHS))
     doc_bytes = document_byte_lengths(documents)
+    # Encoded once: doing it inside the kernel charged datasketch a full UTF-8
+    # encode of the working set on every pass that the StringZilla rows never pay.
+    encoded = [document.encode("utf-8") for document in documents]
 
     def kernel(slice_of_documents):
-        for document in slice_of_documents:
-            data = document.encode("utf-8")
+        for data in slice_of_documents:
             for width in NGRAM_WIDTHS:
                 signature = MinHash(num_perm=per_width)
                 for offset in range(len(data) - width + 1):
@@ -172,16 +143,23 @@ def benchmark_datasketch(documents, dimensions, batch_size, time_limit_seconds, 
                 _ = signature.hashvalues  # force materialization
 
     bench_fingerprint(
-        "datasketch.MinHash", documents, kernel, doc_bytes, dimensions, time_limit_seconds, cpu_batch_size
+        "datasketch.MinHash",
+        encoded,
+        kernel,
+        doc_bytes,
+        dimensions,
+        cpu_batch_size,
     )
 
 
-def benchmark_cudf(documents, dimensions, batch_size, time_limit_seconds, filter_pattern):
+def benchmark_cudf(documents, dimensions, batch_size):
     """cuDF MinHash on the GPU: the CUDA first-party comparison (optional, best-effort)."""
     gpu_batch_size = auto_batch_size(
-        gpu_multiprocessor_count(0) or 64, base=batch_size, default_base=DEFAULT_BATCH_PER_CORE
+        gpu_multiprocessor_count(0) or 64,
+        base=batch_size,
+        default_base=DEFAULT_BATCH_PER_CORE,
     )
-    if not should_run(f"minhash/cudf.minhash<1gpu,batch={gpu_batch_size}>", filter_pattern):
+    if not should_run(f"minhash/cudf.minhash<1gpu,batch={gpu_batch_size}>"):
         return
     try:
         import cupy as cp
@@ -206,7 +184,6 @@ def benchmark_cudf(documents, dimensions, batch_size, time_limit_seconds, filter
             kernel,
             doc_bytes,
             dimensions,
-            time_limit_seconds,
             gpu_batch_size,
         )
     except Exception as error:
@@ -216,10 +193,8 @@ def benchmark_cudf(documents, dimensions, batch_size, time_limit_seconds, filter
 _main_epilog = """
 Examples:
 
-  # Benchmark all algorithms with default settings
   %(prog)s --dataset leipzig1M.txt
 
-  # Benchmark with limited docs and specific dimensions
   %(prog)s --dataset leipzig1M.txt --max-docs 1000 --dimensions 128
 
   # Test only specific algorithms
@@ -261,37 +236,28 @@ def main():
     args = parser.parse_args()
 
     # Compile filter pattern
-    filter_pattern = None
-    if args.filter:
-        try:
-            filter_pattern = re.compile(args.filter)
-        except re.error as e:
-            parser.error(f"Invalid regex for --filter: {e}")
+    set_filter(args.filter)
 
     # Load and tokenize dataset
-    dataset = load_dataset(args.dataset, size_limit=args.dataset_limit)
-    tokens = tokenize_dataset(dataset, resolve_tokens(args.tokens, "lines"))
-
-    if not tokens:
-        print("No tokens found in dataset")
-        return 1
+    dataset = resolve_dataset("fingerprints", as_bytes=False, dataset_path=args.dataset)
+    tokens = dataset.tokens
+    log_dataset(dataset)
+    log_timing_overhead()
 
     # Limit number of documents if specified
     if args.max_docs is not None:
         tokens = tokens[: args.max_docs]
 
-    docs_sizes = [len(doc.encode("utf-8")) for doc in tokens]
-    total_bytes = sum(docs_sizes)
-    avg_doc_length = total_bytes / len(tokens) if tokens else 0
-
-    print(f"Dataset: {len(tokens):,} docs, {total_bytes:,} bytes, {avg_doc_length:.1f} avg doc length")
     log_system_info()
 
     print("\nMinHash Throughput")
-    benchmark_stringzillas(tokens, args.dimensions, args.batch_size, args.time_limit, filter_pattern)
-    benchmark_datasketch(tokens, args.dimensions, args.batch_size, args.time_limit, filter_pattern)
-    if CUDF_AVAILABLE:
-        benchmark_cudf(tokens, args.dimensions, args.batch_size, args.time_limit, filter_pattern)
+    benchmark_stringzillas(tokens, args.dimensions, args.batch_size)
+    benchmark_datasketch(tokens, args.dimensions, args.batch_size)
+    if not CUDF_AVAILABLE:
+        note_unavailable("minhash/cudf.minhash<1gpu>", "cudf not installed")
+    else:
+        benchmark_cudf(tokens, args.dimensions, args.batch_size)
+    finish()
     return 0
 
 

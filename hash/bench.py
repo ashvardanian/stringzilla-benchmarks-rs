@@ -9,37 +9,10 @@
 #   "cityhash",
 # ]
 # ///
-"""
-Python hash function benchmarks comparing various implementations.
-
-Benchmarks hash function performance using consistent methodology with the Rust
-hash/bench.rs implementation, focusing on three categories of hashing patterns.
-
-Benchmark categories:
-- Stateless: Hash each token independently (non-cryptographic)
-- Stateful: Incremental hashing across all tokens (non-cryptographic)
-- Checksum: Cryptographic hashes and reference bounds
-
-Hash functions compared:
-- Built-in Python: hash()
-- StringZilla: sz.hash(), sz.bytesum(), sz.Sha256
-- xxHash: xxh3_64, xxh64, xxh32 variants
-- Blake3: Modern cryptographic hash
-- hashlib: SHA256 for comparison with StringZilla
-
-Environment variables:
-- STRINGWARS_DATASET: Path to input dataset file
-- STRINGWARS_TOKENS: Tokenization mode ('lines', 'words', 'file')
-
-Examples:
-  uv run hash/bench.py --dataset README.md --tokens lines
-  uv run hash/bench.py --dataset xlsum.csv --tokens words -k "xxhash"
-  STRINGWARS_DATASET=data.txt STRINGWARS_TOKENS=lines uv run hash/bench.py
-"""
+"""Hash benchmarks in Python: stateless, stateful and checksum digests. Mirrors `hash/bench.rs`."""
 
 import argparse
 import hashlib
-import re
 import sys
 from collections.abc import Callable
 from importlib.metadata import version as pkg_version
@@ -53,14 +26,15 @@ import stringzilla as sz
 import xxhash
 
 from utils import (
+    MeasureSpec,
     add_common_args,
-    load_dataset,
-    now_nanoseconds,
-    paced_items,
-    report_stats,
-    resolve_tokens,
-    should_run,
-    tokenize_dataset,
+    finish,
+    log_dataset,
+    log_timing_overhead,
+    measure,
+    pass_over,
+    resolve_dataset,
+    set_filter,
 )
 
 
@@ -80,146 +54,105 @@ def bench_hash_function(
     name: str,
     tokens: list[bytes],
     hash_func: Callable[[bytes], Any],
-    time_limit_seconds: float = 10.0,
+    work: MeasureSpec,
 ) -> None:
     """
-    Benchmark a stateless hash function and report throughput.
+    Benchmark a stateless hash function over the whole working set.
 
-    Processes tokens until time limit is reached, then reports results.
+    One pass hashes every token, driven from C so the interpreter never appears in
+    the measured region — a Python-level loop body costs ~50-80 ns per item and
+    would be attributed to the kernel.
     """
-    start_time = now_nanoseconds()
-    deadline_nanoseconds = start_time + int(time_limit_seconds * 1e9)
-
-    processed_tokens = 0
-    processed_bytes = 0
-
-    # Stateless: hash each token independently.
-    for token in paced_items(tokens, deadline_nanoseconds):
-        _ = hash_func(token)
-        processed_tokens += 1
-        processed_bytes += len(token)
-
-    end_time = now_nanoseconds()
-
-    seconds = (end_time - start_time) / 1e9
-    report_stats(name, "bytes", seconds, processed_tokens, processed_bytes)
+    measure(name, work, pass_over(hash_func, tokens))
 
 
 def run_stateless_benchmarks(
     tokens: list[bytes],
-    filter_pattern: re.Pattern | None = None,
-    time_limit_seconds: float = 10.0,
+    work: MeasureSpec,
 ):
-    """Run stateless hash benchmarks (hash each token independently)."""
     print("\nStateless Hash Benchmarks")
 
     # Python built-in hash
-    if should_run("stateless/hash", filter_pattern):
-        bench_hash_function("hash", tokens, lambda x: hash(x), time_limit_seconds)
+    bench_hash_function("stateless/hash", tokens, lambda x: hash(x), work)
 
     # xxHash
-    if should_run("stateless/xxhash.xxh3_64", filter_pattern):
-        bench_hash_function("xxhash.xxh3_64", tokens, lambda x: xxhash.xxh3_64(x).intdigest(), time_limit_seconds)
+    bench_hash_function("stateless/xxhash.xxh3_64", tokens, xxhash.xxh3_64_intdigest, work)
 
     # StringZilla hashes
-    if should_run("stateless/stringzilla.hash", filter_pattern):
-        bench_hash_function("stringzilla.hash", tokens, lambda x: sz.hash(x), time_limit_seconds)
+    bench_hash_function("stateless/stringzilla.hash", tokens, lambda x: sz.hash(x), work)
 
     # Google CRC32C (Castagnoli) one-shot
-    if should_run("stateless/google_crc32c.value", filter_pattern):
-        bench_hash_function("google_crc32c.value", tokens, lambda x: google_crc32c.value(x), time_limit_seconds)
+    bench_hash_function("stateless/google_crc32c.value", tokens, lambda x: google_crc32c.value(x), work)
 
     # MurmurHash3 — stateless
-    if should_run("stateless/mmh3.hash32", filter_pattern):
-        bench_hash_function("mmh3.hash32", tokens, lambda x: mmh3.hash(x, signed=False), time_limit_seconds)
-    if should_run("stateless/mmh3.hash64", filter_pattern):
-        bench_hash_function("mmh3.hash64", tokens, lambda x: mmh3.hash64(x, signed=False)[0], time_limit_seconds)
-    if should_run("stateless/mmh3.hash128", filter_pattern):
-        bench_hash_function("mmh3.hash128", tokens, lambda x: mmh3.hash128(x, signed=False), time_limit_seconds)
+    bench_hash_function("stateless/mmh3.hash32", tokens, lambda x: mmh3.hash(x, signed=False), work)
+    bench_hash_function("stateless/mmh3.hash64", tokens, lambda x: mmh3.hash64(x, signed=False)[0], work)
+    bench_hash_function("stateless/mmh3.hash128", tokens, lambda x: mmh3.hash128(x, signed=False), work)
 
     # CityHash — stateless
-    if should_run("stateless/cityhash.CityHash64", filter_pattern):
-        bench_hash_function("cityhash.CityHash64", tokens, lambda x: cityhash.CityHash64(x), time_limit_seconds)
-    if should_run("stateless/cityhash.CityHash128", filter_pattern):
-        bench_hash_function("cityhash.CityHash128", tokens, lambda x: cityhash.CityHash128(x), time_limit_seconds)
+    bench_hash_function("stateless/cityhash.CityHash64", tokens, lambda x: cityhash.CityHash64(x), work)
+    bench_hash_function("stateless/cityhash.CityHash128", tokens, lambda x: cityhash.CityHash128(x), work)
 
 
 def bench_stateful_hash(
     name: str,
     tokens: list[bytes],
     hasher_factory: Callable,
-    time_limit_seconds: float = 10.0,
+    work: MeasureSpec,
 ) -> None:
-    """Benchmark a stateful hash function and report throughput."""
-    start_time = now_nanoseconds()
-    deadline_nanoseconds = start_time + int(time_limit_seconds * 1e9)
+    """
+    Benchmark a stateful hash by streaming the whole working set through one hasher.
 
-    processed_tokens = 0
-    processed_bytes = 0
+    The hasher is rebuilt per pass so every sample does identical work; the old
+    version built it once for the entire run, which is not what the Rust side does.
+    """
 
-    hasher = hasher_factory()
-    for token in paced_items(tokens, deadline_nanoseconds):
-        hasher.update(token)
-        processed_tokens += 1
-        processed_bytes += len(token)
+    def one_pass() -> None:
+        hasher = hasher_factory()
+        pass_over(hasher.update, tokens)()
+        hasher.digest() if hasattr(hasher, "digest") else hasher.intdigest()
 
-    _ = hasher.digest() if hasattr(hasher, "digest") else hasher.intdigest()
-    end_time = now_nanoseconds()
-
-    seconds = (end_time - start_time) / 1e9
-    report_stats(name, "bytes", seconds, processed_tokens, processed_bytes)
+    measure(name, work, one_pass)
 
 
 def run_stateful_benchmarks(
     tokens: list[bytes],
-    filter_pattern: re.Pattern | None = None,
-    time_limit_seconds: float = 10.0,
+    work: MeasureSpec,
 ):
-    """Run stateful hash benchmarks (incremental/streaming hashing)."""
     print("\nStateful Hash Benchmarks")
 
     # xxHash stateful
-    if should_run("stateful/xxhash.xxh3_64", filter_pattern):
-        bench_stateful_hash("xxhash.xxh3_64", tokens, lambda: xxhash.xxh3_64(), time_limit_seconds)
+    bench_stateful_hash("stateful/xxhash.xxh3_64", tokens, lambda: xxhash.xxh3_64(), work)
 
     # StringZilla stateful hasher
-    if should_run("stateful/stringzilla.Hasher", filter_pattern):
-        bench_stateful_hash("stringzilla.Hasher", tokens, lambda: sz.Hasher(), time_limit_seconds)
+    bench_stateful_hash("stateful/stringzilla.Hasher", tokens, lambda: sz.Hasher(), work)
 
     # Google CRC32C (Castagnoli) stateful
-    if should_run("stateful/google_crc32c.Checksum", filter_pattern):
-        bench_stateful_hash("google_crc32c.Checksum", tokens, lambda: google_crc32c.Checksum(), time_limit_seconds)
+    bench_stateful_hash("stateful/google_crc32c.Checksum", tokens, lambda: google_crc32c.Checksum(), work)
 
 
 def run_checksum_benchmarks(
     tokens: list[bytes],
-    filter_pattern: re.Pattern | None = None,
-    time_limit_seconds: float = 10.0,
+    work: MeasureSpec,
 ):
-    """Run checksum/cryptographic hash benchmarks."""
     print("\nChecksum Hash Benchmarks")
 
     # StringZilla bytesum - reference lower bound
-    if should_run("checksum/stringzilla.bytesum", filter_pattern):
-        bench_hash_function("stringzilla.bytesum", tokens, lambda x: sz.bytesum(x), time_limit_seconds)
+    bench_hash_function("checksum/stringzilla.bytesum", tokens, lambda x: sz.bytesum(x), work)
 
     # Blake3 - cryptographic hash
-    if should_run("checksum/blake3.blake3", filter_pattern):
-        bench_hash_function("blake3.blake3", tokens, lambda x: blake3.blake3(x).digest(), time_limit_seconds)
+    bench_hash_function("checksum/blake3.blake3", tokens, lambda x: blake3.blake3(x).digest(), work)
 
     # SHA256 via hashlib (Python standard library)
-    if should_run("checksum/hashlib.sha256", filter_pattern):
-        bench_hash_function("hashlib.sha256", tokens, lambda x: hashlib.sha256(x).digest(), time_limit_seconds)
+    bench_hash_function("checksum/hashlib.sha256", tokens, lambda x: hashlib.sha256(x).digest(), work)
 
     # SHA256 via StringZilla
-    if should_run("checksum/stringzilla.Sha256", filter_pattern):
-        bench_hash_function("stringzilla.Sha256", tokens, lambda x: sz.Sha256().update(x).digest(), time_limit_seconds)
+    bench_hash_function("checksum/stringzilla.Sha256", tokens, lambda x: sz.Sha256().update(x).digest(), work)
 
 
 _main_epilog = """
 Examples:
 
-  # Benchmark all hash functions with default settings
   %(prog)s --dataset README.md --tokens lines
 
   # Test only specific hash functions
@@ -246,33 +179,22 @@ def main():
     args = parser.parse_args()
 
     # Compile filter pattern
-    filter_pattern = None
-    if args.filter:
-        try:
-            filter_pattern = re.compile(args.filter)
-        except re.error as e:
-            parser.error(f"Invalid regex for --filter: {e}")
+    set_filter(args.filter)
 
-    # Load and tokenize dataset
-    dataset = load_dataset(args.dataset, as_bytes=True, size_limit=args.dataset_limit)
-    tokens_mode = resolve_tokens(args.tokens, "words")
-    tokens = tokenize_dataset(dataset, tokens_mode)
-
-    if not tokens:
-        print("No tokens found in dataset")
-        return 1
-
-    # Report dataset info
-    total_bytes = sum(len(token) for token in tokens)
-    avg_token_length = total_bytes / len(tokens) if tokens else 0
-    print(f"Dataset: {len(tokens):,} tokens, {total_bytes:,} bytes, {avg_token_length:.1f} avg token length")
+    # Resolve the working set from the shared manifest, identically to `utils.rs`.
+    dataset = resolve_dataset("hash", as_bytes=True, dataset_path=args.dataset)
+    tokens = dataset.tokens
+    log_dataset(dataset)
     log_system_info()
 
     # Run benchmarks
-    run_stateless_benchmarks(tokens, filter_pattern, args.time_limit)
-    run_stateful_benchmarks(tokens, filter_pattern, args.time_limit)
-    run_checksum_benchmarks(tokens, filter_pattern, args.time_limit)
+    work = MeasureSpec(report="bytes", elements=dataset.token_count, total_bytes=dataset.token_bytes)
+    log_timing_overhead()
+    run_stateless_benchmarks(tokens, work)
+    run_stateful_benchmarks(tokens, work)
+    run_checksum_benchmarks(tokens, work)
 
+    finish()
     return 0
 
 

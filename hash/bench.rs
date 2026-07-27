@@ -1,70 +1,15 @@
-#![doc = r#"
-# StringWars: String Hashing Benchmarks
+#![doc = r#"# StringWars: Hash
 
-This file contains benchmarks for various Rust hashing libraries, treating the inputs as binary strings without any
-UTF-8 validity constraints. For accurate stats aggregation, on each iteration, the whole file is scanned. Be warned, for
-large files, it may take a while!
+Hashing benchmarks: stateless, stateful and checksum digests over the working set.
 
-The benchmarks are organized into three categories:
+- `STRINGWARS_COLLISIONS=1` also reports collision rates; off by default because
+  deduplicating a large corpus costs gigabytes.
 
-**Stateless Hashes** (hash each input independently):
-- StringZilla `hash`
-- Standard `Hash` implementation (SipHash)
-- aHash
-- xxHash (xxh3)
-- FoldHash
-- CRC32 (IEEE) via `crc32fast`
-- MurmurHash32 via `murmurhash32`
-- CityHash64 via `cityhash` (x86_64 & Clang only)
-
-**Stateful Hashes** (incremental/streaming):
-- StringZilla `Hasher`
-- Standard `DefaultHasher` (SipHash)
-- aHash `AHasher`
-- FoldHash `FoldHasher`
-- CRC32 via `crc32fast::Hasher`
-
-**Checksum Hashes** (cryptographic and reference bounds):
-- StringZilla `bytesum` (reference lower bound)
-- Blake3 (cryptographic)
-- SHA256 via `sha2` (cryptographic)
-- SHA256 via `ring` (cryptographic)
-- SHA256 via `stringzilla` (cryptographic, stateless and stateful)
-
-## System Dependencies
-
-Before running these benchmarks, ensure the following system packages are installed:
+  `cityhash` is x86_64-only and is skipped elsewhere.
 
 ```sh
-sudo apt install -y build-essential llvm-18-dev libclang-18-dev clang-18 # for Ubuntu/Debian
-sudo dnf install -y gcc llvm-devel clang-devel # for RHEL/Fedora
-brew install llvm clang # for macOS
+STRINGWARS_DATASET=README.md cargo bench --features bench_hash --bench bench_hash
 ```
-
-## Usage Examples
-
-The benchmarks use environment variables to control the input dataset and mode:
-
-- `STRINGWARS_DATASET`: Path to the input dataset file.
-- `STRINGWARS_TOKENS`: Specifies how to interpret the input. Allowed values:
-  - `lines`: Process the dataset line by line.
-  - `words`: Process the dataset word by word.
-  - `file`: Process the entire file as a single token.
-- `STRINGWARS_COLLISIONS`: Set to `1` or `true` to enable collision detection (disabled by default to avoid OOM on large
-  datasets).
-- `STRINGWARS_FILTER`: Regex pattern to filter which benchmarks to run (e.g., `sha` for SHA benchmarks,
-  `stateless/.*hash` for stateless hashes).
-
-To run the benchmarks with the appropriate CPU features enabled, you can use the following commands:
-
-```sh
-RUSTFLAGS="-C target-cpu=native" \
-    STRINGWARS_DATASET=README.md \
-    STRINGWARS_TOKENS=lines \
-    cargo bench --features bench_hash --bench bench_hash
-```
-
-Note: `cityhash` is only compiled on x86_64 targets as it requires x86-specific instructions.
 "#]
 use std::collections::HashSet;
 use std::hash::{BuildHasher, Hasher};
@@ -80,12 +25,10 @@ use stringzilla::sz;
 use wyhash::wyhash;
 use xxhash_rust::xxh3::xxh3_64;
 
-
-#[path = "../utils.rs"]
-mod utils;
-use utils::{
-    get_env_bool, install_panic_hook, load_dataset_with_default_mode, log_stringzilla_metadata,
-    measure_throughput, should_run, BenchBudget, ReportAs, ResultExt, WorkUnits,
+use stringwars::{
+    finish, get_env_bool, install_panic_hook, log_stringzilla_metadata, log_timing_overhead,
+    measure, note_unavailable, resolve_dataset, should_run, MeasureSpec, ResultExt, Unit,
+    WorkUnits,
 };
 
 /// Benchmarks one stateless hash that produces a `u64` result: runs `bench_each_token` for
@@ -95,12 +38,12 @@ use utils::{
 /// the `#[cfg(target_arch = "x86_64")]` `cityhash` block (cfg-gated, must stay inline).
 fn bench_stateless_hash<HashFn: Fn(&[u8]) -> u64 + Copy>(
     name: &str,
-    budget: &BenchBudget,
+    work: WorkUnits,
     slices: &[&[u8]],
     unique_tokens: &[&[u8]],
     hash_fn: HashFn,
 ) {
-    bench_each_token(name, budget, slices, |token| {
+    bench_each_token(name, slices, work, |token| {
         let _ = black_box(hash_fn(token));
     });
     if !unique_tokens.is_empty() && should_run(name) {
@@ -108,20 +51,21 @@ fn bench_stateless_hash<HashFn: Fn(&[u8]) -> u64 + Copy>(
     }
 }
 
-/// Time one stateless hash over the dataset by cycling tokens for the budget. The kernel
-/// `hash_one` is called on one token per iteration; throughput is reported as bytes/s.
+/// Times one stateless hash over the whole working set.
+///
+/// A pass is one complete traversal, so the mixture of token lengths is identical
+/// in every sample and cancels exactly, and the work is declared once instead of
+/// being accumulated per call.
 fn bench_each_token<HashOne: FnMut(&[u8])>(
     name: &str,
-    budget: &BenchBudget,
     tokens: &[&[u8]],
+    work: WorkUnits,
     mut hash_one: HashOne,
 ) {
-    let mut cursor = 0usize;
-    measure_throughput(name, ReportAs::Bytes, budget, || {
-        let token = tokens[cursor % tokens.len()];
-        cursor += 1;
-        hash_one(black_box(token));
-        WorkUnits::new(1, token.len() as u64)
+    measure(name, MeasureSpec::new(Unit::Bytes, work), || {
+        for token in tokens {
+            hash_one(black_box(token));
+        }
     });
 }
 
@@ -167,7 +111,7 @@ where
 }
 
 /// Benchmarks stateless hashes, hashing one token per call and cycling the dataset.
-fn bench_stateless(budget: &BenchBudget, tokens: &BytesCowsAuto) {
+fn bench_stateless(work: WorkUnits, tokens: &BytesCowsAuto) {
     // Collision detection is opt-in via STRINGWARS_COLLISIONS environment variable.
     // This avoids OOM on large datasets (can use GBs of RAM for deduplication).
     let enable_collision_detection = get_env_bool("STRINGWARS_COLLISIONS");
@@ -185,7 +129,6 @@ fn bench_stateless(budget: &BenchBudget, tokens: &BytesCowsAuto) {
         Vec::new()
     };
 
-    // Use BytesTape to colocate strings and reduce memory access overhead.
     let mut tokens_tape = BytesTape::<u64>::new();
     tokens_tape
         .extend(tokens.iter())
@@ -193,10 +136,9 @@ fn bench_stateless(budget: &BenchBudget, tokens: &BytesCowsAuto) {
     let view = tokens_tape.view();
     let slices: Vec<&[u8]> = (&view).into_iter().collect();
 
-    // Benchmark: StringZilla
     bench_stateless_hash(
         "stateless/stringzilla::hash",
-        budget,
+        work,
         &slices,
         &unique_tokens,
         |token| sz::hash(token),
@@ -206,7 +148,7 @@ fn bench_stateless(budget: &BenchBudget, tokens: &BytesCowsAuto) {
     let std_builder = std::collections::hash_map::RandomState::new();
     bench_stateless_hash(
         "stateless/std::DefaultHasher::hash_one",
-        budget,
+        work,
         &slices,
         &unique_tokens,
         |token| std_builder.hash_one(token),
@@ -216,25 +158,23 @@ fn bench_stateless(budget: &BenchBudget, tokens: &BytesCowsAuto) {
     let hash_builder = AHashState::with_seed(42);
     bench_stateless_hash(
         "stateless/ahash::hash_one",
-        budget,
+        work,
         &slices,
         &unique_tokens,
         |token| hash_builder.hash_one(token),
     );
 
-    // Benchmark: xxHash
     bench_stateless_hash(
         "stateless/xxh3::xxh3_64",
-        budget,
+        work,
         &slices,
         &unique_tokens,
         xxh3_64,
     );
 
-    // Benchmark: wyhash
     bench_stateless_hash(
         "stateless/wyhash::wyhash",
-        budget,
+        work,
         &slices,
         &unique_tokens,
         |token| wyhash(token, 42),
@@ -244,7 +184,7 @@ fn bench_stateless(budget: &BenchBudget, tokens: &BytesCowsAuto) {
     let foldhash_builder = foldhash::fast::RandomState::default();
     bench_stateless_hash(
         "stateless/foldhash::hash_one",
-        budget,
+        work,
         &slices,
         &unique_tokens,
         |token| foldhash_builder.hash_one(token),
@@ -253,7 +193,7 @@ fn bench_stateless(budget: &BenchBudget, tokens: &BytesCowsAuto) {
     // Benchmark: CRC32 — left inline because `crc32fast::hash` returns `u32`, so the
     // bench closure black-boxes a `u32` while the collision closure casts to `u64`;
     // the two-closure shapes differ from `bench_stateless_hash`.
-    bench_each_token("stateless/crc32fast::hash", budget, &slices, |token| {
+    bench_each_token("stateless/crc32fast::hash", &slices, work, |token| {
         let _ = black_box(crc32fast::hash(token));
     });
     if !unique_tokens.is_empty() && should_run("stateless/crc32fast::hash") {
@@ -262,27 +202,22 @@ fn bench_stateless(budget: &BenchBudget, tokens: &BytesCowsAuto) {
         });
     }
 
-    // Benchmark: MurmurHash32 via `murmurhash32` (stateless) — cast to u64 at call site.
     bench_stateless_hash(
         "stateless/murmurhash32::murmurhash3",
-        budget,
+        work,
         &slices,
         &unique_tokens,
         |token| murmurhash32::murmurhash3(token) as u64,
     );
 
-    // Benchmark: CityHash64 via `cityhash` (stateless, x86_64 only) — left inline because
-    // the cfg gate cannot be placed on a single function call expression without a block.
+    // Inline because a cfg gate cannot sit on a bare call expression.
+    #[cfg(not(target_arch = "x86_64"))]
+    note_unavailable("stateless/cityhash::city_hash_64", "x86_64 only");
     #[cfg(target_arch = "x86_64")]
     {
-        bench_each_token(
-            "stateless/cityhash::city_hash_64",
-            budget,
-            &slices,
-            |token| {
-                let _ = black_box(cityhash::city_hash_64(token));
-            },
-        );
+        bench_each_token("stateless/cityhash::city_hash_64", &slices, work, |token| {
+            let _ = black_box(cityhash::city_hash_64(token));
+        });
         if !unique_tokens.is_empty() && should_run("stateless/cityhash::city_hash_64") {
             print_collision_rate(&unique_tokens, |token_bytes| {
                 cityhash::city_hash_64(token_bytes)
@@ -296,7 +231,7 @@ fn bench_stateless(budget: &BenchBudget, tokens: &BytesCowsAuto) {
 }
 
 /// Benchmarks checksum hashes including cryptographic hashes and reference bounds.
-fn bench_checksum(budget: &BenchBudget, tokens: &BytesCowsAuto) {
+fn bench_checksum(work: WorkUnits, tokens: &BytesCowsAuto) {
     let enable_collision_detection = get_env_bool("STRINGWARS_COLLISIONS");
     let unique_tokens: Vec<&[u8]> = if enable_collision_detection {
         let unique_set: HashSet<&[u8]> = tokens.iter().collect();
@@ -318,13 +253,11 @@ fn bench_checksum(budget: &BenchBudget, tokens: &BytesCowsAuto) {
     let view = tokens_tape.view();
     let slices: Vec<&[u8]> = (&view).into_iter().collect();
 
-    // Benchmark: StringZilla `bytesum` reference lower bound
-    bench_each_token("checksum/stringzilla::bytesum", budget, &slices, |token| {
+    bench_each_token("checksum/stringzilla::bytesum", &slices, work, |token| {
         let _ = black_box(sz::bytesum(token));
     });
 
-    // Benchmark: Blake3 - cryptographic hash
-    bench_each_token("checksum/blake3::hash", budget, &slices, |token| {
+    bench_each_token("checksum/blake3::hash", &slices, work, |token| {
         let _ = black_box(blake3::hash(token));
     });
     if !unique_tokens.is_empty() && should_run("checksum/blake3::hash") {
@@ -337,8 +270,7 @@ fn bench_checksum(budget: &BenchBudget, tokens: &BytesCowsAuto) {
         });
     }
 
-    // Benchmark: SHA256 via sha2
-    bench_each_token("checksum/sha2::Sha256", budget, &slices, |token| {
+    bench_each_token("checksum/sha2::Sha256", &slices, work, |token| {
         let mut hasher = Sha256::new();
         hasher.update(token);
         let _ = black_box(hasher.finalize());
@@ -355,8 +287,7 @@ fn bench_checksum(budget: &BenchBudget, tokens: &BytesCowsAuto) {
         });
     }
 
-    // Benchmark: SHA256 via ring
-    bench_each_token("checksum/ring::SHA256", budget, &slices, |token| {
+    bench_each_token("checksum/ring::SHA256", &slices, work, |token| {
         let _ = black_box(ring_digest::digest(&ring_digest::SHA256, token));
     });
     if !unique_tokens.is_empty() && should_run("checksum/ring::SHA256") {
@@ -369,8 +300,7 @@ fn bench_checksum(budget: &BenchBudget, tokens: &BytesCowsAuto) {
         });
     }
 
-    // Benchmark: SHA256 via stringzilla
-    bench_each_token("checksum/stringzilla::Sha256", budget, &slices, |token| {
+    bench_each_token("checksum/stringzilla::Sha256", &slices, work, |token| {
         let _ = black_box(sz::Sha256::hash(token));
     });
     if !unique_tokens.is_empty() && should_run("checksum/stringzilla::Sha256") {
@@ -391,7 +321,7 @@ fn bench_checksum(budget: &BenchBudget, tokens: &BytesCowsAuto) {
 /// Benchmarks stateful hashes, streaming the whole dataset through one hasher per pass and
 /// cycling passes for the budget. The per-call unit is one full streaming pass, so the deadline
 /// check after each call bounds overshoot to a single pass.
-fn bench_stateful(budget: &BenchBudget, tokens: &BytesCowsAuto) {
+fn bench_stateful(tokens: &BytesCowsAuto) {
     let mut tokens_tape = BytesTape::<u64>::new();
     tokens_tape
         .extend(tokens.iter())
@@ -399,76 +329,69 @@ fn bench_stateful(budget: &BenchBudget, tokens: &BytesCowsAuto) {
     let view = tokens_tape.view();
     let total_bytes: u64 = (&view).into_iter().map(|token| token.len() as u64).sum();
 
-    // Benchmark: StringZilla `Hasher`
-    measure_throughput(
+    measure(
         "stateful/stringzilla::Hasher",
-        ReportAs::Bytes,
-        budget,
+        MeasureSpec::new(Unit::Bytes, WorkUnits::bytes(total_bytes)),
         || {
             let mut hasher = sz::Hasher::new(0);
             for token in &view {
                 hasher.write(token);
             }
             black_box(hasher.finish());
-            WorkUnits::bytes(total_bytes)
         },
     );
 
     // Benchmark: SipHash via `std::DefaultHasher`
     let std_builder = std::collections::hash_map::RandomState::new();
-    measure_throughput(
+    measure(
         "stateful/std::DefaultHasher",
-        ReportAs::Bytes,
-        budget,
+        MeasureSpec::new(Unit::Bytes, WorkUnits::bytes(total_bytes)),
         || {
             let mut aggregate = std_builder.build_hasher();
             for token in &view {
                 aggregate.write(token);
             }
             black_box(aggregate.finish());
-            WorkUnits::bytes(total_bytes)
         },
     );
 
     // Benchmark: aHash
     let ahash_state = AHashState::with_seed(42);
-    measure_throughput("stateful/ahash::AHasher", ReportAs::Bytes, budget, || {
-        let mut aggregate = ahash_state.build_hasher();
-        for token in &view {
-            aggregate.write(token);
-        }
-        black_box(aggregate.finish());
-        WorkUnits::bytes(total_bytes)
-    });
+    measure(
+        "stateful/ahash::AHasher",
+        MeasureSpec::new(Unit::Bytes, WorkUnits::bytes(total_bytes)),
+        || {
+            let mut aggregate = ahash_state.build_hasher();
+            for token in &view {
+                aggregate.write(token);
+            }
+            black_box(aggregate.finish());
+        },
+    );
 
     // Benchmark: FoldHash
     let foldhash_state = foldhash::fast::RandomState::default();
-    measure_throughput(
+    measure(
         "stateful/foldhash::FoldHasher",
-        ReportAs::Bytes,
-        budget,
+        MeasureSpec::new(Unit::Bytes, WorkUnits::bytes(total_bytes)),
         || {
             let mut aggregate = foldhash_state.build_hasher();
             for token in &view {
                 aggregate.write(token);
             }
             black_box(aggregate.finish());
-            WorkUnits::bytes(total_bytes)
         },
     );
 
-    // Benchmark: CRC32
-    measure_throughput(
+    measure(
         "stateful/crc32fast::Hasher",
-        ReportAs::Bytes,
-        budget,
+        MeasureSpec::new(Unit::Bytes, WorkUnits::bytes(total_bytes)),
         || {
             let mut hasher = crc32fast::Hasher::new();
             for token in &view {
                 hasher.update(token);
             }
             black_box(hasher.finalize());
-            WorkUnits::bytes(total_bytes)
         },
     );
 }
@@ -477,17 +400,20 @@ fn main() {
     install_panic_hook();
     log_stringzilla_metadata();
 
-    // Load the dataset defined by the environment variables.
-    let tape = load_dataset_with_default_mode("words").unwrap_nice();
+    let tape = resolve_dataset("hash").unwrap_nice();
 
-    let budget = BenchBudget::from_env(2.0, 10.0);
+    // One pass is one traversal of the working set; declared once, never accumulated.
+    let work = WorkUnits::new(tape.len() as u64, tape.iter().map(|t| t.len() as u64).sum());
+    log_timing_overhead();
 
     println!("# stateless");
-    bench_stateless(&budget, &tape);
+    bench_stateless(work, &tape);
 
     println!("# stateful");
-    bench_stateful(&budget, &tape);
+    bench_stateful(&tape);
 
     println!("# checksum");
-    bench_checksum(&budget, &tape);
+    bench_checksum(work, &tape);
+
+    finish();
 }

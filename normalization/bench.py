@@ -6,30 +6,10 @@
 #   "PyICU",
 # ]
 # ///
-"""
-Python case folding and normalization benchmarks.
-
-Benchmarks case-insensitive operations and Unicode normalization:
-- Case-insensitive comparison of adjacent token pairs
-- Case-insensitive substring search
-- Case folding transformation
-- Unicode normalization (NFC / NFD / NFKC / NFKD)
-
-Environment variables:
-- STRINGWARS_DATASET: Path to input dataset file
-- STRINGWARS_TOKENS: Tokenization mode ('lines', 'words', 'file')
-
-Examples:
-  uv run normalization/bench.py --dataset README.md --tokens lines
-  uv run normalization/bench.py --dataset xlsum.csv --tokens words -k "casefold"
-
-Timing via time.monotonic_ns; throughput in decimal GB/s. Filter with -k/--filter.
-"""
+"""Unicode normalization and case-insensitive comparison benchmarks in Python. Mirrors `normalization/bench.rs`."""
 
 import argparse
-import itertools
 import random
-import re
 import sys
 import unicodedata
 from collections.abc import Callable
@@ -37,18 +17,21 @@ from functools import partial
 from importlib.metadata import version as pkg_version
 
 import icu
+import pyunormalize
 import regex
 import stringzilla as sz
 
 from utils import (
+    MeasureSpec,
     add_common_args,
-    load_dataset,
-    now_nanoseconds,
-    paced_items,
-    reduce_in_windows,
-    report_stats,
-    should_run,
-    tokenize_dataset,
+    finish,
+    log_dataset,
+    log_timing_overhead,
+    measure,
+    note_unavailable,
+    pass_over,
+    resolve_dataset,
+    set_filter,
 )
 
 
@@ -58,80 +41,40 @@ def log_system_info():
     print(f"- StringZilla: {sz.__version__} with {sz.__capabilities_str__}")
     print(f"- regex: {pkg_version('regex')}")
     print(f"- PyICU: {pkg_version('PyICU')} (ICU {icu.ICU_VERSION})")
+    print(f"- pyunormalize: {pkg_version('pyunormalize')} (Unicode {pyunormalize.UCD_VERSION})")
     print()
-
-
-def make_pairs(tokens: list[str]) -> list[tuple[str, str]]:
-    """Create adjacent token pairs for comparison benchmarks."""
-    if len(tokens) < 2:
-        return []
-    return [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
 
 
 def bench_case_compare(
     name: str,
-    pairs: list[tuple[str, str]],
+    lefts: list[str],
+    rights: list[str],
     compare_function: Callable[[str, str], bool],
-    time_limit_seconds: float = 10.0,
 ):
-    """Benchmark case-insensitive comparison of string pairs."""
-    if not pairs:
-        print(f"{name}: no pairs to compare", file=sys.stderr)
+    """One pass compares every pair, so the pair mixture is identical in every sample."""
+    if not lefts:
+        note_unavailable(name, "fewer than two tokens to pair")
         return
-
-    # Encode once: byte length of every pair plus cumulative prefix sums, so the
-    # hot loop never re-encodes a string just to count throughput bytes.
-    cumulative_bytes = [0]
-    for first_string, second_string in pairs:
-        pair_bytes = len(first_string.encode("utf-8")) + len(second_string.encode("utf-8"))
-        cumulative_bytes.append(cumulative_bytes[-1] + pair_bytes)
-    bytes_per_pass = cumulative_bytes[-1]
-
-    start_time = now_nanoseconds()
-    deadline_nanoseconds = start_time + int(time_limit_seconds * 1e9)
-
-    first_column = [first_string for first_string, _ in pairs]
-    second_column = [second_string for _, second_string in pairs]
-
-    compared_pairs = 0
-    matches_found = 0
-
-    # Cycle whole C-windowed passes over the dataset until the time limit; a pass that
-    # returns short means the deadline was hit mid-pass.
-    while now_nanoseconds() < deadline_nanoseconds:
-        pass_matches, pass_count = reduce_in_windows(
-            compare_function,
-            first_column,
-            second_column,
-            deadline_nanoseconds=deadline_nanoseconds,
-        )
-        matches_found += pass_matches
-        compared_pairs += pass_count
-        if pass_count < len(pairs):
-            break
-
-    seconds = (now_nanoseconds() - start_time) / 1e9
-    full_passes, remainder = divmod(compared_pairs, len(pairs))
-    compared_bytes = full_passes * bytes_per_pass + cumulative_bytes[remainder]
-
-    print(f"{name}: {matches_found:,} matches over {compared_pairs:,} pairs", file=sys.stderr)
-    report_stats(name, "bytes", seconds, compared_pairs, compared_bytes)
+    work = MeasureSpec(
+        report="bytes",
+        elements=len(lefts),
+        total_bytes=sum(len(item.encode("utf-8")) for item in lefts)
+        + sum(len(item.encode("utf-8")) for item in rights),
+    )
+    measure(name, work, pass_over(compare_function, lefts, rights))
 
 
 def compare_casefold(first_string: str, second_string: str) -> bool:
-    """Compare using Python's str.casefold()."""
     return first_string.casefold() == second_string.casefold()
 
 
 def compare_regex_fullcase(first_string: str, second_string: str) -> bool:
-    """Compare using regex with IGNORECASE | FULLCASE."""
     # Escape special regex characters and do a full match
     pattern = regex.compile(regex.escape(first_string), regex.IGNORECASE | regex.FULLCASE)
     return pattern.fullmatch(second_string) is not None
 
 
 def compare_icu(first_string: str, second_string: str) -> bool:
-    """Compare using ICU case folding."""
     first_folded = icu.UnicodeString(first_string).foldCase()
     second_folded = icu.UnicodeString(second_string).foldCase()
     return first_folded == second_folded
@@ -147,38 +90,18 @@ def bench_case_find(
     haystack: str,
     needles: list[str],
     find_function: Callable[[str, str], int],
-    time_limit_seconds: float = 10.0,
 ):
-    """Benchmark case-insensitive substring search."""
+    """One pass searches every needle across the whole haystack."""
     if not needles:
         print(f"{name}: no needles to search", file=sys.stderr)
         return
-
     haystack_bytes = len(haystack.encode("utf-8"))
-    start_time = now_nanoseconds()
-    deadline_nanoseconds = start_time + int(time_limit_seconds * 1e9)
-
-    queries_done = 0
-    total_matches = 0
-
-    # Haystack is fixed, so bind it and cycle whole C-windowed passes over the needles.
-    search = partial(find_function, haystack)
-    while now_nanoseconds() < deadline_nanoseconds:
-        pass_matches, pass_count = reduce_in_windows(
-            search,
-            needles,
-            deadline_nanoseconds=deadline_nanoseconds,
-        )
-        total_matches += pass_matches
-        queries_done += pass_count
-        if pass_count < len(needles):
-            break
-
-    seconds = (now_nanoseconds() - start_time) / 1e9
-
-    # Throughput = haystack bytes searched per query
-    print(f"{name}: {total_matches:,} matches over {queries_done:,} queries", file=sys.stderr)
-    report_stats(name, "bytes", seconds, queries_done, haystack_bytes * queries_done)
+    work = MeasureSpec(
+        report="bytes",
+        elements=len(needles),
+        total_bytes=haystack_bytes * len(needles),
+    )
+    measure(name, work, pass_over(partial(find_function, haystack), needles))
 
 
 def find_casefold(haystack: str, needle: str) -> int:
@@ -233,35 +156,17 @@ def bench_case_fold(
     name: str,
     strings: list[str],
     fold_function: Callable[[str], str | bytes],
-    time_limit_seconds: float = 10.0,
 ):
-    """Benchmark case folding transformation."""
+    """One pass folds every string."""
     if not strings:
-        print(f"{name}: no strings to fold", file=sys.stderr)
+        print(f"{name}: nothing to process", file=sys.stderr)
         return
-
-    # Encode once: cumulative prefix sums of byte lengths for exact throughput
-    # accounting without re-encoding inside the hot loop.
-    cumulative_bytes = [0]
-    for string in strings:
-        cumulative_bytes.append(cumulative_bytes[-1] + len(string.encode("utf-8")))
-    bytes_per_pass = cumulative_bytes[-1]
-
-    start_time = now_nanoseconds()
-    deadline_nanoseconds = start_time + int(time_limit_seconds * 1e9)
-
-    processed_strings = 0
-
-    # Cycle the dataset until the time limit, one pair at a time.
-    for string in paced_items(itertools.cycle(strings), deadline_nanoseconds):
-        _ = fold_function(string)
-        processed_strings += 1
-
-    seconds = (now_nanoseconds() - start_time) / 1e9
-    full_passes, remainder = divmod(processed_strings, len(strings))
-    processed_bytes = full_passes * bytes_per_pass + cumulative_bytes[remainder]
-
-    report_stats(name, "bytes", seconds, processed_strings, processed_bytes)
+    work = MeasureSpec(
+        report="bytes",
+        elements=len(strings),
+        total_bytes=sum(len(item.encode("utf-8")) for item in strings),
+    )
+    measure(name, work, pass_over(fold_function, strings))
 
 
 def fold_casefold(s: str) -> str:
@@ -275,7 +180,6 @@ def fold_stringzilla(s: str) -> bytes:
 
 
 def fold_icu(s: str) -> str:
-    """Fold using ICU case folding."""
     return str(icu.UnicodeString(s).foldCase())
 
 
@@ -286,35 +190,17 @@ def bench_normalize(
     name: str,
     strings: list[str],
     normalize_function: Callable[[str], str | bytes],
-    time_limit_seconds: float = 10.0,
 ):
-    """Benchmark a per-string Unicode normalization transform and report input-byte throughput."""
+    """One pass normalizes every string."""
     if not strings:
-        print(f"{name}: no strings to normalize", file=sys.stderr)
+        print(f"{name}: nothing to process", file=sys.stderr)
         return
-
-    # Encode once: cumulative prefix sums of byte lengths for exact throughput
-    # accounting without re-encoding inside the hot loop.
-    cumulative_bytes = [0]
-    for string in strings:
-        cumulative_bytes.append(cumulative_bytes[-1] + len(string.encode("utf-8")))
-    bytes_per_pass = cumulative_bytes[-1]
-
-    start_time = now_nanoseconds()
-    deadline_nanoseconds = start_time + int(time_limit_seconds * 1e9)
-
-    processed_strings = 0
-
-    # Cycle the dataset until the time limit, one string at a time.
-    for string in paced_items(itertools.cycle(strings), deadline_nanoseconds):
-        _ = normalize_function(string)
-        processed_strings += 1
-
-    seconds = (now_nanoseconds() - start_time) / 1e9
-    full_passes, remainder = divmod(processed_strings, len(strings))
-    processed_bytes = full_passes * bytes_per_pass + cumulative_bytes[remainder]
-
-    report_stats(name, "bytes", seconds, processed_strings, processed_bytes)
+    work = MeasureSpec(
+        report="bytes",
+        elements=len(strings),
+        total_bytes=sum(len(item.encode("utf-8")) for item in strings),
+    )
+    measure(name, work, pass_over(normalize_function, strings))
 
 
 def normalize_stringzilla(form: str, s: str) -> bytes:
@@ -325,6 +211,16 @@ def normalize_stringzilla(form: str, s: str) -> bytes:
 def normalize_stdlib(form: str, s: str) -> str:
     """Normalize using Python's unicodedata.normalize()."""
     return unicodedata.normalize(form, s)
+
+
+def normalize_pyunormalize(form: str, s: str) -> str:
+    """Normalize using `pyunormalize`, a pure-Python implementation of UAX #15.
+
+    Included as the reference point for what the algorithm costs without a native
+    extension behind it - it ships its own Unicode tables rather than deferring to
+    the interpreter's, so it also serves as an independent oracle for the forms.
+    """
+    return pyunormalize.normalize(form, s)
 
 
 def make_normalize_icu(form: str) -> Callable[[str], str]:
@@ -348,7 +244,6 @@ def make_normalize_icu(form: str) -> Callable[[str], str]:
 _main_epilog = """
 Examples:
 
-  # Benchmark all case folding and normalization operations
   %(prog)s --dataset README.md --tokens lines
 
   # Test only case folding
@@ -357,6 +252,10 @@ Examples:
   # Test only normalization
   %(prog)s --dataset data.txt --tokens lines -k "normalize"
 """
+
+
+# One pass scans the haystack once per needle, matching `find` and the Rust side.
+NEEDLES_PER_PASS = 16
 
 
 def main():
@@ -372,33 +271,30 @@ def main():
     args = parser.parse_args()
 
     # Compile filter pattern
-    filter_pattern: re.Pattern | None = None
-    if args.filter:
-        try:
-            filter_pattern = re.compile(args.filter)
-        except re.error as e:
-            parser.error(f"Invalid regex for --filter: {e}")
+    set_filter(args.filter)
 
-    # Load and tokenize dataset
-    pythonic_str = load_dataset(args.dataset, as_bytes=False, size_limit=args.dataset_limit)
-    tokens = tokenize_dataset(pythonic_str, args.tokens)
+    # Resolve the working set from the shared manifest, identically to `utils.rs`.
+    dataset = resolve_dataset("normalization", as_bytes=False, dataset_path=args.dataset)
+    tokens = dataset.tokens
+    pythonic_str = "".join(tokens)
+    log_dataset(dataset)
+    log_timing_overhead()
 
-    if not tokens:
-        print("No tokens found in dataset")
-        return 1
+    # The manifest gives this suite `tokens = "file"`, so `tokens` is one 16 MB string.
+    # Case-folding and normalization want that, but the find and compare groups need
+    # real needles - searching for the whole haystack inside itself matches once, and
+    # a single token yields no pairs at all. Rust splits the same buffer; mirror it.
+    words = pythonic_str.split()
+    lefts, rights = words[:-1], words[1:]
 
-    # Create adjacent pairs for comparison benchmarks
-    pairs = make_pairs(tokens)
-
-    # Select subset of tokens as needles for search benchmarks
-    # Filter to needles with >= 3 UTF-8 bytes (matching Rust benchmark)
-    candidates = [t for t in tokens if len(t.encode("utf-8")) >= 3]
-    # Random sample with fixed seed for reproducibility
+    # >= 3 UTF-8 bytes, as in Rust. Codepoint length is a lower bound on byte length,
+    # so the encode only runs for the short ones.
+    candidates = [w for w in words if len(w) >= 3 or len(w.encode("utf-8")) >= 3]
     random.seed(42)
-    search_needles = random.sample(candidates, min(1000, len(candidates))) if candidates else []
+    search_needles = random.sample(candidates, min(NEEDLES_PER_PASS, len(candidates))) if candidates else []
 
     total_tokens = len(tokens)
-    total_pairs = len(pairs)
+    total_pairs = len(lefts)
     mean_token_length = sum(len(t) for t in tokens) / total_tokens
     total_bytes = len(pythonic_str)
 
@@ -408,52 +304,45 @@ def main():
 
     # Case-insensitive comparison
     print("Case-Insensitive Comparison")
-    if should_run("case-insensitive-compare/stringzilla.utf8_uncased_order", filter_pattern):
-        bench_case_compare("stringzilla.utf8_uncased_order", pairs, compare_stringzilla, args.time_limit)
-    if should_run("case-insensitive-compare/str.casefold.eq", filter_pattern):
-        bench_case_compare("str.casefold.eq", pairs, compare_casefold, args.time_limit)
-    if should_run("case-insensitive-compare/regex.fullmatch<fullcase>", filter_pattern):
-        bench_case_compare("regex.fullmatch<fullcase>", pairs, compare_regex_fullcase, args.time_limit)
-    if should_run("case-insensitive-compare/icu.CaseMap.foldCase.eq", filter_pattern):
-        bench_case_compare("icu.CaseMap.foldCase.eq", pairs, compare_icu, args.time_limit)
+    bench_case_compare("case-insensitive-compare/stringzilla.utf8_uncased_order", lefts, rights, compare_stringzilla)
+    bench_case_compare("case-insensitive-compare/str.casefold.eq", lefts, rights, compare_casefold)
+    bench_case_compare("case-insensitive-compare/regex.fullmatch<fullcase>", lefts, rights, compare_regex_fullcase)
+    bench_case_compare("case-insensitive-compare/icu.CaseMap.foldCase.eq", lefts, rights, compare_icu)
 
     # Case-insensitive substring search
     print("\nCase-Insensitive Substring Search")
-    if should_run("case-insensitive-find/stringzilla.utf8_uncased_find", filter_pattern):
-        bench_case_find(
-            "stringzilla.utf8_uncased_find", pythonic_str, search_needles, find_stringzilla, args.time_limit
-        )
-    if should_run("case-insensitive-find/str.casefold.find", filter_pattern):
-        bench_case_find("str.casefold.find", pythonic_str, search_needles, find_casefold, args.time_limit)
-    if should_run("case-insensitive-find/regex.search<fullcase>", filter_pattern):
-        bench_case_find("regex.search<fullcase>", pythonic_str, search_needles, find_regex_fullcase, args.time_limit)
-    if should_run("case-insensitive-find/icu.StringSearch", filter_pattern):
-        bench_case_find("icu.StringSearch", pythonic_str, search_needles, find_icu, args.time_limit)
+    # The row is named for the function actually called, `utf8_uncased_matches`.
+    bench_case_find(
+        "case-insensitive-find/stringzilla.utf8_uncased_matches",
+        pythonic_str,
+        search_needles,
+        find_stringzilla,
+    )
+    bench_case_find("case-insensitive-find/str.casefold.find", pythonic_str, search_needles, find_casefold)
+    bench_case_find(
+        "case-insensitive-find/regex.search<fullcase>",
+        pythonic_str,
+        search_needles,
+        find_regex_fullcase,
+    )
+    bench_case_find("case-insensitive-find/icu.StringSearch", pythonic_str, search_needles, find_icu)
 
     # Case folding transformation
     print("\nCase Folding Transformation")
-    if should_run("case-fold/stringzilla.utf8_uncased_fold", filter_pattern):
-        bench_case_fold("stringzilla.utf8_uncased_fold", tokens, fold_stringzilla, args.time_limit)
-    if should_run("case-fold/str.casefold", filter_pattern):
-        bench_case_fold("str.casefold", tokens, fold_casefold, args.time_limit)
-    if should_run("case-fold/icu.CaseMap.foldCase", filter_pattern):
-        bench_case_fold("icu.CaseMap.foldCase", tokens, fold_icu, args.time_limit)
+    bench_case_fold("case-fold/stringzilla.utf8_uncased_fold", tokens, fold_stringzilla)
+    bench_case_fold("case-fold/str.casefold", tokens, fold_casefold)
+    bench_case_fold("case-fold/icu.CaseMap.foldCase", tokens, fold_icu)
 
     # Unicode normalization (NFC / NFD / NFKC / NFKD) - all forms measured
     print("\nUnicode Normalization")
     for form in NORMALIZATION_FORMS:
         suffix = form.lower()
-        if should_run(f"normalize-{suffix}/stringzilla.utf8_norm", filter_pattern):
-            bench_normalize(
-                f"stringzilla.utf8_norm<{suffix}>", tokens, partial(normalize_stringzilla, form), args.time_limit
-            )
-        if should_run(f"normalize-{suffix}/unicodedata.normalize", filter_pattern):
-            bench_normalize(
-                f"unicodedata.normalize<{suffix}>", tokens, partial(normalize_stdlib, form), args.time_limit
-            )
-        if should_run(f"normalize-{suffix}/icu.Normalizer2", filter_pattern):
-            bench_normalize(f"icu.Normalizer2<{suffix}>", tokens, make_normalize_icu(form), args.time_limit)
+        bench_normalize(f"normalize-{suffix}/stringzilla.utf8_norm", tokens, partial(normalize_stringzilla, form))
+        bench_normalize(f"normalize-{suffix}/unicodedata.normalize", tokens, partial(normalize_stdlib, form))
+        bench_normalize(f"normalize-{suffix}/icu.Normalizer2", tokens, make_normalize_icu(form))
+        bench_normalize(f"normalize-{suffix}/pyunormalize.normalize", tokens, partial(normalize_pyunormalize, form))
 
+    finish()
     return 0
 
 
