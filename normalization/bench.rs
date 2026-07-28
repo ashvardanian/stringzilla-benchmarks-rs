@@ -209,17 +209,6 @@ fn bench_normalize(haystack: &[u8]) {
         },
     );
 }
-/// A pass compares every pair once, so the pair mixture is identical in every sample.
-fn pass_work_of<L: AsRef<[u8]>, R: AsRef<[u8]>>(pairs: &[(L, R)]) -> WorkUnits {
-    WorkUnits::new(
-        pairs.len() as u64,
-        pairs
-            .iter()
-            .map(|(left, right)| (left.as_ref().len() + right.as_ref().len()) as u64)
-            .sum(),
-    )
-}
-
 /// Benchmarks case-insensitive string equality comparison.
 fn bench_case_insensitive_compare(needles: &[&[u8]]) {
     // We compare each pair of adjacent tokens
@@ -235,6 +224,17 @@ fn bench_case_insensitive_compare(needles: &[&[u8]]) {
         eprintln!("Warning: Not enough tokens for case-insensitive comparison benchmarks");
         return;
     }
+
+    // A pass compares every pair once, so the pair mixture is identical in every sample.
+    // All three rows are priced by this one declaration rather than by re-deriving it
+    // from whichever representation each row happens to iterate.
+    let pair_work = WorkUnits::new(
+        pairs.len() as u64,
+        pairs
+            .iter()
+            .map(|(left, right)| (left.len() + right.len()) as u64)
+            .sum(),
+    );
 
     // Decode each pair to `&str` once, outside the timed closures, so the string-based baselines
     // do not re-validate UTF-8 on every iteration. StringZilla compares the raw bytes directly.
@@ -253,7 +253,7 @@ fn bench_case_insensitive_compare(needles: &[&[u8]]) {
     {
         measure(
             "case-insensitive-compare/stringzilla::utf8_uncased_order",
-            MeasureSpec::new(Unit::Bytes, pass_work_of(&pairs)),
+            MeasureSpec::new(Unit::Bytes, pair_work),
             || {
                 for &(left, right) in pairs.iter() {
                     let equal = sz::utf8_uncased_order(left, right) == std::cmp::Ordering::Equal;
@@ -266,7 +266,7 @@ fn bench_case_insensitive_compare(needles: &[&[u8]]) {
     {
         measure(
             "case-insensitive-compare/unicase::eq",
-            MeasureSpec::new(Unit::Bytes, pass_work_of(&pairs_str)),
+            MeasureSpec::new(Unit::Bytes, pair_work),
             || {
                 for &(left_str, right_str) in pairs_str.iter() {
                     let equal = UniCase::new(left_str) == UniCase::new(right_str);
@@ -279,7 +279,7 @@ fn bench_case_insensitive_compare(needles: &[&[u8]]) {
     {
         measure(
             "case-insensitive-compare/std::to_lowercase.eq",
-            MeasureSpec::new(Unit::Bytes, pass_work_of(&pairs_str)),
+            MeasureSpec::new(Unit::Bytes, pair_work),
             || {
                 for &(left_str, right_str) in pairs_str.iter() {
                     let equal = left_str.to_lowercase() == right_str.to_lowercase();

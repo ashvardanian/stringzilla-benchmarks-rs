@@ -40,32 +40,42 @@ def log_system_info():
 
 NEEDLES_PER_PASS = 16
 
+# The three bytesets `find/bench.rs` scans, so a pass covers the haystack three times.
+BYTESETS = ("\n\r\x0b\x0c", "</>&'\"=[]", "0123456789")
+BYTESET_PATTERNS = tuple(re.compile("[" + re.escape(byteset) + "]") for byteset in BYTESETS)
 
-def bench_op(name: str, haystack, patterns, operation: Callable[..., int]):
+
+def bench_op(name: str, haystack, haystack_bytes: int, patterns, operation: Callable[..., int]):
     """
     One pass scans every pattern across the whole haystack.
 
     The pattern set is fixed, so every implementation scans identical work. The old
     loop ran against a deadline, so a faster engine got through more patterns than a
     slower one — and pattern cost varies by more than an order of magnitude.
+
+    `haystack_bytes` is passed rather than measured: `len()` on a `str` counts
+    codepoints, which published the four stdlib rows at 61% of their true rate on a
+    Cyrillic corpus while the `sz.Str` rows, whose `len()` is bytes, were correct.
     """
-    haystack_length = len(haystack)
     work = MeasureSpec(
         report="bytes",
         elements=len(patterns),
-        total_bytes=haystack_length * len(patterns),
+        total_bytes=haystack_bytes * len(patterns),
     )
     measure(name, work, pass_over(partial(operation, haystack), patterns))
 
 
 def count_find(haystack, pattern) -> int:
+    # Non-overlapping, as `find/bench.rs` counts. `sz.Str` indexes bytes and `str`
+    # codepoints, so the stride is the needle measured in the haystack's own unit.
+    stride = len(pattern) if isinstance(haystack, str) else len(pattern.encode())
     count, start = 0, 0
     while True:
         index = haystack.find(pattern, start)
         if index == -1:
             break
         count += 1
-        start = index + 1
+        start = index + stride
     return count
 
 
@@ -84,16 +94,16 @@ def count_regex(haystack: str, regex: re.Pattern) -> int:
     return sum(1 for _ in regex.finditer(haystack))
 
 
-def count_aho_multi(haystack: str, automaton) -> int:
-    # Count all matches over all tokens in a single pass
+def count_aho(haystack: str, automaton) -> int:
     return sum(1 for _ in automaton.iter(haystack))
 
 
-def count_aho(haystack: str, pattern: str) -> int:
+def build_automaton(needle: str):
+    """Built before the clock starts, as `find/bench.rs` builds its FSAs."""
     automaton = ahoc.Automaton()
-    automaton.add_word(pattern, 1)
+    automaton.add_word(needle, 1)
     automaton.make_automaton()
-    return sum(1 for _ in automaton.iter(haystack))
+    return automaton
 
 
 def count_byteset(haystack: sz.Str, characters: str) -> int:
@@ -146,26 +156,28 @@ def main():
     # scans identical work rather than however far the deadline reached.
     stride = max(len(tokens) // NEEDLES_PER_PASS, 1)
     sample = tokens[::stride][:NEEDLES_PER_PASS]
+    automatons = [build_automaton(needle) for needle in sample]
+    haystack_bytes = dataset.token_bytes
 
     log_dataset(dataset)
     log_system_info()
 
     print("\nSubstring Search Benchmarks")
-    bench_op("substring-forward/str.find", pythonic_str, sample, count_find)
-    bench_op("substring-forward/stringzilla.Str.find", stringzilla_str, sample, count_find)
-    bench_op("substring-backward/str.rfind", pythonic_str, sample, count_rfind)
-    bench_op("substring-backward/stringzilla.Str.rfind", stringzilla_str, sample, count_rfind)
-    bench_op("substring-forward/pyahocorasick.iter", pythonic_str, sample, count_aho)
+    bench_op("substring-forward/str.find", pythonic_str, haystack_bytes, sample, count_find)
+    bench_op("substring-forward/stringzilla.Str.find", stringzilla_str, haystack_bytes, sample, count_find)
+    bench_op("substring-backward/str.rfind", pythonic_str, haystack_bytes, sample, count_rfind)
+    bench_op("substring-backward/stringzilla.Str.rfind", stringzilla_str, haystack_bytes, sample, count_rfind)
+    bench_op("substring-forward/pyahocorasick.iter", pythonic_str, haystack_bytes, automatons, count_aho)
 
     print("\nCharacter Set Search")
-    if dataset.mode == "lines":
-        re_chars = re.compile(r"[\n\r]")  # newlines: LF, CR
-        sz_chars = "\n\r"
-    else:
-        re_chars = re.compile(r"[\t\n\r ]")  # whitespace: space, tab, LF, CR
-        sz_chars = " \t\n\r"
-    bench_op("byteset-forward/re.finditer", pythonic_str, [re_chars], count_regex)
-    bench_op("byteset-forward/stringzilla.Str.find_first_of", stringzilla_str, [sz_chars], count_byteset)
+    bench_op("byteset-forward/re.finditer", pythonic_str, haystack_bytes, BYTESET_PATTERNS, count_regex)
+    bench_op(
+        "byteset-forward/stringzilla.Str.find_first_of",
+        stringzilla_str,
+        haystack_bytes,
+        BYTESETS,
+        count_byteset,
+    )
 
     finish()
     return 0

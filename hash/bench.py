@@ -61,7 +61,9 @@ def bench_hash_function(
 
     One pass hashes every token, driven from C so the interpreter never appears in
     the measured region — a Python-level loop body costs ~50-80 ns per item and
-    would be attributed to the kernel.
+    would be attributed to the kernel. For the same reason `hash_func` is the
+    library's own callable wherever one call suffices: an identity wrapper lambda
+    measured 1.9x on `sz.hash` and on `xxh3`, and only some rows were paying it.
     """
     measure(name, work, pass_over(hash_func, tokens))
 
@@ -73,16 +75,16 @@ def run_stateless_benchmarks(
     print("\nStateless Hash Benchmarks")
 
     # Python built-in hash
-    bench_hash_function("stateless/hash", tokens, lambda x: hash(x), work)
+    bench_hash_function("stateless/hash", tokens, hash, work)
 
     # xxHash
     bench_hash_function("stateless/xxhash.xxh3_64", tokens, xxhash.xxh3_64_intdigest, work)
 
     # StringZilla hashes
-    bench_hash_function("stateless/stringzilla.hash", tokens, lambda x: sz.hash(x), work)
+    bench_hash_function("stateless/stringzilla.hash", tokens, sz.hash, work)
 
     # Google CRC32C (Castagnoli) one-shot
-    bench_hash_function("stateless/google_crc32c.value", tokens, lambda x: google_crc32c.value(x), work)
+    bench_hash_function("stateless/google_crc32c.value", tokens, google_crc32c.value, work)
 
     # MurmurHash3 — stateless
     bench_hash_function("stateless/mmh3.hash32", tokens, lambda x: mmh3.hash(x, signed=False), work)
@@ -90,8 +92,8 @@ def run_stateless_benchmarks(
     bench_hash_function("stateless/mmh3.hash128", tokens, lambda x: mmh3.hash128(x, signed=False), work)
 
     # CityHash — stateless
-    bench_hash_function("stateless/cityhash.CityHash64", tokens, lambda x: cityhash.CityHash64(x), work)
-    bench_hash_function("stateless/cityhash.CityHash128", tokens, lambda x: cityhash.CityHash128(x), work)
+    bench_hash_function("stateless/cityhash.CityHash64", tokens, cityhash.CityHash64, work)
+    bench_hash_function("stateless/cityhash.CityHash128", tokens, cityhash.CityHash128, work)
 
 
 def bench_stateful_hash(
@@ -138,7 +140,7 @@ def run_checksum_benchmarks(
     print("\nChecksum Hash Benchmarks")
 
     # StringZilla bytesum - reference lower bound
-    bench_hash_function("checksum/stringzilla.bytesum", tokens, lambda x: sz.bytesum(x), work)
+    bench_hash_function("checksum/stringzilla.bytesum", tokens, sz.bytesum, work)
 
     # Blake3 - cryptographic hash
     bench_hash_function("checksum/blake3.blake3", tokens, lambda x: blake3.blake3(x).digest(), work)

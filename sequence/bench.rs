@@ -164,69 +164,65 @@ fn bench_argsort(unsorted: &CharsCowsAuto<'static>) {
         reclaim_memory();
     }
 
-    // Benchmark: Polars Series sort
-    if should_run("argsort/polars::Series::sort") {
-        // Polars can create Series from an iterator of &str
-        let polars_series = Series::new(COLUMN_NAME.into(), unsorted.iter().collect::<Vec<&str>>());
-        measure(
-            "argsort/polars::Series::sort",
-            MeasureSpec::new(
-                Unit::Comparisons,
-                WorkUnits::new(comparisons_estimate, total_bytes),
-            ),
-            || {
-                let sorted = polars_series.sort(POLARS_SORT_OPTIONS).unwrap();
-                let _ = black_box(sorted);
-            },
-        );
-        drop(polars_series);
-        reclaim_memory();
-    }
+    // Benchmark: Polars. All three rows read the same unsorted column — `sort` and `arg_sort`
+    // take `&self` and the DataFrame takes an Arc-backed clone — so it is built once, and
+    // straight from the tape rather than through a throwaway `Vec<&str>`.
+    let run_series_sort = should_run("argsort/polars::Series::sort");
+    let run_series_arg_sort = should_run("argsort/polars::Series::arg_sort");
+    let run_dataframe_sort = should_run("argsort/polars::DataFrame::sort");
+    if run_series_sort || run_series_arg_sort || run_dataframe_sort {
+        let polars_series =
+            StringChunked::from_iter_values(COLUMN_NAME.into(), unsorted.iter()).into_series();
 
-    // Benchmark: Polars Series argsort (returning indices)
-    if should_run("argsort/polars::Series::arg_sort") {
-        let polars_series = Series::new(COLUMN_NAME.into(), unsorted.iter().collect::<Vec<&str>>());
-        measure(
-            "argsort/polars::Series::arg_sort",
-            MeasureSpec::new(
-                Unit::Comparisons,
-                WorkUnits::new(comparisons_estimate, total_bytes),
-            ),
-            || {
-                let indices = polars_series.arg_sort(POLARS_SORT_OPTIONS);
-                black_box(indices);
-            },
-        );
-        drop(polars_series);
-        reclaim_memory();
-    }
+        if run_series_sort {
+            measure(
+                "argsort/polars::Series::sort",
+                MeasureSpec::new(
+                    Unit::Comparisons,
+                    WorkUnits::new(comparisons_estimate, total_bytes),
+                ),
+                || {
+                    let sorted = polars_series.sort(POLARS_SORT_OPTIONS).unwrap();
+                    let _ = black_box(sorted);
+                },
+            );
+        }
 
-    // Benchmark: Polars DataFrame sort
-    if should_run("argsort/polars::DataFrame::sort") {
-        // Lazy initialization: only create DataFrame when needed
-        // No unnecessary clone - DataFrame takes ownership directly
-        let polars_dataframe = DataFrame::new(
-            unsorted.len(),
-            vec![Series::new(COLUMN_NAME.into(), unsorted.iter().collect::<Vec<&str>>()).into()],
-        )
-        .unwrap();
+        if run_series_arg_sort {
+            measure(
+                "argsort/polars::Series::arg_sort",
+                MeasureSpec::new(
+                    Unit::Comparisons,
+                    WorkUnits::new(comparisons_estimate, total_bytes),
+                ),
+                || {
+                    let indices = polars_series.arg_sort(POLARS_SORT_OPTIONS);
+                    black_box(indices);
+                },
+            );
+        }
 
-        measure(
-            "argsort/polars::DataFrame::sort",
-            MeasureSpec::new(
-                Unit::Comparisons,
-                WorkUnits::new(comparisons_estimate, total_bytes),
-            ),
-            || {
-                let sorted = polars_dataframe
-                    .sort([COLUMN_NAME], polars_sort_multiple_options.clone())
-                    .unwrap();
-                black_box(sorted);
-            },
-        );
+        if run_dataframe_sort {
+            let polars_dataframe =
+                DataFrame::new(unsorted.len(), vec![polars_series.clone().into()]).unwrap();
+            measure(
+                "argsort/polars::DataFrame::sort",
+                MeasureSpec::new(
+                    Unit::Comparisons,
+                    WorkUnits::new(comparisons_estimate, total_bytes),
+                ),
+                || {
+                    let sorted = polars_dataframe
+                        .sort([COLUMN_NAME], polars_sort_multiple_options.clone())
+                        .unwrap();
+                    black_box(sorted);
+                },
+            );
+            drop(polars_dataframe);
+        }
 
         // Explicitly drop and reclaim memory (~4.7 GB)
-        drop(polars_dataframe);
+        drop(polars_series);
         reclaim_memory();
     }
 }

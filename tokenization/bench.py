@@ -69,6 +69,7 @@ def bench_split_lines(
     name: str,
     lines: list[str],
     count_function: Callable[[str], int],
+    total_bytes: int,
 ):
     """Benchmark a splitter by processing one document line per call, cycling the lines.
 
@@ -77,12 +78,23 @@ def bench_split_lines(
     still mirrors a whole-file pass; only the working set changes. Throughput is reported as the
     sum of the byte lengths of every line processed.
     """
-    work = MeasureSpec(
-        report="bytes",
-        elements=len(lines),
-        total_bytes=sum(len(line.encode("utf-8")) for line in lines),
-    )
+    work = MeasureSpec(report="bytes", elements=len(lines), total_bytes=total_bytes)
     measure(name, work, pass_over(count_function, lines))
+
+
+def make_count_boundaries_icu(break_iterator) -> Callable[[str], int]:
+    """Build a counter over one reused ICU `BreakIterator` — word, character, sentence or line.
+
+    Every boundary counts, words and punctuation and whitespace alike, mirroring the Rust
+    segmenter baselines. Nothing is materialized: slicing out each segment would copy, where
+    `sz.Str` only views and every Rust row counts a lazy iterator.
+    """
+
+    def count(text: str) -> int:
+        break_iterator.setText(text)
+        return sum(1 for _ in break_iterator)
+
+    return count
 
 
 def count_words_stringzilla(text: str) -> int:
@@ -99,37 +111,17 @@ def count_words_uniseg(text: str) -> int:
     return sum(1 for _ in uniseg.wordbreak.words(text))
 
 
-def make_count_words_icu() -> Callable[[str], int]:
-    """Build an ICU word BreakIterator counter, reusing one iterator instance.
-
-    Iterating the break iterator yields every boundary segment (words, punctuation,
-    and whitespace), mirroring the Rust ICU WordSegmenter baseline which also counts
-    boundary segments rather than only word-like ones.
-    """
-    break_iterator = icu.BreakIterator.createWordInstance(icu.Locale.getRoot())
-
-    def count(text: str) -> int:
-        break_iterator.setText(text)
-        segments = 0
-        previous = 0
-        for boundary in break_iterator:
-            segment = text[previous:boundary]  # materialize each segment, matching StringZilla's per-unit Str output
-            _ = segment
-            previous = boundary
-            segments += 1
-        return segments
-
-    return count
-
-
 def count_graphemes_stringzilla(text: str) -> int:
     """Count grapheme clusters lazily via StringZilla's utf8_graphemes (no list built)."""
     return sum(1 for _ in sz.utf8_graphemes(text, skip_empty=True))
 
 
+_GRAPHEME_PATTERN = regex.compile(r"\X")
+
+
 def count_graphemes_regex(text: str) -> int:
     """Count grapheme clusters via the `regex` module's \\X meta-sequence (lazy)."""
-    return sum(1 for _ in regex.finditer(r"\X", text))
+    return sum(1 for _ in _GRAPHEME_PATTERN.finditer(text))
 
 
 def count_graphemes_grapheme(text: str) -> int:
@@ -142,24 +134,6 @@ def count_graphemes_uniseg(text: str) -> int:
     return sum(1 for _ in uniseg.graphemecluster.grapheme_clusters(text))
 
 
-def make_count_graphemes_icu() -> Callable[[str], int]:
-    """Build an ICU character (grapheme) BreakIterator counter, reusing one iterator instance."""
-    break_iterator = icu.BreakIterator.createCharacterInstance(icu.Locale.getRoot())
-
-    def count(text: str) -> int:
-        break_iterator.setText(text)
-        segments = 0
-        previous = 0
-        for boundary in break_iterator:
-            segment = text[previous:boundary]  # materialize each segment, matching StringZilla's per-unit Str output
-            _ = segment
-            previous = boundary
-            segments += 1
-        return segments
-
-    return count
-
-
 def count_sentences_stringzilla(text: str) -> int:
     """Count sentences lazily via StringZilla's utf8_sentences (no list built)."""
     return sum(1 for _ in sz.utf8_sentences(text, skip_empty=True))
@@ -168,24 +142,6 @@ def count_sentences_stringzilla(text: str) -> int:
 def count_sentences_uniseg(text: str) -> int:
     """Count TR29 sentences lazily via uniseg's sentence_break iterator."""
     return sum(1 for _ in uniseg.sentencebreak.sentences(text))
-
-
-def make_count_sentences_icu() -> Callable[[str], int]:
-    """Build an ICU sentence BreakIterator counter, reusing one iterator instance."""
-    break_iterator = icu.BreakIterator.createSentenceInstance(icu.Locale.getRoot())
-
-    def count(text: str) -> int:
-        break_iterator.setText(text)
-        segments = 0
-        previous = 0
-        for boundary in break_iterator:
-            segment = text[previous:boundary]  # materialize each segment, matching StringZilla's per-unit Str output
-            _ = segment
-            previous = boundary
-            segments += 1
-        return segments
-
-    return count
 
 
 def count_lines_stringzilla(text: str) -> int:
@@ -198,24 +154,6 @@ def count_lines_uniseg(text: str) -> int:
     return sum(1 for _ in uniseg.linebreak.line_break_units(text))
 
 
-def make_count_lines_icu() -> Callable[[str], int]:
-    """Build an ICU line BreakIterator counter, reusing one iterator instance."""
-    break_iterator = icu.BreakIterator.createLineInstance(icu.Locale.getRoot())
-
-    def count(text: str) -> int:
-        break_iterator.setText(text)
-        segments = 0
-        previous = 0
-        for boundary in break_iterator:
-            segment = text[previous:boundary]  # materialize each segment, matching StringZilla's per-unit Str output
-            _ = segment
-            previous = boundary
-            segments += 1
-        return segments
-
-    return count
-
-
 def count_whitespace_stringzilla(text: str) -> int:
     """Count whitespace-delimited tokens lazily via StringZilla's utf8_split_whitespaces.
 
@@ -224,9 +162,16 @@ def count_whitespace_stringzilla(text: str) -> int:
     return sum(1 for _ in sz.utf8_split_whitespaces(text, skip_empty=True))
 
 
+_WHITESPACE_PATTERN = regex.compile(r"\s+")
+
+
 def count_whitespace_regex(text: str) -> int:
-    """Count whitespace-delimited tokens via the `regex` module's \\s+ split (allocates a list)."""
-    return len(regex.split(r"\s+", text))
+    """Count whitespace runs via the `regex` module's \\s+ pattern — the scan `regex.split` performs.
+
+    `len(regex.split(...))` built the whole parts list before counting it; the Rust twin counts a
+    lazy iterator, so the two were not measuring the same work.
+    """
+    return sum(1 for _ in _WHITESPACE_PATTERN.finditer(text))
 
 
 def count_newlines_stringzilla(text: str) -> int:
@@ -273,45 +218,76 @@ def main():
     dataset = resolve_dataset("tokenization", as_bytes=False, dataset_path=args.dataset)
     lines = dataset.tokens
     pythonic_str = "".join(lines)
+    total_bytes = dataset.token_bytes
 
     log_dataset(dataset)
     log_timing_overhead()
     log_system_info()
 
+    root = icu.Locale.getRoot()
+
     # UTF-8 word segmentation (TR29) per document line, cycling the lines.
     print("Word Segmentation (TR29)")
-    bench_split_lines("tokenize-words/stringzilla.utf8_wordbreaks", lines, count_words_stringzilla)
-    bench_split_lines("tokenize-words/uniseg.words", lines, count_words_uniseg)
-    bench_split_lines("tokenize-words/icu.BreakIterator", lines, make_count_words_icu())
+    bench_split_lines("tokenize-words-tr29/stringzilla.utf8_wordbreaks", lines, count_words_stringzilla, total_bytes)
+    bench_split_lines("tokenize-words-tr29/uniseg.words", lines, count_words_uniseg, total_bytes)
+    bench_split_lines(
+        "tokenize-words-tr29/icu.BreakIterator",
+        lines,
+        make_count_boundaries_icu(icu.BreakIterator.createWordInstance(root)),
+        total_bytes,
+    )
 
     # UTF-8 grapheme cluster segmentation (TR29) per document line, cycling the lines.
     print("\nGrapheme Cluster Segmentation (TR29)")
-    bench_split_lines("tokenize-graphemes-tr29/stringzilla.utf8_graphemes", lines, count_graphemes_stringzilla)
-    bench_split_lines("tokenize-graphemes-tr29/regex.finditer", lines, count_graphemes_regex)
-    bench_split_lines("tokenize-graphemes-tr29/grapheme.graphemes", lines, count_graphemes_grapheme)
-    bench_split_lines("tokenize-graphemes-tr29/uniseg.grapheme_clusters", lines, count_graphemes_uniseg)
-    bench_split_lines("tokenize-graphemes-tr29/icu.BreakIterator", lines, make_count_graphemes_icu())
+    bench_split_lines(
+        "tokenize-graphemes-tr29/stringzilla.utf8_graphemes", lines, count_graphemes_stringzilla, total_bytes
+    )
+    bench_split_lines("tokenize-graphemes-tr29/regex.finditer", lines, count_graphemes_regex, total_bytes)
+    bench_split_lines("tokenize-graphemes-tr29/grapheme.graphemes", lines, count_graphemes_grapheme, total_bytes)
+    bench_split_lines("tokenize-graphemes-tr29/uniseg.grapheme_clusters", lines, count_graphemes_uniseg, total_bytes)
+    bench_split_lines(
+        "tokenize-graphemes-tr29/icu.BreakIterator",
+        lines,
+        make_count_boundaries_icu(icu.BreakIterator.createCharacterInstance(root)),
+        total_bytes,
+    )
 
     # UTF-8 sentence segmentation (TR29) per document line, cycling the lines.
     print("\nSentence Segmentation (TR29)")
-    bench_split_lines("tokenize-sentences-tr29/stringzilla.utf8_sentences", lines, count_sentences_stringzilla)
-    bench_split_lines("tokenize-sentences-tr29/uniseg.sentences", lines, count_sentences_uniseg)
-    bench_split_lines("tokenize-sentences-tr29/icu.BreakIterator", lines, make_count_sentences_icu())
+    bench_split_lines(
+        "tokenize-sentences-tr29/stringzilla.utf8_sentences", lines, count_sentences_stringzilla, total_bytes
+    )
+    bench_split_lines("tokenize-sentences-tr29/uniseg.sentences", lines, count_sentences_uniseg, total_bytes)
+    bench_split_lines(
+        "tokenize-sentences-tr29/icu.BreakIterator",
+        lines,
+        make_count_boundaries_icu(icu.BreakIterator.createSentenceInstance(root)),
+        total_bytes,
+    )
 
     # UTF-8 line-break opportunity segmentation (UAX#14) per document line, cycling the lines.
     print("\nLine-Break Segmentation (UAX#14)")
-    bench_split_lines("tokenize-lines-uax14/stringzilla.utf8_linebreaks", lines, count_lines_stringzilla)
-    bench_split_lines("tokenize-lines-uax14/uniseg.line_break", lines, count_lines_uniseg)
-    bench_split_lines("tokenize-lines-uax14/icu.BreakIterator", lines, make_count_lines_icu())
+    bench_split_lines("tokenize-lines-uax14/stringzilla.utf8_linebreaks", lines, count_lines_stringzilla, total_bytes)
+    bench_split_lines("tokenize-lines-uax14/uniseg.line_break", lines, count_lines_uniseg, total_bytes)
+    bench_split_lines(
+        "tokenize-lines-uax14/icu.BreakIterator",
+        lines,
+        make_count_boundaries_icu(icu.BreakIterator.createLineInstance(root)),
+        total_bytes,
+    )
 
     # UTF-8 whitespace splitting per document line, cycling the lines.
     print("\nWhitespace Splitting")
-    bench_split_lines("tokenize-whitespace/stringzilla.utf8_split_whitespaces", lines, count_whitespace_stringzilla)
-    bench_split_lines("tokenize-whitespace/regex.split", lines, count_whitespace_regex)
+    bench_split_lines(
+        "tokenize-whitespace/stringzilla.utf8_split_whitespaces", lines, count_whitespace_stringzilla, total_bytes
+    )
+    bench_split_lines("tokenize-whitespace/regex.finditer", lines, count_whitespace_regex, total_bytes)
 
     # UTF-8 newline splitting per document line, cycling the lines.
     print("\nNewline Splitting")
-    bench_split_lines("tokenize-newlines/stringzilla.utf8_split_newlines", lines, count_newlines_stringzilla)
+    bench_split_lines(
+        "tokenize-newlines/stringzilla.utf8_split_newlines", lines, count_newlines_stringzilla, total_bytes
+    )
 
     # UTF-8 codepoint counting over the raw bytes (fair O(n)-from-bytes comparison;
     # `len(str)` is O(1) in CPython, so we decode-and-count as the stdlib baseline).

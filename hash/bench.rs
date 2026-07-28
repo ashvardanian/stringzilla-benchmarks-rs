@@ -16,7 +16,7 @@ use std::hash::{BuildHasher, Hasher};
 use std::hint::black_box;
 
 use bit_set::BitSet;
-use stringtape::{BytesCowsAuto, BytesTape};
+use stringtape::{BytesTape, BytesTapeView};
 
 use ahash::RandomState as AHashState;
 use ring::digest as ring_digest;
@@ -110,37 +110,38 @@ where
     );
 }
 
-/// Benchmarks stateless hashes, hashing one token per call and cycling the dataset.
-fn bench_stateless(work: WorkUnits, tokens: &BytesCowsAuto) {
-    // Collision detection is opt-in via STRINGWARS_COLLISIONS environment variable.
-    // This avoids OOM on large datasets (can use GBs of RAM for deduplication).
-    let enable_collision_detection = get_env_bool("STRINGWARS_COLLISIONS");
-    let unique_tokens: Vec<&[u8]> = if enable_collision_detection {
-        println!("\nComputing unique tokens for collision detection...");
-        let unique_set: HashSet<&[u8]> = tokens.iter().collect();
-        let unique: Vec<&[u8]> = unique_set.into_iter().collect();
+/// Unique tokens for the collision tables, empty unless `STRINGWARS_COLLISIONS` is set.
+/// Deduplicating a large corpus costs gigabytes, so it is opt-in — and paid once for
+/// the whole run rather than once per section.
+fn unique_tokens<'a>(slices: &[&'a [u8]]) -> Vec<&'a [u8]> {
+    if !get_env_bool("STRINGWARS_COLLISIONS") {
+        return Vec::new();
+    }
+    println!("\nComputing unique tokens for collision detection...");
+    let unique_set: HashSet<&[u8]> = slices.iter().copied().collect();
+    unique_set.into_iter().collect()
+}
+
+/// Announces the collision table that the rows below it will populate.
+fn announce_collisions(unique_tokens: &[&[u8]], total: usize) {
+    if !unique_tokens.is_empty() {
         println!(
             "Collision statistics for {} unique tokens (from {} total):",
-            unique.len(),
-            tokens.len()
+            unique_tokens.len(),
+            total
         );
-        unique
-    } else {
-        Vec::new()
-    };
+    }
+}
 
-    let mut tokens_tape = BytesTape::<u64>::new();
-    tokens_tape
-        .extend(tokens.iter())
-        .expect("Failed to create BytesTape");
-    let view = tokens_tape.view();
-    let slices: Vec<&[u8]> = (&view).into_iter().collect();
+/// Benchmarks stateless hashes, hashing one token per call and cycling the dataset.
+fn bench_stateless(work: WorkUnits, slices: &[&[u8]], unique_tokens: &[&[u8]]) {
+    announce_collisions(unique_tokens, slices.len());
 
     bench_stateless_hash(
         "stateless/stringzilla::hash",
         work,
-        &slices,
-        &unique_tokens,
+        slices,
+        unique_tokens,
         |token| sz::hash(token),
     );
 
@@ -149,8 +150,8 @@ fn bench_stateless(work: WorkUnits, tokens: &BytesCowsAuto) {
     bench_stateless_hash(
         "stateless/std::DefaultHasher::hash_one",
         work,
-        &slices,
-        &unique_tokens,
+        slices,
+        unique_tokens,
         |token| std_builder.hash_one(token),
     );
 
@@ -159,24 +160,24 @@ fn bench_stateless(work: WorkUnits, tokens: &BytesCowsAuto) {
     bench_stateless_hash(
         "stateless/ahash::hash_one",
         work,
-        &slices,
-        &unique_tokens,
+        slices,
+        unique_tokens,
         |token| hash_builder.hash_one(token),
     );
 
     bench_stateless_hash(
         "stateless/xxh3::xxh3_64",
         work,
-        &slices,
-        &unique_tokens,
+        slices,
+        unique_tokens,
         xxh3_64,
     );
 
     bench_stateless_hash(
         "stateless/wyhash::wyhash",
         work,
-        &slices,
-        &unique_tokens,
+        slices,
+        unique_tokens,
         |token| wyhash(token, 42),
     );
 
@@ -185,19 +186,19 @@ fn bench_stateless(work: WorkUnits, tokens: &BytesCowsAuto) {
     bench_stateless_hash(
         "stateless/foldhash::hash_one",
         work,
-        &slices,
-        &unique_tokens,
+        slices,
+        unique_tokens,
         |token| foldhash_builder.hash_one(token),
     );
 
     // Benchmark: CRC32 — left inline because `crc32fast::hash` returns `u32`, so the
     // bench closure black-boxes a `u32` while the collision closure casts to `u64`;
     // the two-closure shapes differ from `bench_stateless_hash`.
-    bench_each_token("stateless/crc32fast::hash", &slices, work, |token| {
+    bench_each_token("stateless/crc32fast::hash", slices, work, |token| {
         let _ = black_box(crc32fast::hash(token));
     });
     if !unique_tokens.is_empty() && should_run("stateless/crc32fast::hash") {
-        print_collision_rate(&unique_tokens, |token_bytes| {
+        print_collision_rate(unique_tokens, |token_bytes| {
             crc32fast::hash(token_bytes) as u64
         });
     }
@@ -205,8 +206,8 @@ fn bench_stateless(work: WorkUnits, tokens: &BytesCowsAuto) {
     bench_stateless_hash(
         "stateless/murmurhash32::murmurhash3",
         work,
-        &slices,
-        &unique_tokens,
+        slices,
+        unique_tokens,
         |token| murmurhash32::murmurhash3(token) as u64,
     );
 
@@ -215,11 +216,11 @@ fn bench_stateless(work: WorkUnits, tokens: &BytesCowsAuto) {
     note_unavailable("stateless/cityhash::city_hash_64", "x86_64 only");
     #[cfg(target_arch = "x86_64")]
     {
-        bench_each_token("stateless/cityhash::city_hash_64", &slices, work, |token| {
+        bench_each_token("stateless/cityhash::city_hash_64", slices, work, |token| {
             let _ = black_box(cityhash::city_hash_64(token));
         });
         if !unique_tokens.is_empty() && should_run("stateless/cityhash::city_hash_64") {
-            print_collision_rate(&unique_tokens, |token_bytes| {
+            print_collision_rate(unique_tokens, |token_bytes| {
                 cityhash::city_hash_64(token_bytes)
             });
         }
@@ -231,37 +232,18 @@ fn bench_stateless(work: WorkUnits, tokens: &BytesCowsAuto) {
 }
 
 /// Benchmarks checksum hashes including cryptographic hashes and reference bounds.
-fn bench_checksum(work: WorkUnits, tokens: &BytesCowsAuto) {
-    let enable_collision_detection = get_env_bool("STRINGWARS_COLLISIONS");
-    let unique_tokens: Vec<&[u8]> = if enable_collision_detection {
-        let unique_set: HashSet<&[u8]> = tokens.iter().collect();
-        let unique: Vec<&[u8]> = unique_set.into_iter().collect();
-        println!(
-            "Collision statistics for {} unique tokens (from {} total):",
-            unique.len(),
-            tokens.len()
-        );
-        unique
-    } else {
-        Vec::new()
-    };
+fn bench_checksum(work: WorkUnits, slices: &[&[u8]], unique_tokens: &[&[u8]]) {
+    announce_collisions(unique_tokens, slices.len());
 
-    let mut tokens_tape = BytesTape::<u64>::new();
-    tokens_tape
-        .extend(tokens.iter())
-        .expect("Failed to create BytesTape");
-    let view = tokens_tape.view();
-    let slices: Vec<&[u8]> = (&view).into_iter().collect();
-
-    bench_each_token("checksum/stringzilla::bytesum", &slices, work, |token| {
+    bench_each_token("checksum/stringzilla::bytesum", slices, work, |token| {
         let _ = black_box(sz::bytesum(token));
     });
 
-    bench_each_token("checksum/blake3::hash", &slices, work, |token| {
+    bench_each_token("checksum/blake3::hash", slices, work, |token| {
         let _ = black_box(blake3::hash(token));
     });
     if !unique_tokens.is_empty() && should_run("checksum/blake3::hash") {
-        print_collision_rate(&unique_tokens, |token_bytes| {
+        print_collision_rate(unique_tokens, |token_bytes| {
             let hash = blake3::hash(token_bytes);
             let bytes = hash.as_bytes();
             u64::from_le_bytes([
@@ -270,13 +252,13 @@ fn bench_checksum(work: WorkUnits, tokens: &BytesCowsAuto) {
         });
     }
 
-    bench_each_token("checksum/sha2::Sha256", &slices, work, |token| {
+    bench_each_token("checksum/sha2::Sha256", slices, work, |token| {
         let mut hasher = Sha256::new();
         hasher.update(token);
         let _ = black_box(hasher.finalize());
     });
     if !unique_tokens.is_empty() && should_run("checksum/sha2::Sha256") {
-        print_collision_rate(&unique_tokens, |token_bytes| {
+        print_collision_rate(unique_tokens, |token_bytes| {
             let mut hasher = Sha256::new();
             hasher.update(token_bytes);
             let result = hasher.finalize();
@@ -287,11 +269,11 @@ fn bench_checksum(work: WorkUnits, tokens: &BytesCowsAuto) {
         });
     }
 
-    bench_each_token("checksum/ring::SHA256", &slices, work, |token| {
+    bench_each_token("checksum/ring::SHA256", slices, work, |token| {
         let _ = black_box(ring_digest::digest(&ring_digest::SHA256, token));
     });
     if !unique_tokens.is_empty() && should_run("checksum/ring::SHA256") {
-        print_collision_rate(&unique_tokens, |token_bytes| {
+        print_collision_rate(unique_tokens, |token_bytes| {
             let digest = ring_digest::digest(&ring_digest::SHA256, token_bytes);
             let bytes = digest.as_ref();
             u64::from_le_bytes([
@@ -300,11 +282,11 @@ fn bench_checksum(work: WorkUnits, tokens: &BytesCowsAuto) {
         });
     }
 
-    bench_each_token("checksum/stringzilla::Sha256", &slices, work, |token| {
+    bench_each_token("checksum/stringzilla::Sha256", slices, work, |token| {
         let _ = black_box(sz::Sha256::hash(token));
     });
     if !unique_tokens.is_empty() && should_run("checksum/stringzilla::Sha256") {
-        print_collision_rate(&unique_tokens, |token_bytes| {
+        print_collision_rate(unique_tokens, |token_bytes| {
             let digest = sz::Sha256::hash(token_bytes);
             u64::from_le_bytes([
                 digest[0], digest[1], digest[2], digest[3], digest[4], digest[5], digest[6],
@@ -321,20 +303,13 @@ fn bench_checksum(work: WorkUnits, tokens: &BytesCowsAuto) {
 /// Benchmarks stateful hashes, streaming the whole dataset through one hasher per pass and
 /// cycling passes for the budget. The per-call unit is one full streaming pass, so the deadline
 /// check after each call bounds overshoot to a single pass.
-fn bench_stateful(tokens: &BytesCowsAuto) {
-    let mut tokens_tape = BytesTape::<u64>::new();
-    tokens_tape
-        .extend(tokens.iter())
-        .expect("Failed to create BytesTape");
-    let view = tokens_tape.view();
-    let total_bytes: u64 = (&view).into_iter().map(|token| token.len() as u64).sum();
-
+fn bench_stateful(view: &BytesTapeView<'_, u64>, total_bytes: u64) {
     measure(
         "stateful/stringzilla::Hasher",
         MeasureSpec::new(Unit::Bytes, WorkUnits::bytes(total_bytes)),
         || {
             let mut hasher = sz::Hasher::new(0);
-            for token in &view {
+            for token in view {
                 hasher.write(token);
             }
             black_box(hasher.finish());
@@ -348,7 +323,7 @@ fn bench_stateful(tokens: &BytesCowsAuto) {
         MeasureSpec::new(Unit::Bytes, WorkUnits::bytes(total_bytes)),
         || {
             let mut aggregate = std_builder.build_hasher();
-            for token in &view {
+            for token in view {
                 aggregate.write(token);
             }
             black_box(aggregate.finish());
@@ -362,7 +337,7 @@ fn bench_stateful(tokens: &BytesCowsAuto) {
         MeasureSpec::new(Unit::Bytes, WorkUnits::bytes(total_bytes)),
         || {
             let mut aggregate = ahash_state.build_hasher();
-            for token in &view {
+            for token in view {
                 aggregate.write(token);
             }
             black_box(aggregate.finish());
@@ -376,7 +351,7 @@ fn bench_stateful(tokens: &BytesCowsAuto) {
         MeasureSpec::new(Unit::Bytes, WorkUnits::bytes(total_bytes)),
         || {
             let mut aggregate = foldhash_state.build_hasher();
-            for token in &view {
+            for token in view {
                 aggregate.write(token);
             }
             black_box(aggregate.finish());
@@ -388,7 +363,7 @@ fn bench_stateful(tokens: &BytesCowsAuto) {
         MeasureSpec::new(Unit::Bytes, WorkUnits::bytes(total_bytes)),
         || {
             let mut hasher = crc32fast::Hasher::new();
-            for token in &view {
+            for token in view {
                 hasher.update(token);
             }
             black_box(hasher.finalize());
@@ -406,14 +381,24 @@ fn main() {
     let work = WorkUnits::new(tape.len() as u64, tape.iter().map(|t| t.len() as u64).sum());
     log_timing_overhead();
 
+    // One compacted copy of the working set, shared by all three sections. Each used to
+    // build its own, so the run paid three full corpus copies to measure the same bytes.
+    let mut tokens_tape = BytesTape::<u64>::new();
+    tokens_tape
+        .extend(tape.iter())
+        .expect("Failed to create BytesTape");
+    let view = tokens_tape.view();
+    let slices: Vec<&[u8]> = (&view).into_iter().collect();
+    let unique = unique_tokens(&slices);
+
     println!("# stateless");
-    bench_stateless(work, &tape);
+    bench_stateless(work, &slices, &unique);
 
     println!("# stateful");
-    bench_stateful(&tape);
+    bench_stateful(&view, work.bytes);
 
     println!("# checksum");
-    bench_checksum(work, &tape);
+    bench_checksum(work, &slices, &unique);
 
     finish();
 }

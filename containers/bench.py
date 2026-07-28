@@ -67,12 +67,13 @@ def bench_multihash(
     tokens: list[bytes],
     produce: Callable[[bytes], object],
     digest_bits: int,
+    total_bytes: int,
 ):
     """One pass emits `digest_bits` digest bits for every token."""
     work = MeasureSpec(
         report="bits",
         elements=len(tokens) * digest_bits,
-        total_bytes=sum(len(token) for token in tokens),
+        total_bytes=total_bytes,
     )
     measure(name, work, pass_over(produce, tokens))
 
@@ -83,13 +84,9 @@ def bench_build(name: str, count: int, total_bytes: int, build: Callable[[], obj
     measure(name, work, build)
 
 
-def bench_query(name: str, probes: list[bytes], query: Callable[[bytes], bool]):
+def bench_query(name: str, probes: list[bytes], total_bytes: int, query: Callable[[bytes], bool]):
     """One pass queries every probe."""
-    work = MeasureSpec(
-        report="hashes",
-        elements=len(probes),
-        total_bytes=sum(len(probe) for probe in probes),
-    )
+    work = MeasureSpec(report="hashes", elements=len(probes), total_bytes=total_bytes)
     measure(name, work, pass_over(query, probes))
 
 
@@ -107,20 +104,24 @@ def report_quality(
     print(f"    {label:<38} {bits}, measured FPR {rate:.3f}%")
 
 
-def run_multihash(tokens: list[bytes]):
+def run_multihash(tokens: list[bytes], total_bytes: int):
     for digest_bits in (128, 256, 512, 1024):
         print(f"# multihash ({digest_bits}-bit digest)")
         sz_hashes = digest_bits // 64
         xxh3_calls = digest_bits // 128
         seeds = array("Q", SEEDS[:sz_hashes])
-        # One preallocated digest buffer reused every call, so no variant pays per-call allocation.
-        out = np.empty(sz_hashes, dtype=np.uint64)
+        # One digest buffer reused every call, so no variant pays per-call allocation.
+        # `array("Q")` and not numpy: the two per-dimension variants below store into it
+        # from Python, and a numpy scalar `__setitem__` costs 43.5 ns against the 28.4 ns
+        # hash it is storing — the comparison would be about numpy, not about hashing.
+        out = array("Q", [0] * sz_hashes)
 
         bench_multihash(
             "multihash/stringzilla.hash_multiseed",
             tokens,
             lambda token, seeds=seeds, out=out: sz.hash_multiseed(token, seeds, out),
             digest_bits,
+            total_bytes,
         )
 
         def sz_hash_fill(token, seeds=seeds, out=out):
@@ -132,6 +133,7 @@ def run_multihash(tokens: list[bytes]):
             tokens,
             sz_hash_fill,
             digest_bits,
+            total_bytes,
         )
 
         # One full 128-bit xxh3 hash per seed — every bit is independent, no double-hashing —
@@ -142,7 +144,7 @@ def run_multihash(tokens: list[bytes]):
                 out[2 * index] = wide & MASK_64
                 out[2 * index + 1] = wide >> 64
 
-        bench_multihash("multihash/xxhash.xxh3_128", tokens, xxh3_fill, digest_bits)
+        bench_multihash("multihash/xxhash.xxh3_128", tokens, xxh3_fill, digest_bits, total_bytes)
 
 
 def run_filters(unique: list[bytes]):
@@ -160,11 +162,10 @@ def run_filters(unique: list[bytes]):
 
     def build_bloom():
         filter_ = BloomFilter(est_elements=inserted_count, false_positive_rate=TARGET_FALSE_POSITIVE_RATE)
-        for token in inserted:
-            filter_.add(token)
+        pass_over(filter_.add, inserted)()
 
     bench_build("bloom/pyprobables.add<fnv>", inserted_count, inserted_bytes, build_bloom)
-    bench_query("bloom/pyprobables.check<fnv>", inserted, bloom.check)
+    bench_query("bloom/pyprobables.check<fnv>", inserted, inserted_bytes, bloom.check)
 
     # Same filter, fed StringZilla's `hash_multiseed` digest through the precomputed-hash API: one
     # native call fills the reused buffer, then `add_alt`/`check_alt` consume it — no per-key callback.
@@ -188,13 +189,13 @@ def run_filters(unique: list[bytes]):
 
     def build_bloom_sz():
         filter_ = BloomFilter(est_elements=inserted_count, false_positive_rate=TARGET_FALSE_POSITIVE_RATE)
-        for token in inserted:
-            filter_.add_alt(sz_digest(token))
+        pass_over(lambda token: filter_.add_alt(sz_digest(token)), inserted)()
 
     bench_build("bloom/pyprobables.add<stringzilla>", inserted_count, inserted_bytes, build_bloom_sz)
     bench_query(
         "bloom/pyprobables.check<stringzilla>",
         inserted,
+        inserted_bytes,
         lambda t: bloom_sz.check_alt(sz_digest(t)),
     )
 
@@ -218,11 +219,11 @@ def main():
         return 1
 
     unique = list(dict.fromkeys(tokens))
-    total_bytes = sum(len(token) for token in tokens)
+    total_bytes = dataset.token_bytes
     print(f"Dataset: {len(tokens):,} tokens, {total_bytes:,} bytes, {len(unique):,} unique")
     log_system_info()
 
-    run_multihash(tokens)
+    run_multihash(tokens, total_bytes)
     run_filters(unique)
     finish()
     return 0

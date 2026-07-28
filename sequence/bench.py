@@ -221,15 +221,9 @@ def main():
         n_items,
         token_bytes,
     )
-    # PyArrow
-    # Choose Arrow string type without timing the conversion
+    # PyArrow. `string` carries 32-bit offsets, so a tape past that needs `large_string`.
     INT32_MAX = 2_147_483_647
-    total_bytes = 0
-    for s_ in tokens:
-        total_bytes += len(s_.encode("utf-8", errors="ignore"))
-        if total_bytes > INT32_MAX:
-            break
-    use_large = total_bytes > INT32_MAX
+    use_large = dataset.token_bytes > INT32_MAX
     arr = pa.array(tokens, type=pa.large_string() if use_large else pa.string())
 
     bench_sort_operation(

@@ -115,7 +115,7 @@ def sizes_from_tokens(tokens: Iterable[bytes]) -> list[int]:
     return [len(token) for token in tokens if len(token) > 0]
 
 
-def bench_generator(name: str, sizes: list[int], generate_bytes: Callable[[int], bytes]) -> None:
+def bench_generator(name: str, sizes: list[int], generate_bytes: Callable[[int], object]) -> None:
     work = MeasureSpec(report="bytes", elements=len(sizes), total_bytes=sum(sizes))
     measure(name, work, pass_over(generate_bytes, sizes))
 
@@ -124,6 +124,10 @@ def make_pycryptodome_aes_ctr():
     key = b"\x00" * 16
     cipher = PyCryptoDomeAES.new(key, PyCryptoDomeAES.MODE_CTR, nonce=b"")
 
+    # This row does pay an input allocation no other generator pays, but preallocating
+    # buffers and passing `output=` measured *slower* (-17% at 9 B, -13% at 100 B): two
+    # `memoryview` slices per call cost more than `b"\x00" * size`, which pymalloc serves
+    # from its freelist.
     def generate_bytes(size: int) -> bytes:
         return cipher.encrypt(b"\x00" * size)
 
@@ -139,26 +143,16 @@ def make_stringzilla_fill_random():
     return generate_bytes
 
 
-def make_numpy_pcg64():
-    generator = np.random.Generator(np.random.PCG64(0))
-    random_raw = generator.bit_generator.random_raw
+def make_numpy_generator(bit_generator):
+    """A byte generator over a NumPy PRNG's raw 64-bit words.
 
-    def generate_bytes(size: int) -> bytes:
-        words = (size + 7) // 8
-        raw_words = random_raw(words)
-        return raw_words.view(np.uint8)[:size].tobytes()
+    The trailing slice is a view, not a `tobytes()` copy: the copy walked the whole buffer a
+    second time and was charged to these two rows alone, and `pass_over` discards the value.
+    """
+    random_raw = np.random.Generator(bit_generator).bit_generator.random_raw
 
-    return generate_bytes
-
-
-def make_numpy_philox():
-    generator = np.random.Generator(np.random.Philox(0))
-    random_raw = generator.bit_generator.random_raw
-
-    def generate_bytes(size: int) -> bytes:
-        words = (size + 7) // 8
-        raw_words = random_raw(words)
-        return raw_words.view(np.uint8)[:size].tobytes()
+    def generate_bytes(size: int) -> np.ndarray:
+        return random_raw((size + 7) // 8).view(np.uint8)[:size]
 
     return generate_bytes
 
@@ -240,8 +234,8 @@ def main() -> int:
     bench_generator("generate-random/pycryptodome.AES-CTR", sizes, make_pycryptodome_aes_ctr())
     bench_generator("generate-random/stringzilla.fill_random", sizes, make_stringzilla_fill_random())
     bench_generator("generate-random/stringzilla.random", sizes, sz.random)
-    bench_generator("generate-random/numpy.PCG64", sizes, make_numpy_pcg64())
-    bench_generator("generate-random/numpy.Philox", sizes, make_numpy_philox())
+    bench_generator("generate-random/numpy.PCG64", sizes, make_numpy_generator(np.random.PCG64(0)))
+    bench_generator("generate-random/numpy.Philox", sizes, make_numpy_generator(np.random.Philox(0)))
 
     finish()
     return 0

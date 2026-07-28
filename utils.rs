@@ -224,6 +224,27 @@ pub const REPORT_NAME_WIDTH: usize = 42;
 
 const ASCII_WHITESPACE: &[u8] = b" \n\t\r\x0b\x0c";
 
+/// Derived from `ASCII_WHITESPACE` so the normative set stays the single source of truth.
+/// `u8::is_ascii_whitespace` is *not* a substitute: it excludes U+000B, which Python's
+/// bare `bytes.split()` does split on.
+static IS_ASCII_WHITESPACE: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut index = 0;
+    while index < ASCII_WHITESPACE.len() {
+        table[ASCII_WHITESPACE[index] as usize] = true;
+        index += 1;
+    }
+    table
+};
+
+/// Largest `end <= index` that does not sit inside a UTF-8 continuation byte.
+fn char_boundary_floor(bytes: &[u8], mut end: usize) -> usize {
+    while end > 0 && end < bytes.len() && (bytes[end] & 0b1100_0000) == 0b1000_0000 {
+        end -= 1;
+    }
+    end
+}
+
 /// Global measurement limits and per-suite overrides, read from `stringwars.toml`.
 /// Neither harness carries its own defaults, so the two cannot drift.
 pub struct Limits {
@@ -260,19 +281,26 @@ pub fn parse_size(text: impl AsRef<str>) -> Option<u64> {
 /// `stringwars.toml` — the single source of defaults shared with `utils.py`.
 /// `utils.rs` is included via `#[path]` from each suite directory, so the manifest
 /// is resolved relative to this source file rather than the working directory.
-pub fn manifest() -> toml::Value {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    fs::read_to_string(root.join("stringwars.toml"))
-        .or_else(|_| fs::read_to_string("stringwars.toml"))
-        .expect_or_exit("stringwars.toml not found; it is the shared manifest for both harnesses")
-        .parse::<toml::Value>()
-        .expect_or_exit("stringwars.toml is not valid TOML")
+/// Parsed once: `limits()` runs per row, and re-reading the file there put an open and a
+/// TOML parse between every pair of measurements.
+pub fn manifest() -> &'static toml::Value {
+    static MANIFEST: OnceLock<toml::Value> = OnceLock::new();
+    MANIFEST.get_or_init(|| {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        fs::read_to_string(root.join("stringwars.toml"))
+            .or_else(|_| fs::read_to_string("stringwars.toml"))
+            .expect_or_exit(
+                "stringwars.toml not found; it is the shared manifest for both harnesses",
+            )
+            .parse::<toml::Value>()
+            .expect_or_exit("stringwars.toml is not valid TOML")
+    })
 }
 
-/// Global measurement limits, with `STRINGWARS_*` overrides applied.
+/// Global measurement limits, with `STRINGWARS_*` overrides applied. Deliberately not
+/// cached, so an override set mid-run still applies.
 pub fn limits() -> Limits {
-    let manifest = manifest();
-    let table = &manifest["limits"];
+    let table = &manifest()["limits"];
     let number = |key: &str| {
         table[key]
             .as_float()
@@ -515,50 +543,31 @@ fn record_outcome(outcome: &Outcome, spec: &MeasureSpec, bytes_per_second: f64) 
 /// `file` arm applied neither the byte budget nor the UTF-8 backoff, so
 /// `STRINGWARS_TOKENS=file` there ran over the whole 5 GB corpus.
 pub fn token_ranges(haystack: &[u8], mode: &str, budget: u64) -> Vec<std::ops::Range<usize>> {
-    let mut ranges = Vec::new();
-    let mut used: u64 = 0;
-    let mut push = |start: usize, end: usize, used: &mut u64| -> bool {
-        let size = (end - start) as u64;
-        if *used + size > budget && !ranges.is_empty() {
-            return false;
-        }
-        ranges.push(start..end);
-        *used += size;
-        true
-    };
-
     if mode == "file" {
         // The one mode where the budget truncates: a single token cannot be dropped
         // without emptying the working set. Back off to a UTF-8 boundary.
-        let mut end = (budget as usize).min(haystack.len());
-        while end > 0 && end < haystack.len() && (haystack[end] & 0b1100_0000) == 0b1000_0000 {
-            end -= 1;
-        }
-        return vec![0..end];
+        return vec![0..char_boundary_floor(haystack, (budget as usize).min(haystack.len()))];
     }
 
-    let is_separator = |byte: u8| {
-        if mode == "lines" {
+    let lines = mode == "lines";
+    let (mut ranges, mut used, mut offset) = (Vec::new(), 0u64, 0usize);
+    for field in haystack.split(|&byte| {
+        if lines {
             byte == b'\n'
         } else {
-            ASCII_WHITESPACE.contains(&byte)
+            IS_ASCII_WHITESPACE[byte as usize]
         }
-    };
-
-    let mut start = None;
-    for (index, &byte) in haystack.iter().enumerate() {
-        if is_separator(byte) {
-            if let Some(begin) = start.take() {
-                if !push(begin, index, &mut used) {
-                    return ranges;
-                }
-            }
-        } else if start.is_none() {
-            start = Some(index);
+    }) {
+        let start = offset;
+        offset += field.len() + 1; // `split` consumed exactly one separator
+        if field.is_empty() {
+            continue;
         }
-    }
-    if let Some(begin) = start {
-        push(begin, haystack.len(), &mut used);
+        if used + field.len() as u64 > budget && !ranges.is_empty() {
+            break;
+        }
+        used += field.len() as u64;
+        ranges.push(start..start + field.len());
     }
     ranges
 }
@@ -587,23 +596,30 @@ pub fn read_within_budget(path: &str, budget: u64, mode: &str) -> std::io::Resul
         return Ok(buffer);
     }
 
+    let lines = mode == "lines";
     let is_separator = |byte: u8| {
-        if mode == "lines" {
+        if lines {
             byte == b'\n'
         } else {
-            ASCII_WHITESPACE.contains(&byte)
+            IS_ASCII_WHITESPACE[byte as usize]
         }
     };
 
     let mut buffer = Vec::new();
     let mut want = budget;
+    let mut token_bytes: u64 = 0;
     loop {
         let before = buffer.len();
         Read::by_ref(&mut file)
             .take(want)
             .read_to_end(&mut buffer)?;
         let hit_eof = (buffer.len() - before) < want as usize;
-        let token_bytes = buffer.iter().filter(|&&byte| !is_separator(byte)).count() as u64;
+        // Count only what was just read. Rescanning the whole buffer per top-up made this
+        // quadratic in the budget; `utils.py` already counts incrementally.
+        token_bytes += buffer[before..]
+            .iter()
+            .filter(|&&byte| !is_separator(byte))
+            .count() as u64;
         if hit_eof || token_bytes >= budget {
             break;
         }
@@ -691,7 +707,7 @@ fn load_working_set(suite: &str) -> Result<BytesCowsAuto<'static>, DatasetError>
         }
         "words" => {
             let all = content_static
-                .split(|&byte| ASCII_WHITESPACE.contains(&byte))
+                .split(|&byte| IS_ASCII_WHITESPACE[byte as usize])
                 .filter(|slice| !slice.is_empty());
             let mut deduped = all.filter(|token| !unique || seen.insert(*token));
             let kept = take_within_budget(&mut deduped);
@@ -701,14 +717,8 @@ fn load_working_set(suite: &str) -> Result<BytesCowsAuto<'static>, DatasetError>
             // The one mode where the budget must truncate: a single token cannot be
             // dropped without emptying the working set. Back off to a UTF-8 boundary
             // so the two harnesses cap at the same byte and agree on the fingerprint.
-            let mut end = (budget as usize).min(content_static.len());
-            // `end` is a character boundary unless the byte *at* it continues one.
-            while end > 0
-                && end < content_static.len()
-                && (content_static[end] & 0b1100_0000) == 0b1000_0000
-            {
-                end -= 1;
-            }
+            let end =
+                char_boundary_floor(content_static, (budget as usize).min(content_static.len()));
             let capped = &content_static[..end];
             let iter = std::iter::once(capped);
             BytesCowsAuto::from_iter_and_data(iter, Cow::Borrowed(content_static))
@@ -808,17 +818,20 @@ fn load_working_set(suite: &str) -> Result<BytesCowsAuto<'static>, DatasetError>
     Ok(tape)
 }
 
-/// Format large numbers with thousand separators for readability
+/// Format large numbers with thousand separators for readability.
 fn format_number(n: u64) -> String {
     let digits = n.to_string();
-    let mut result = String::new();
-    for (index, digit) in digits.chars().rev().enumerate() {
-        if index > 0 && index % 3 == 0 {
-            result.insert(0, ',');
-        }
-        result.insert(0, digit);
+    let head = match digits.len() % 3 {
+        0 => 3,
+        rest => rest,
+    };
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    out.push_str(&digits[..head]);
+    for start in (head..digits.len()).step_by(3) {
+        out.push(',');
+        out.push_str(&digits[start..start + 3]);
     }
-    result
+    out
 }
 
 #[cfg(target_os = "linux")]
@@ -924,19 +937,6 @@ fn scale_si(mut v: f64) -> (f64, &'static str) {
         (v, "k")
     } else {
         (v, "")
-    }
-}
-
-fn format_seconds(value: f64) -> String {
-    // value is seconds
-    if value < 1e-6 {
-        format!("{:.2} ns", value * 1e9)
-    } else if value < 1e-3 {
-        format!("{:.2} µs", value * 1e6)
-    } else if value < 1.0 {
-        format!("{:.2} ms", value * 1e3)
-    } else {
-        format!("{:.2} s", value)
     }
 }
 
@@ -1219,7 +1219,7 @@ fn measure_core(
     // that consumes its input cannot be repeated inside a sample, so `fixed_passes`
     // pins it at one and skips calibration entirely.
     let mut passes: u64 = fixed_passes.unwrap_or(1);
-    let mut pass_cost = Duration::ZERO;
+    let mut pass_cost;
     if fixed_passes.is_none() {
         loop {
             let took = run_sample(passes);
@@ -1232,6 +1232,11 @@ fn measure_core(
                 .saturating_mul((shortfall.ceil() as u64).max(2))
                 .min(1 << 40);
         }
+    } else {
+        // A consuming kernel cannot batch passes, but one sample still prices one. Leaving
+        // `pass_cost` at zero made the refusal below test `0.0 * 3.0 > max_seconds`, so
+        // `sequence` - the one suite whose work is superlinear - could never be refused.
+        pass_cost = run_sample(passes) / passes.max(1) as u32;
     }
 
     if pass_cost.as_secs_f64() * 3.0 > lim.max_seconds {
@@ -1520,6 +1525,90 @@ mod tests {
     /// The rule `memory` used to fork. Its copy ignored the budget in `file` mode
     /// and split `words` on a narrower set, so the two disagreed silently.
     #[test]
+    fn token_ranges_match_the_reference_state_machine() {
+        // The pre-`split` implementation, kept only as a fuzzing oracle: this is the
+        // normative tokenizer, so a silent divergence would corrupt every working set.
+        fn reference(haystack: &[u8], mode: &str, budget: u64) -> Vec<std::ops::Range<usize>> {
+            let mut ranges: Vec<std::ops::Range<usize>> = Vec::new();
+            let mut used: u64 = 0;
+            if mode == "file" {
+                let mut end = (budget as usize).min(haystack.len());
+                while end > 0
+                    && end < haystack.len()
+                    && (haystack[end] & 0b1100_0000) == 0b1000_0000
+                {
+                    end -= 1;
+                }
+                return vec![0..end];
+            }
+            let is_separator = |byte: u8| {
+                if mode == "lines" {
+                    byte == b'\n'
+                } else {
+                    ASCII_WHITESPACE.contains(&byte)
+                }
+            };
+            let mut start = None;
+            for (index, &byte) in haystack.iter().enumerate() {
+                if is_separator(byte) {
+                    if let Some(begin) = start.take() {
+                        let size = (index - begin) as u64;
+                        if used + size > budget && !ranges.is_empty() {
+                            return ranges;
+                        }
+                        ranges.push(begin..index);
+                        used += size;
+                    }
+                } else if start.is_none() {
+                    start = Some(index);
+                }
+            }
+            if let Some(begin) = start {
+                let size = (haystack.len() - begin) as u64;
+                if used + size <= budget || ranges.is_empty() {
+                    ranges.push(begin..haystack.len());
+                }
+            }
+            ranges
+        }
+
+        // Deterministic xorshift, so a failure reproduces exactly.
+        let alphabet = [
+            b"a".as_slice(),
+            b"bb",
+            b" ",
+            b"\n",
+            b"\t",
+            b"\r",
+            b"\x0b",
+            b"\x0c",
+            "é".as_bytes(),
+            "\u{4e2d}".as_bytes(),
+        ];
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..20_000 {
+            let mut haystack = Vec::new();
+            for _ in 0..(next() % 24) {
+                haystack.extend_from_slice(alphabet[(next() % alphabet.len() as u64) as usize]);
+            }
+            let budget = next() % 70;
+            for mode in ["words", "lines", "file"] {
+                assert_eq!(
+                    token_ranges(&haystack, mode, budget),
+                    reference(&haystack, mode, budget),
+                    "mode={mode} budget={budget} haystack={haystack:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
     fn token_ranges_follow_the_normative_rule() {
         let text = b"alpha beta\n\ngamma";
         let words = token_ranges(text, "words", 1 << 20);
@@ -1550,5 +1639,14 @@ mod tests {
         // Unicode spaces are deliberately excluded: Python's bare `str.split()`
         // also splits U+3000, which Rust never did, and the CJK corpora contain it.
         assert!(!ASCII_WHITESPACE.contains(&0xA0));
+        // The lookup table the tokenizer actually consults must agree with the slice
+        // it is derived from, for every byte.
+        for byte in 0..=u8::MAX {
+            assert_eq!(
+                IS_ASCII_WHITESPACE[byte as usize],
+                ASCII_WHITESPACE.contains(&byte),
+                "byte {byte:#04x}",
+            );
+        }
     }
 }

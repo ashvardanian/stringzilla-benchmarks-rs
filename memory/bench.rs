@@ -80,13 +80,11 @@ pub fn tokenize_mut(haystack: &mut [u8]) -> Result<Vec<&mut [u8]>, Box<dyn Error
 /// dataset. Throughput is reported as bytes/s, matching the original `Throughput::Bytes` over the
 /// sum of token lengths.
 fn bench_lookup_table(tokens: &mut [&mut [u8]]) {
-    let mut lookup_invert_case: [u8; 256] = core::array::from_fn(|index| index as u8);
-    for (upper, lower) in ('A'..='Z').zip('a'..='z') {
-        lookup_invert_case[upper as usize] = lower as u8;
-    }
-    for (upper, lower) in ('A'..='Z').zip('a'..='z') {
-        lookup_invert_case[lower as usize] = upper as u8;
-    }
+    let lookup_invert_case: [u8; 256] = core::array::from_fn(|index| match index as u8 {
+        byte @ b'A'..=b'Z' => byte + 32,
+        byte @ b'a'..=b'z' => byte - 32,
+        byte => byte,
+    });
 
     measure_mut_token(
         "lookup-table/stringzilla::lookup_inplace",
@@ -116,11 +114,6 @@ fn bench_generate_random(tokens: &mut [&mut [u8]]) {
             sz::fill_random(token, 0);
         },
     );
-
-    measure_mut_token("generate-random/zeroize::zeroize", tokens, |token| {
-        token.zeroize();
-        black_box(&token);
-    });
 
     measure_mut_token("generate-random/getrandom::fill", tokens, |token| {
         getrandom::fill(token).expect("getrandom failed");
@@ -156,137 +149,91 @@ fn bench_generate_random(tokens: &mut [&mut [u8]]) {
 }
 
 /// Benchmarks memory-fill operations, filling one buffer per call and cycling the dataset.
+///
+/// Fills the tokens themselves rather than per-row `Vec<Vec<u8>>` copies: the generators
+/// above have already overwritten every byte, and the copies cost one allocation per token
+/// plus a corpus-sized clone for each row.
 fn bench_memset(tokens: &mut [&mut [u8]]) {
     const FILL_VALUE: u8 = 0xAA;
-    let templates: Vec<Vec<u8>> = tokens.iter().map(|token| (**token).to_vec()).collect();
-    let total_bytes: usize = templates.iter().map(|buffer| buffer.len()).sum();
-    if total_bytes == 0 {
-        return;
-    }
-    let buffer_count = templates.len();
 
-    {
-        let mut buffers = templates.clone();
-        measure(
-            "memset/stringzilla::fill",
-            MeasureSpec::new(
-                Unit::Bytes,
-                WorkUnits::new(buffer_count as u64, total_bytes as u64),
-            ),
-            || {
-                for buffer in buffers.iter_mut() {
-                    sz::fill(buffer, FILL_VALUE);
-                    black_box(&buffer);
-                }
-            },
-        );
-    }
+    measure_mut_token("memset/stringzilla::fill", tokens, |buffer| {
+        sz::fill(buffer, FILL_VALUE);
+        black_box(&buffer);
+    });
 
-    {
-        let mut buffers = templates.clone();
-        measure(
-            "memset/std::ptr::write_bytes",
-            MeasureSpec::new(
-                Unit::Bytes,
-                WorkUnits::new(buffer_count as u64, total_bytes as u64),
-            ),
-            || {
-                for buffer in buffers.iter_mut() {
-                    unsafe {
-                        ptr::write_bytes(buffer.as_mut_ptr(), FILL_VALUE, buffer.len());
-                    }
-                    black_box(&buffer);
-                }
-            },
-        );
-    }
+    measure_mut_token("memset/std::ptr::write_bytes", tokens, |buffer| {
+        unsafe {
+            ptr::write_bytes(buffer.as_mut_ptr(), FILL_VALUE, buffer.len());
+        }
+        black_box(&buffer);
+    });
 
-    {
-        let mut buffers = templates.clone();
-        measure(
-            "memset/slice::fill",
-            MeasureSpec::new(
-                Unit::Bytes,
-                WorkUnits::new(buffer_count as u64, total_bytes as u64),
-            ),
-            || {
-                for buffer in buffers.iter_mut() {
-                    buffer.fill(FILL_VALUE);
-                    black_box(&buffer);
-                }
-            },
-        );
-    }
+    measure_mut_token("memset/slice::fill", tokens, |buffer| {
+        buffer.fill(FILL_VALUE);
+        black_box(&buffer);
+    });
+
+    // `zeroize` writes zeros through volatile stores, so it is a memset with a fixed value
+    // rather than a generator; it used to sit in the random-generation group.
+    measure_mut_token("memset/zeroize::zeroize", tokens, |buffer| {
+        buffer.zeroize();
+        black_box(&buffer);
+    });
 }
 
 /// Benchmarks memory-copy operations, copying one buffer per call and cycling the dataset.
-fn bench_memcpy(tokens: &mut [&mut [u8]]) {
-    let sources: Vec<Vec<u8>> = tokens.iter().map(|token| (**token).to_vec()).collect();
-    let dest_template: Vec<Vec<u8>> = sources.iter().map(|src| vec![0u8; src.len()]).collect();
-    let total_bytes: usize = sources.iter().map(|buffer| buffer.len()).sum();
+///
+/// Sources are the tokens and destinations one arena split into matching slices. The previous
+/// shape held three corpus-sized `Vec<Vec<u8>>` at once — a separate allocation per token.
+fn bench_memcpy(tokens: &[&mut [u8]]) {
+    let total_bytes: usize = tokens.iter().map(|token| token.len()).sum();
     if total_bytes == 0 {
         return;
     }
-    let buffer_count = sources.len();
-
-    {
-        let mut dests = dest_template.clone();
-        measure(
-            "memcpy/stringzilla::copy",
-            MeasureSpec::new(
-                Unit::Bytes,
-                WorkUnits::new(buffer_count as u64, total_bytes as u64),
-            ),
-            || {
-                for index in 0..buffer_count {
-                    let source = &sources[index];
-                    let dest = &mut dests[index];
-                    sz::copy(dest, source);
-                    black_box(&dest);
-                }
-            },
-        );
+    let mut arena = vec![0u8; total_bytes];
+    let mut destinations: Vec<&mut [u8]> = Vec::with_capacity(tokens.len());
+    let mut rest = &mut arena[..];
+    for token in tokens.iter() {
+        let (head, tail) = rest.split_at_mut(token.len());
+        destinations.push(head);
+        rest = tail;
     }
+    let pass = WorkUnits::new(tokens.len() as u64, total_bytes as u64);
 
-    {
-        let mut dests = dest_template.clone();
-        measure(
-            "memcpy/slice::copy_from_slice",
-            MeasureSpec::new(
-                Unit::Bytes,
-                WorkUnits::new(buffer_count as u64, total_bytes as u64),
-            ),
-            || {
-                for index in 0..buffer_count {
-                    let source = &sources[index];
-                    let dest = &mut dests[index];
-                    dest.copy_from_slice(source);
-                    black_box(&dest);
-                }
-            },
-        );
-    }
+    measure(
+        "memcpy/stringzilla::copy",
+        MeasureSpec::new(Unit::Bytes, pass),
+        || {
+            for (source, dest) in tokens.iter().zip(destinations.iter_mut()) {
+                sz::copy(dest, source);
+                black_box(&dest);
+            }
+        },
+    );
 
-    {
-        let mut dests = dest_template.clone();
-        measure(
-            "memcpy/std::ptr::copy_nonoverlapping",
-            MeasureSpec::new(
-                Unit::Bytes,
-                WorkUnits::new(buffer_count as u64, total_bytes as u64),
-            ),
-            || {
-                for index in 0..buffer_count {
-                    let source = &sources[index];
-                    let dest = &mut dests[index];
-                    unsafe {
-                        ptr::copy_nonoverlapping(source.as_ptr(), dest.as_mut_ptr(), source.len());
-                    }
-                    black_box(&dest);
+    measure(
+        "memcpy/slice::copy_from_slice",
+        MeasureSpec::new(Unit::Bytes, pass),
+        || {
+            for (source, dest) in tokens.iter().zip(destinations.iter_mut()) {
+                dest.copy_from_slice(source);
+                black_box(&dest);
+            }
+        },
+    );
+
+    measure(
+        "memcpy/std::ptr::copy_nonoverlapping",
+        MeasureSpec::new(Unit::Bytes, pass),
+        || {
+            for (source, dest) in tokens.iter().zip(destinations.iter_mut()) {
+                unsafe {
+                    ptr::copy_nonoverlapping(source.as_ptr(), dest.as_mut_ptr(), source.len());
                 }
-            },
-        );
-    }
+                black_box(&dest);
+            }
+        },
+    );
 }
 
 /// Benchmarks memory-move operations, shifting one buffer per call and cycling the dataset.
@@ -294,86 +241,62 @@ fn bench_memcpy(tokens: &mut [&mut [u8]]) {
 /// matching the original `Throughput::Bytes(sum(len - SHIFT))` accounting.
 fn bench_memmove(tokens: &mut [&mut [u8]]) {
     const SHIFT: usize = 8;
-    let templates: Vec<Vec<u8>> = tokens
-        .iter()
-        .filter_map(|token| {
-            let slice = &**token;
-            if slice.len() <= SHIFT {
-                None
-            } else {
-                Some(slice.to_vec())
-            }
-        })
+    // The tokens themselves, shifted in place: the shorter ones are filtered out here so the
+    // timed loop carries no length test.
+    let mut movable: Vec<&mut [u8]> = tokens
+        .iter_mut()
+        .filter(|token| token.len() > SHIFT)
+        .map(|token| &mut **token)
         .collect();
-    if templates.is_empty() {
+    if movable.is_empty() {
         return;
     }
-    let buffer_count = templates.len();
-    let moved_bytes: usize = templates
-        .iter()
-        .map(|b| b.len().saturating_sub(SHIFT))
-        .sum();
+    let pass = WorkUnits::new(
+        movable.len() as u64,
+        movable.iter().map(|b| (b.len() - SHIFT) as u64).sum(),
+    );
 
-    {
-        let mut buffers = templates.clone();
-        measure(
-            "memmove/stringzilla::move_",
-            MeasureSpec::new(
-                Unit::Bytes,
-                WorkUnits::new(buffer_count as u64, moved_bytes as u64),
-            ),
-            || {
-                for buffer in buffers.iter_mut() {
-                    let move_len = buffer.len() - SHIFT;
-                    unsafe {
-                        let source = slice::from_raw_parts(buffer.as_ptr(), move_len);
-                        let dest =
-                            slice::from_raw_parts_mut(buffer.as_mut_ptr().add(SHIFT), move_len);
-                        sz::move_(dest, &source);
-                    }
-                    black_box(&buffer);
+    measure(
+        "memmove/stringzilla::move_",
+        MeasureSpec::new(Unit::Bytes, pass),
+        || {
+            for buffer in movable.iter_mut() {
+                let move_len = buffer.len() - SHIFT;
+                unsafe {
+                    let source = slice::from_raw_parts(buffer.as_ptr(), move_len);
+                    let dest = slice::from_raw_parts_mut(buffer.as_mut_ptr().add(SHIFT), move_len);
+                    sz::move_(dest, &source);
                 }
-            },
-        );
-    }
+                black_box(&buffer);
+            }
+        },
+    );
 
-    {
-        let mut buffers = templates.clone();
-        measure(
-            "memmove/std::ptr::copy",
-            MeasureSpec::new(
-                Unit::Bytes,
-                WorkUnits::new(buffer_count as u64, moved_bytes as u64),
-            ),
-            || {
-                for buffer in buffers.iter_mut() {
-                    let move_len = buffer.len() - SHIFT;
-                    unsafe {
-                        ptr::copy(buffer.as_ptr(), buffer.as_mut_ptr().add(SHIFT), move_len);
-                    }
-                    black_box(&buffer);
+    measure(
+        "memmove/std::ptr::copy",
+        MeasureSpec::new(Unit::Bytes, pass),
+        || {
+            for buffer in movable.iter_mut() {
+                let move_len = buffer.len() - SHIFT;
+                unsafe {
+                    ptr::copy(buffer.as_ptr(), buffer.as_mut_ptr().add(SHIFT), move_len);
                 }
-            },
-        );
-    }
+                black_box(&buffer);
+            }
+        },
+    );
 
-    {
-        let mut buffers = templates.clone();
-        measure(
-            "memmove/slice::copy_within",
-            MeasureSpec::new(
-                Unit::Bytes,
-                WorkUnits::new(buffer_count as u64, moved_bytes as u64),
-            ),
-            || {
-                for buffer in buffers.iter_mut() {
-                    let move_len = buffer.len() - SHIFT;
-                    buffer.copy_within(0..move_len, SHIFT);
-                    black_box(&buffer);
-                }
-            },
-        );
-    }
+    measure(
+        "memmove/slice::copy_within",
+        MeasureSpec::new(Unit::Bytes, pass),
+        || {
+            for buffer in movable.iter_mut() {
+                let move_len = buffer.len() - SHIFT;
+                buffer.copy_within(0..move_len, SHIFT);
+                black_box(&buffer);
+            }
+        },
+    );
 }
 
 fn main() {
@@ -385,10 +308,7 @@ fn main() {
     if tokens.is_empty() {
         panic!("No tokens found in the dataset.");
     }
-    note_working_set(
-        "memory",
-        &tokens.iter().map(|token| &**token).collect::<Vec<_>>(),
-    );
+    note_working_set("memory", &tokens);
     log_timing_overhead();
 
     println!("# lookup-table");
@@ -401,7 +321,7 @@ fn main() {
     bench_memset(&mut tokens[..]);
 
     println!("# memcpy");
-    bench_memcpy(&mut tokens[..]);
+    bench_memcpy(&tokens[..]);
 
     println!("# memmove");
     bench_memmove(&mut tokens[..]);

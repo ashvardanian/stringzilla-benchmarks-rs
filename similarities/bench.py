@@ -151,15 +151,21 @@ def crossproduct_metrics(
     return total_cells, total_bytes
 
 
-def _crossproduct_supported(engine: Any, queries: Any, candidates: Any) -> bool:
+# Deliberately unequal lengths: that is the shape a binding without the cross-product call rejects.
+_PROBE_QUERIES = sz.Strs(["ab", "cde", "f"])
+_PROBE_CANDIDATES = sz.Strs(["gh", "ij"])
+
+
+def _crossproduct_supported(engine: Any) -> bool:
     """Probe whether the installed binding exposes the queries x candidates cross-product call.
 
     A supporting binding accepts two disjoint, differently-sized collections and returns a 2-D
-    matrix; a binding without the cross-product call raises on unequal lengths. We probe once with a
-    tiny mismatched pair so an unsupported binding degrades to a clear SKIP instead of a crash.
+    matrix; a binding without the cross-product call raises on unequal lengths. The probe uses a
+    tiny mismatched pair so an unsupported binding degrades to a clear SKIP instead of a crash,
+    and so the check costs nothing next to the row it guards.
     """
     try:
-        probe = engine(queries, candidates)
+        probe = engine(_PROBE_QUERIES, _PROBE_CANDIDATES)
     except Exception:
         return False
     return getattr(np.asarray(probe), "ndim", 0) == 2
@@ -199,7 +205,7 @@ def unary_class_costs(match_cost: int, mismatch_cost: int) -> tuple[np.ndarray, 
     `match_cost` on the diagonal and `mismatch_cost` off it. Throughput (CUPS) is invariant to the
     actual cost values, so this stays apples-to-apples with the Rust harness.
     """
-    byte_to_class = np.array([byte % 32 for byte in range(256)], dtype=np.uint8)
+    byte_to_class = np.arange(256, dtype=np.uint8) % 32
     class_substitution_costs = np.full((32, 32), mismatch_cost, dtype=np.int8)
     np.fill_diagonal(class_substitution_costs, match_cost)
     return byte_to_class, class_substitution_costs
@@ -275,13 +281,13 @@ def benchmark_stringzillas_distances(
     bench.rs.
     """
     for variant in device_variants:
-        full_name = f"{engine_name}{variant.label}"
-        if not should_run(f"{category}/{full_name}"):
+        full_name = f"{category}/{engine_name}{variant.label}"
+        if not should_run(full_name):
             continue
 
         side = variant.side
-        queries = sz.Strs(list(tokens[0:side]))
-        candidates = sz.Strs(list(tokens[side : 2 * side]))
+        queries = sz.Strs(tokens[0:side])
+        candidates = sz.Strs(tokens[side : 2 * side])
 
         try:
             engine = engine_class(capabilities=variant.scope)
@@ -289,7 +295,7 @@ def benchmark_stringzillas_distances(
             print(f"{full_name}: SKIPPED ({creation_error})")
             continue
 
-        if not _crossproduct_supported(engine, queries, candidates):
+        if not _crossproduct_supported(engine):
             print(f"{full_name}: SKIPPED (installed stringzillas lacks the queries x candidates cross-product API)")
             continue
 
@@ -336,13 +342,13 @@ def benchmark_stringzillas_scores(
     throughput denominator uses byte lengths (the binary cells), matching bench.rs.
     """
     for variant in device_variants:
-        full_name = f"{engine_name}{variant.label}"
-        if not should_run(f"{category}/{full_name}"):
+        full_name = f"{category}/{engine_name}{variant.label}"
+        if not should_run(full_name):
             continue
 
         side = variant.side
-        queries = sz.Strs(list(tokens[0:side]))
-        candidates = sz.Strs(list(tokens[side : 2 * side]))
+        queries = sz.Strs(tokens[0:side])
+        candidates = sz.Strs(tokens[side : 2 * side])
 
         try:
             engine = engine_class(
@@ -356,7 +362,7 @@ def benchmark_stringzillas_scores(
             print(f"{full_name}: SKIPPED ({creation_error})")
             continue
 
-        if not _crossproduct_supported(engine, queries, candidates):
+        if not _crossproduct_supported(engine):
             print(f"{full_name}: SKIPPED (installed stringzillas lacks the queries x candidates cross-product API)")
             continue
 
@@ -393,15 +399,16 @@ def benchmark_edit_distance_baselines(
 ) -> None:
     """Third-party edit-distance baselines along the single-CPU cross-product diagonal."""
 
-    queries = list(tokens[0:baseline_side])
-    candidates = list(tokens[baseline_side : 2 * baseline_side])
+    queries = tokens[0:baseline_side]
+    candidates = tokens[baseline_side : 2 * baseline_side]
     query_codepoints = codepoint_lengths[:baseline_side]
     candidate_codepoints = codepoint_lengths[baseline_side : 2 * baseline_side]
     query_bytes = byte_lengths[:baseline_side]
     candidate_bytes = byte_lengths[baseline_side : 2 * baseline_side]
 
     def run(name: str, scalar_function: Callable[[Any, Any], int], length_metric: tuple[np.ndarray, np.ndarray]):
-        if not should_run(f"levenshtein/{name}"):
+        name = f"levenshtein/{name}"
+        if not should_run(name):
             return
         # These baselines score the diagonal pairs, not a cross-product, so the work is
         # summed pairwise: cells are len(query_i) * len(candidate_i) under whichever
@@ -461,8 +468,8 @@ def benchmark_edit_distance_baselines(
     else:
         gpu_cores = gpu_multiprocessor_count(0) or 64
         gpu_batch_size = auto_batch_size(gpu_cores, base=batch_size_override, default_base=DEFAULT_BATCH_PER_CORE)
-        name = f"cudf.edit_distance<1gpu,batch={gpu_batch_size}>"
-        if should_run(f"levenshtein/{name}"):
+        name = f"levenshtein/cudf.edit_distance<1gpu,batch={gpu_batch_size}>"
+        if should_run(name):
             _benchmark_cudf_edit_distance(
                 name,
                 queries,
@@ -515,8 +522,8 @@ def benchmark_biopython_baseline(
     if not BIOPYTHON_AVAILABLE:
         note_unavailable(f"{category}/biopython.PairwiseAligner.{mode}", "biopython not installed")
         return
-    name = f"biopython.PairwiseAligner.{mode}"
-    if not should_run(f"{category}/{name}"):
+    name = f"{category}/biopython.PairwiseAligner.{mode}"
+    if not should_run(name):
         return
 
     aligner = Align.PairwiseAligner()
@@ -526,8 +533,8 @@ def benchmark_biopython_baseline(
     aligner.open_gap_score = gap_open
     aligner.extend_gap_score = gap_extend
 
-    queries = list(tokens[0:baseline_side])
-    candidates = list(tokens[baseline_side : 2 * baseline_side])
+    queries = tokens[0:baseline_side]
+    candidates = tokens[baseline_side : 2 * baseline_side]
     query_bytes = byte_lengths[:baseline_side]
     candidate_bytes = byte_lengths[baseline_side : 2 * baseline_side]
 

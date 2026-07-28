@@ -10,7 +10,7 @@ STRINGWARS_DATASET=README.md cargo bench --features bench_containers --bench ben
 use std::collections::HashSet;
 use std::hint::black_box;
 
-use stringtape::{BytesCowsAuto, BytesTape};
+use stringtape::BytesCowsAuto;
 
 use fastbloom::BloomFilter;
 use stringzilla::sz;
@@ -210,23 +210,26 @@ fn bench_bloom(inserted: &[&[u8]], absent: &[&[u8]], bytes: u64) {
     );
 }
 
-/// Collects the keys into a sorted, deduplicated `u64` array — the shape `xorf` consumes.
-fn hashed_keys<Hash: Fn(&[u8]) -> u64>(inserted: &[&[u8]], hash: Hash) -> Vec<u64> {
-    let mut keys: Vec<u64> = inserted.iter().map(|token| hash(token)).collect();
+/// Fills `keys` with the sorted, deduplicated `u64` array `xorf` consumes.
+fn hashed_keys<Hash: Fn(&[u8]) -> u64>(keys: &mut Vec<u64>, inserted: &[&[u8]], hash: Hash) {
+    keys.clear();
+    keys.extend(inserted.iter().map(|token| hash(token)));
     keys.sort_unstable();
     keys.dedup();
-    keys
 }
 
 /// Binary-fuse filter (xorf): a static filter built from pre-hashed keys, so the only variable is the
 /// hash that produced them. Its ~0.4% false-positive rate is fixed by the 8-bit fingerprints.
 fn bench_xorf(inserted: &[&[u8]], absent: &[&[u8]], bytes: u64) {
     let count = inserted.len();
+    // Hashing, sorting and deduplication stay inside the clock — that is what building
+    // this filter is — but the buffer they fill is allocated once, not once per pass.
+    let mut keys: Vec<u64> = Vec::with_capacity(count);
 
-    let fuse_sz = BinaryFuse8::try_from(&hashed_keys(inserted, |token| sz::hash(token)))
-        .expect("binary-fuse build from StringZilla keys");
-    let fuse_xxh = BinaryFuse8::try_from(&hashed_keys(inserted, xxh3_64))
-        .expect("binary-fuse build from xxh3 keys");
+    hashed_keys(&mut keys, inserted, |token| sz::hash(token));
+    let fuse_sz = BinaryFuse8::try_from(&keys).expect("binary-fuse build from StringZilla keys");
+    hashed_keys(&mut keys, inserted, xxh3_64);
+    let fuse_xxh = BinaryFuse8::try_from(&keys).expect("binary-fuse build from xxh3 keys");
     report_quality(
         "xor/xorf::BinaryFuse8<stringzilla>",
         fuse_sz.len() * 8,
@@ -247,9 +250,8 @@ fn bench_xorf(inserted: &[&[u8]], absent: &[&[u8]], bytes: u64) {
         count,
         bytes,
         || {
-            black_box(
-                BinaryFuse8::try_from(&hashed_keys(inserted, |token| sz::hash(token))).unwrap(),
-            );
+            hashed_keys(&mut keys, inserted, |token| sz::hash(token));
+            black_box(BinaryFuse8::try_from(&keys).unwrap());
         },
     );
     measure_query(
@@ -258,7 +260,8 @@ fn bench_xorf(inserted: &[&[u8]], absent: &[&[u8]], bytes: u64) {
         |token| fuse_sz.contains(&sz::hash(token)),
     );
     measure_build("xor/xorf::BinaryFuse8::build<xxh3>", count, bytes, || {
-        black_box(BinaryFuse8::try_from(&hashed_keys(inserted, xxh3_64)).unwrap());
+        hashed_keys(&mut keys, inserted, xxh3_64);
+        black_box(BinaryFuse8::try_from(&keys).unwrap());
     });
     measure_query("xor/xorf::BinaryFuse8::contains<xxh3>", inserted, |token| {
         fuse_xxh.contains(&xxh3_64(token))
@@ -305,15 +308,16 @@ fn main() {
     let tokens: BytesCowsAuto = resolve_dataset("containers").unwrap_nice();
     log_timing_overhead();
 
-    let mut tape = BytesTape::<u64>::new();
-    tape.extend(tokens.iter())
-        .expect("Failed to build BytesTape");
-    let view = tape.view();
-    let slices: Vec<&[u8]> = (&view).into_iter().collect();
+    let slices: Vec<&[u8]> = tokens.iter().collect();
 
+    // Sorted, not left in `HashSet` order: `RandomState` reshuffles the 80/20
+    // insert/absent split on every run, and with it `inserted_bytes` — the bytes/s
+    // denominator of all six filter rows.
     let unique: Vec<&[u8]> = {
         let set: HashSet<&[u8]> = slices.iter().copied().collect();
-        set.into_iter().collect()
+        let mut unique: Vec<&[u8]> = set.into_iter().collect();
+        unique.sort_unstable();
+        unique
     };
     println!("- {} tokens, {} unique\n", slices.len(), unique.len());
 

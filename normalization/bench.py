@@ -50,17 +50,13 @@ def bench_case_compare(
     lefts: list[str],
     rights: list[str],
     compare_function: Callable[[str, str], bool],
+    total_bytes: int,
 ):
     """One pass compares every pair, so the pair mixture is identical in every sample."""
     if not lefts:
         note_unavailable(name, "fewer than two tokens to pair")
         return
-    work = MeasureSpec(
-        report="bytes",
-        elements=len(lefts),
-        total_bytes=sum(len(item.encode("utf-8")) for item in lefts)
-        + sum(len(item.encode("utf-8")) for item in rights),
-    )
+    work = MeasureSpec(report="bytes", elements=len(lefts), total_bytes=total_bytes)
     measure(name, work, pass_over(compare_function, lefts, rights))
 
 
@@ -69,7 +65,12 @@ def compare_casefold(first_string: str, second_string: str) -> bool:
 
 
 def compare_regex_fullcase(first_string: str, second_string: str) -> bool:
-    # Escape special regex characters and do a full match
+    """Escape, compile and full-match, all inside the timed pass — hence the row's name.
+
+    Precompiling is not an option: the corpus holds millions of distinct words and `regex`
+    caches only 500 patterns, so a hoisted variant would thrash that cache under its lock.
+    `regex.escape` is a per-character Python loop and is paid on every call either way.
+    """
     pattern = regex.compile(regex.escape(first_string), regex.IGNORECASE | regex.FULLCASE)
     return pattern.fullmatch(second_string) is not None
 
@@ -90,12 +91,12 @@ def bench_case_find(
     haystack: str,
     needles: list[str],
     find_function: Callable[[str, str], int],
+    haystack_bytes: int,
 ):
     """One pass searches every needle across the whole haystack."""
     if not needles:
         print(f"{name}: no needles to search", file=sys.stderr)
         return
-    haystack_bytes = len(haystack.encode("utf-8"))
     work = MeasureSpec(
         report="bytes",
         elements=len(needles),
@@ -122,27 +123,39 @@ def find_casefold(haystack: str, needle: str) -> int:
 
 
 def find_regex_fullcase(haystack: str, needle: str) -> int:
-    """Count occurrences using regex with IGNORECASE | FULLCASE."""
+    """Count occurrences with IGNORECASE | FULLCASE, escaping and compiling per needle.
+
+    Only 16 needles run here, so the compile is a cache hit; the escape is still a
+    per-character Python loop, and the row's name says so.
+    """
     if not needle:
         return 0
     pattern = regex.compile(regex.escape(needle), regex.IGNORECASE | regex.FULLCASE)
-    # Use finditer for fair comparison (same Python loop overhead as StringZilla)
+    # Counted lazily, so the Python loop overhead matches the StringZilla row.
     return sum(1 for _ in pattern.finditer(haystack))
 
 
-def find_icu(haystack: str, needle: str) -> int:
-    """Count occurrences using ICU StringSearch."""
-    if not needle:
-        return 0
+def make_find_icu() -> Callable[[str, str], int]:
+    """Build an ICU StringSearch counter over one reused collator.
+
+    The collator does not depend on the needle, so it is built here rather than inside the
+    timed pass; only the `StringSearch` binding a needle to the haystack stays per-call.
+    """
     collator = icu.Collator.createInstance(icu.Locale.getRoot())
     collator.setStrength(icu.Collator.SECONDARY)  # Case-insensitive
-    searcher = icu.StringSearch(needle, haystack, collator)
-    count = 0
-    pos = searcher.nextMatch()
-    while pos != -1:
-        count += 1
+
+    def find(haystack: str, needle: str) -> int:
+        if not needle:
+            return 0
+        searcher = icu.StringSearch(needle, haystack, collator)
+        count = 0
         pos = searcher.nextMatch()
-    return count
+        while pos != -1:
+            count += 1
+            pos = searcher.nextMatch()
+        return count
+
+    return find
 
 
 def find_stringzilla(haystack: str, needle: str) -> int:
@@ -156,16 +169,13 @@ def bench_case_fold(
     name: str,
     strings: list[str],
     fold_function: Callable[[str], str | bytes],
+    total_bytes: int,
 ):
     """One pass folds every string."""
     if not strings:
         print(f"{name}: nothing to process", file=sys.stderr)
         return
-    work = MeasureSpec(
-        report="bytes",
-        elements=len(strings),
-        total_bytes=sum(len(item.encode("utf-8")) for item in strings),
-    )
+    work = MeasureSpec(report="bytes", elements=len(strings), total_bytes=total_bytes)
     measure(name, work, pass_over(fold_function, strings))
 
 
@@ -190,16 +200,13 @@ def bench_normalize(
     name: str,
     strings: list[str],
     normalize_function: Callable[[str], str | bytes],
+    total_bytes: int,
 ):
     """One pass normalizes every string."""
     if not strings:
         print(f"{name}: nothing to process", file=sys.stderr)
         return
-    work = MeasureSpec(
-        report="bytes",
-        elements=len(strings),
-        total_bytes=sum(len(item.encode("utf-8")) for item in strings),
-    )
+    work = MeasureSpec(report="bytes", elements=len(strings), total_bytes=total_bytes)
     measure(name, work, pass_over(normalize_function, strings))
 
 
@@ -296,7 +303,10 @@ def main():
     total_tokens = len(tokens)
     total_pairs = len(lefts)
     mean_token_length = sum(len(t) for t in tokens) / total_tokens
-    total_bytes = len(pythonic_str)
+    # `token_bytes` is the denominator every bytes/s figure is quoted against, and what
+    # `log_dataset` has already printed; `len(pythonic_str)` is codepoints.
+    total_bytes = dataset.token_bytes
+    pair_bytes = sum(len(item.encode("utf-8")) for item in lefts) + sum(len(item.encode("utf-8")) for item in rights)
 
     print(f"Dataset: {total_tokens:,} tokens, {total_bytes:,} bytes, {mean_token_length:.1f} avg token length")
     print(f"Pairs: {total_pairs:,}, Search needles: {len(search_needles)}")
@@ -304,10 +314,18 @@ def main():
 
     # Case-insensitive comparison
     print("Case-Insensitive Comparison")
-    bench_case_compare("case-insensitive-compare/stringzilla.utf8_uncased_order", lefts, rights, compare_stringzilla)
-    bench_case_compare("case-insensitive-compare/str.casefold.eq", lefts, rights, compare_casefold)
-    bench_case_compare("case-insensitive-compare/regex.fullmatch<fullcase>", lefts, rights, compare_regex_fullcase)
-    bench_case_compare("case-insensitive-compare/icu.CaseMap.foldCase.eq", lefts, rights, compare_icu)
+    bench_case_compare(
+        "case-insensitive-compare/stringzilla.utf8_uncased_order", lefts, rights, compare_stringzilla, pair_bytes
+    )
+    bench_case_compare("case-insensitive-compare/str.casefold.eq", lefts, rights, compare_casefold, pair_bytes)
+    bench_case_compare(
+        "case-insensitive-compare/regex.fullmatch<compile+match>",
+        lefts,
+        rights,
+        compare_regex_fullcase,
+        pair_bytes,
+    )
+    bench_case_compare("case-insensitive-compare/icu.CaseMap.foldCase.eq", lefts, rights, compare_icu, pair_bytes)
 
     # Case-insensitive substring search
     print("\nCase-Insensitive Substring Search")
@@ -317,30 +335,40 @@ def main():
         pythonic_str,
         search_needles,
         find_stringzilla,
+        total_bytes,
     )
-    bench_case_find("case-insensitive-find/str.casefold.find", pythonic_str, search_needles, find_casefold)
+    bench_case_find("case-insensitive-find/str.casefold.find", pythonic_str, search_needles, find_casefold, total_bytes)
     bench_case_find(
-        "case-insensitive-find/regex.search<fullcase>",
+        "case-insensitive-find/regex.finditer<compile+match>",
         pythonic_str,
         search_needles,
         find_regex_fullcase,
+        total_bytes,
     )
-    bench_case_find("case-insensitive-find/icu.StringSearch", pythonic_str, search_needles, find_icu)
+    bench_case_find(
+        "case-insensitive-find/icu.StringSearch", pythonic_str, search_needles, make_find_icu(), total_bytes
+    )
 
     # Case folding transformation
     print("\nCase Folding Transformation")
-    bench_case_fold("case-fold/stringzilla.utf8_uncased_fold", tokens, fold_stringzilla)
-    bench_case_fold("case-fold/str.casefold", tokens, fold_casefold)
-    bench_case_fold("case-fold/icu.CaseMap.foldCase", tokens, fold_icu)
+    bench_case_fold("case-fold/stringzilla.utf8_uncased_fold", tokens, fold_stringzilla, total_bytes)
+    bench_case_fold("case-fold/str.casefold", tokens, fold_casefold, total_bytes)
+    bench_case_fold("case-fold/icu.CaseMap.foldCase", tokens, fold_icu, total_bytes)
 
     # Unicode normalization (NFC / NFD / NFKC / NFKD) - all forms measured
     print("\nUnicode Normalization")
     for form in NORMALIZATION_FORMS:
         suffix = form.lower()
-        bench_normalize(f"normalize-{suffix}/stringzilla.utf8_norm", tokens, partial(normalize_stringzilla, form))
-        bench_normalize(f"normalize-{suffix}/unicodedata.normalize", tokens, partial(normalize_stdlib, form))
-        bench_normalize(f"normalize-{suffix}/icu.Normalizer2", tokens, make_normalize_icu(form))
-        bench_normalize(f"normalize-{suffix}/pyunormalize.normalize", tokens, partial(normalize_pyunormalize, form))
+        bench_normalize(
+            f"normalize-{suffix}/stringzilla.utf8_norm", tokens, partial(normalize_stringzilla, form), total_bytes
+        )
+        bench_normalize(
+            f"normalize-{suffix}/unicodedata.normalize", tokens, partial(normalize_stdlib, form), total_bytes
+        )
+        bench_normalize(f"normalize-{suffix}/icu.Normalizer2", tokens, make_normalize_icu(form), total_bytes)
+        bench_normalize(
+            f"normalize-{suffix}/pyunormalize.normalize", tokens, partial(normalize_pyunormalize, form), total_bytes
+        )
 
     finish()
     return 0

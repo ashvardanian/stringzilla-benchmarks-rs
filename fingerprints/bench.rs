@@ -12,13 +12,12 @@ STRINGWARS_DATASET=README.md cargo bench --features bench_fingerprints --bench b
 "#]
 #![allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 
-use core::convert::TryInto;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
 use forkunion as fu;
-use stringtape::{BytesTape, BytesTapeView, CharsTapeView};
+use stringtape::{BytesTape, BytesTapeView};
 
 use probabilistic_collections::similarity::{ByteGrams, MinHash};
 use stringzilla::szs::{AnyBytesTape, DeviceScope, Fingerprints, UnifiedAlloc, UnifiedVec};
@@ -36,64 +35,51 @@ const NGRAM_WIDTHS: [usize; 4] = [5, 9, 17, 33];
 /// `auto_batch_size` scales it by each variant's core count.
 const DEFAULT_BATCH_PER_CORE: usize = 128;
 
-/// Calculate bit entropy (how well distributed the bits are) - generic
-fn bit_entropy<T>(hash_matrix: &[Vec<T>]) -> f64
+/// Calculate bit entropy (how well distributed the bits are) over a flattened
+/// `documents x dimensions` sketch matrix, normalized to [0, 1].
+fn bit_entropy<T>(hash_values: &[T]) -> f64
 where
     T: Copy + Into<u64>,
 {
-    if hash_matrix.is_empty() || hash_matrix[0].is_empty() {
+    if hash_values.is_empty() {
         return 0.0;
     }
 
-    // Determine bit width based on type
     let bits_per_hash = std::mem::size_of::<T>() * 8;
-    let mut bit_ones_count = vec![0usize; bits_per_hash]; // Count of 1s for each bit position
-    let total_hash_values = hash_matrix.len() * hash_matrix[0].len();
-
-    for document_hashes in hash_matrix {
-        for &hash_value in document_hashes {
-            let hash_as_u64: u64 = hash_value.into();
-            for bit_position in 0..bits_per_hash {
-                if (hash_as_u64 >> bit_position) & 1 == 1 {
-                    bit_ones_count[bit_position] += 1;
-                }
+    let mut bit_ones_count = vec![0usize; bits_per_hash];
+    for &hash_value in hash_values {
+        let hash_as_u64: u64 = hash_value.into();
+        for bit_position in 0..bits_per_hash {
+            if (hash_as_u64 >> bit_position) & 1 == 1 {
+                bit_ones_count[bit_position] += 1;
             }
         }
     }
 
-    // Calculate entropy
     let mut total_entropy = 0.0;
     for ones_count in bit_ones_count {
-        let probability_of_one = ones_count as f64 / total_hash_values as f64;
+        let probability_of_one = ones_count as f64 / hash_values.len() as f64;
         if probability_of_one > 0.0 && probability_of_one < 1.0 {
             total_entropy -= probability_of_one * probability_of_one.log2()
                 + (1.0 - probability_of_one) * (1.0 - probability_of_one).log2();
         }
     }
 
-    total_entropy / bits_per_hash as f64 // Normalize to [0, 1]
+    total_entropy / bits_per_hash as f64
 }
 
-/// Calculate collision rate (duplicate hash values) - generic
-fn collision_rate<T>(hash_matrix: &[Vec<T>]) -> f64
+/// Calculate collision rate (duplicate hash values) over a flattened sketch matrix. This is a
+/// birthday statistic, so it is meaningful only over the whole sample it is reported for.
+fn collision_rate<T>(hash_values: &[T]) -> f64
 where
     T: Copy + std::hash::Hash + Eq,
 {
-    if hash_matrix.is_empty() || hash_matrix[0].is_empty() {
+    if hash_values.is_empty() {
         return 0.0;
     }
 
-    let mut unique_hash_values = HashSet::new();
-    let mut total_hash_count = 0;
-
-    for document_hashes in hash_matrix {
-        for &hash_value in document_hashes {
-            unique_hash_values.insert(hash_value);
-            total_hash_count += 1;
-        }
-    }
-
-    1.0 - (unique_hash_values.len() as f64 / total_hash_count as f64)
+    let unique_hash_values: HashSet<T> = hash_values.iter().copied().collect();
+    1.0 - (unique_hash_values.len() as f64 / hash_values.len() as f64)
 }
 
 /// Runs one `measure_throughput` block for `Fingerprints::compute_into`. Allocates
@@ -194,12 +180,6 @@ fn bench_fingerprints() {
         .unwrap_or_else(|error| panic!("Failed to extend BytesTape for fingerprinting: {}", error));
 
     let bytes_view = units_tape.view();
-    let _chars_view: CharsTapeView<u64> = units_tape.view().try_into().unwrap_or_else(|error| {
-        panic!(
-            "Failed to convert BytesTapeView to CharsTapeView: {}",
-            error
-        )
-    });
 
     // Calculate average bytes per token for throughput reporting
     let total_documents = units_tape.len();
@@ -231,10 +211,11 @@ fn bench_fingerprints() {
         // approximated as NDIM times the average token length. The harness reports hashes/s as
         // the primary metric and bytes/s as the secondary one, with no global ratio plumbing.
 
-        // Pre-allocated matrices for quality analysis: N_docs × N_dims (algorithm-specific types)
-        let mut serial_matrix = vec![vec![0u64; dimensions]; total_documents]; // u64 for serial MinHash
-        let mut pc_matrix = vec![vec![0u64; dimensions]; total_documents]; // u64 for probabilistic_collections
-        let mut sz_matrix = vec![vec![0u32; dimensions]; total_documents]; // u32 for StringZilla fingerprints
+        // Quality-analysis matrices, flattened to one contiguous `N_docs * N_dims` buffer each:
+        // a Vec-of-Vec rebuilt per NDIM scale cost ~120k allocations against a 1 MB working set.
+        let mut serial_matrix = vec![0u64; total_documents * dimensions];
+        let mut pc_matrix = vec![0u64; total_documents * dimensions];
+        let mut sz_matrix = vec![0u32; total_documents * dimensions];
 
         // Track which documents have been processed for each implementation
         let mut serial_document_index = 0usize;
@@ -344,16 +325,13 @@ fn bench_fingerprints() {
             },
             |actual, min_hashes_slice| {
                 for document_index in 0..actual {
-                    if sz_document_index < total_documents {
-                        let start = document_index * dimensions;
-                        let end = start + dimensions;
-                        for (dimension_index, &hash_value) in
-                            min_hashes_slice[start..end].iter().enumerate()
-                        {
-                            sz_matrix[sz_document_index][dimension_index] = hash_value;
-                        }
-                        sz_document_index += 1;
+                    if sz_document_index >= total_documents {
+                        break;
                     }
+                    let source = &min_hashes_slice[document_index * dimensions..][..dimensions];
+                    sz_matrix[sz_document_index * dimensions..][..dimensions]
+                        .copy_from_slice(source);
+                    sz_document_index += 1;
                 }
             },
         );
@@ -394,8 +372,7 @@ fn bench_fingerprints() {
 
         // pc::MinHash baseline (single-threaded scalar; uses the single-core batch).
         {
-            // Pre-allocate output buffers outside the loop (reused across iterations)
-            let mut out = Vec::with_capacity(batch_single_cpu);
+            // Reused across documents and passes, like the serial baseline below.
             let mut combined_signature = Vec::with_capacity(dimensions);
             measure(
                 "minhash/pc::MinHash<ByteGrams>",
@@ -407,18 +384,11 @@ fn bench_fingerprints() {
                     let batch_bytes_view = bytes_view
                         .subview(0, tokens_count)
                         .expect("Failed to create BytesTape subview");
-                    let actual = tokens_count;
-
-                    // Reuse output buffer (clear and reserve)
-                    out.clear();
-                    out.reserve(actual);
 
                     for line_index in 0..batch_bytes_view.len() {
                         let line_bytes: &[u8] = &batch_bytes_view[line_index];
                         if !line_bytes.is_empty() {
-                            // Clear and reuse combined signature buffer
                             combined_signature.clear();
-                            combined_signature.reserve(dimensions);
 
                             for (width_index, &width) in NGRAM_WIDTHS.iter().enumerate() {
                                 let iter = ByteGrams::new(line_bytes, width);
@@ -426,14 +396,14 @@ fn bench_fingerprints() {
                                 combined_signature.extend(partial_sig);
                             }
 
-                            out.push(combined_signature.clone());
-
                             if pc_document_index < total_documents
                                 && combined_signature.len() == dimensions
                             {
-                                pc_matrix[pc_document_index].copy_from_slice(&combined_signature);
+                                pc_matrix[pc_document_index * dimensions..][..dimensions]
+                                    .copy_from_slice(&combined_signature);
                                 pc_document_index += 1;
                             }
+                            std::hint::black_box(&combined_signature);
                         }
                     }
                 },
@@ -496,7 +466,8 @@ fn bench_fingerprints() {
                             }
 
                             if serial_document_index < total_documents {
-                                serial_matrix[serial_document_index].copy_from_slice(&min_hashes);
+                                serial_matrix[serial_document_index * dimensions..][..dimensions]
+                                    .copy_from_slice(&min_hashes);
                                 serial_document_index += 1;
                             }
                             std::hint::black_box(&min_hashes);
@@ -513,14 +484,14 @@ fn bench_fingerprints() {
         );
 
         if pc_document_index > 0 {
-            let pc_slice = &pc_matrix[..pc_document_index];
+            let pc_slice = &pc_matrix[..pc_document_index * dimensions];
             println!("\npc::MinHash<ByteGrams>:");
             println!("  Bit Entropy:  {:.4}", bit_entropy(pc_slice));
             println!("  Collision:    {:.4}%", collision_rate(pc_slice) * 100.0);
         }
 
         if serial_document_index > 0 {
-            let serial_slice = &serial_matrix[..serial_document_index];
+            let serial_slice = &serial_matrix[..serial_document_index * dimensions];
             println!("\nserial::MinHash<ByteGrams>:");
             println!("  Bit Entropy:  {:.4}", bit_entropy(serial_slice));
             println!(
@@ -530,7 +501,7 @@ fn bench_fingerprints() {
         }
 
         if sz_document_index > 0 {
-            let sz_slice = &sz_matrix[..sz_document_index];
+            let sz_slice = &sz_matrix[..sz_document_index * dimensions];
             println!("\nszs::Fingerprints:");
             println!("  Bit Entropy:  {:.4}", bit_entropy(sz_slice));
             println!("  Collision:    {:.4}%", collision_rate(sz_slice) * 100.0);

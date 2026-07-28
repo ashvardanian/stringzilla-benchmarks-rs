@@ -16,6 +16,7 @@ STRINGWARS_DATASET=README.md cargo bench --features bench_encryption --bench ben
 "#]
 use std::hint::black_box;
 
+use openssl::symm::{Cipher, Crypter, Mode};
 use stringtape::BytesCowsAuto;
 
 use stringwars::{
@@ -77,6 +78,42 @@ fn next_sodium_xchacha20_nonce(
     sodium_xchacha20_nonce_at(*counter - 1)
 }
 
+/// Seals `plaintext` into `out`, writing the detached tag, and returns the ciphertext length.
+///
+/// OpenSSL's `encrypt_aead`/`decrypt_aead` and libsodium's `seal`/`open` return an owned `Vec`
+/// per message; the `Crypter` and detached forms used here write into a reused buffer, so all
+/// twelve cipher rows are about the cipher rather than the allocator.
+fn openssl_seal(
+    cipher: Cipher,
+    key: &[u8],
+    iv: &[u8],
+    plaintext: &[u8],
+    out: &mut [u8],
+    tag: &mut [u8],
+) -> usize {
+    let mut crypter = expect_ok(Crypter::new(cipher, Mode::Encrypt, key, Some(iv)));
+    let count = expect_ok(crypter.update(plaintext, out));
+    let rest = expect_ok(crypter.finalize(&mut out[count..]));
+    expect_ok(crypter.get_tag(tag));
+    count + rest
+}
+
+/// Verifies `tag` and opens `ciphertext` into `out`, returning the plaintext length.
+fn openssl_open(
+    cipher: Cipher,
+    key: &[u8],
+    iv: &[u8],
+    ciphertext: &[u8],
+    out: &mut [u8],
+    tag: &[u8],
+) -> usize {
+    let mut crypter = expect_ok(Crypter::new(cipher, Mode::Decrypt, key, Some(iv)));
+    let count = expect_ok(crypter.update(ciphertext, out));
+    expect_ok(crypter.set_tag(tag));
+    let rest = expect_ok(crypter.finalize(&mut out[count..]));
+    count + rest
+}
+
 /// Benchmarks key generation and cipher setup overhead. Each variant builds one key/cipher per
 /// call and cycles for the budget; throughput is reported as bytes/s over the 32-byte key.
 fn bench_key_generation() {
@@ -103,7 +140,6 @@ fn bench_key_generation() {
     );
 
     {
-        use openssl::symm::{Cipher, Crypter, Mode};
         measure(
             "keygen/openssl::chacha20poly1305",
             MeasureSpec::new(Unit::Bytes, WorkUnits::bytes(32)),
@@ -120,7 +156,6 @@ fn bench_key_generation() {
     }
 
     {
-        use openssl::symm::{Cipher, Crypter, Mode};
         measure(
             "keygen/openssl::aes256gcm",
             MeasureSpec::new(Unit::Bytes, WorkUnits::bytes(32)),
@@ -228,10 +263,9 @@ fn bench_encryption(tokens: &BytesCowsAuto) {
     }
 
     {
-        use openssl::symm::{encrypt_aead, Cipher};
-
         let key = [0u8; 32];
         let cipher = Cipher::chacha20_poly1305();
+        let mut ciphertext = vec![0u8; longest_token + cipher.block_size()];
         let mut nonce_counter: u64 = 0;
         measure(
             "encryption/openssl::chacha20poly1305",
@@ -240,24 +274,23 @@ fn bench_encryption(tokens: &BytesCowsAuto) {
                 for token in slices.iter() {
                     let iv = next_openssl_iv(&mut nonce_counter);
                     let mut tag = [0u8; 16];
-                    black_box(expect_ok(encrypt_aead(
+                    black_box(openssl_seal(
                         cipher,
                         &key,
-                        Some(&iv),
-                        &[],
+                        &iv,
                         token,
+                        &mut ciphertext,
                         &mut tag,
-                    )));
+                    ));
                 }
             },
         );
     }
 
     {
-        use openssl::symm::{encrypt_aead, Cipher};
-
         let key = [0u8; 32];
         let cipher = Cipher::aes_256_gcm();
+        let mut ciphertext = vec![0u8; longest_token + cipher.block_size()];
         let mut nonce_counter: u64 = 0;
         measure(
             "encryption/openssl::aes256gcm",
@@ -266,14 +299,14 @@ fn bench_encryption(tokens: &BytesCowsAuto) {
                 for token in slices.iter() {
                     let iv = next_openssl_iv(&mut nonce_counter);
                     let mut tag = [0u8; 16];
-                    black_box(expect_ok(encrypt_aead(
+                    black_box(openssl_seal(
                         cipher,
                         &key,
-                        Some(&iv),
-                        &[],
+                        &iv,
                         token,
+                        &mut ciphertext,
                         &mut tag,
-                    )));
+                    ));
                 }
             },
         );
@@ -283,14 +316,22 @@ fn bench_encryption(tokens: &BytesCowsAuto) {
         use sodiumoxide::crypto::aead::chacha20poly1305_ietf::{self, Key};
 
         let key = Key([0u8; chacha20poly1305_ietf::KEYBYTES]);
+        let mut in_out = Vec::with_capacity(longest_token);
         let mut nonce_counter: u64 = 0;
         measure(
             "encryption/libsodium::chacha20poly1305_ietf",
             MeasureSpec::new(Unit::Bytes, pass_work),
             || {
                 for token in slices.iter() {
+                    in_out.clear();
+                    in_out.extend_from_slice(token);
                     let nonce = next_sodium_chacha20_nonce(&mut nonce_counter);
-                    let _ = black_box(chacha20poly1305_ietf::seal(token, None, &nonce, &key));
+                    let _ = black_box(chacha20poly1305_ietf::seal_detached(
+                        &mut in_out,
+                        None,
+                        &nonce,
+                        &key,
+                    ));
                 }
             },
         );
@@ -300,14 +341,22 @@ fn bench_encryption(tokens: &BytesCowsAuto) {
         use sodiumoxide::crypto::aead::xchacha20poly1305_ietf::{self, Key};
 
         let key = Key([0u8; xchacha20poly1305_ietf::KEYBYTES]);
+        let mut in_out = Vec::with_capacity(longest_token);
         let mut nonce_counter: u64 = 0;
         measure(
             "encryption/libsodium::xchacha20poly1305_ietf",
             MeasureSpec::new(Unit::Bytes, pass_work),
             || {
                 for token in slices.iter() {
+                    in_out.clear();
+                    in_out.extend_from_slice(token);
                     let nonce = next_sodium_xchacha20_nonce(&mut nonce_counter);
-                    let _ = black_box(xchacha20poly1305_ietf::seal(token, None, &nonce, &key));
+                    let _ = black_box(xchacha20poly1305_ietf::seal_detached(
+                        &mut in_out,
+                        None,
+                        &nonce,
+                        &key,
+                    ));
                 }
             },
         );
@@ -320,13 +369,13 @@ fn bench_encryption(tokens: &BytesCowsAuto) {
 fn bench_decryption(tokens: &BytesCowsAuto) {
     use ring::aead::{self, Aad, LessSafeKey, UnboundKey};
 
-    // Original plaintext lengths, used as the per-item byte work (the encrypted buffers carry
-    // extra tag/overhead bytes that the original throughput accounting excluded).
-    let plaintext_lengths: Vec<u64> = tokens.iter().map(|token| token.len() as u64).collect();
+    // Byte work is the original plaintext: the sealed blobs carry tag bytes the encryption
+    // accounting excluded too.
     let decrypt_pass_work = WorkUnits::new(
-        plaintext_lengths.len() as u64,
-        plaintext_lengths.iter().sum(),
+        tokens.len() as u64,
+        tokens.iter().map(|token| token.len() as u64).sum(),
     );
+    let longest_token = tokens.iter().map(|token| token.len()).max().unwrap_or(0);
 
     let key_bytes = [0u8; 32];
     let unbound_key_chacha = UnboundKey::new(&aead::CHACHA20_POLY1305, &key_bytes).unwrap();
@@ -408,9 +457,9 @@ fn bench_decryption(tokens: &BytesCowsAuto) {
         );
     }
 
-    use openssl::symm::{decrypt_aead, encrypt_aead, Cipher};
+    use openssl::symm::encrypt_aead;
     let cipher_chacha = Cipher::chacha20_poly1305();
-    let mut encrypted_tokens_openssl_chacha: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut encrypted_tokens_openssl_chacha: Vec<(Vec<u8>, [u8; 16])> = Vec::new();
     {
         let mut nonce_counter: u64 = 0;
         for token in tokens.iter() {
@@ -418,12 +467,12 @@ fn bench_decryption(tokens: &BytesCowsAuto) {
             let mut tag = [0u8; 16];
             let ciphertext =
                 encrypt_aead(cipher_chacha, &key_bytes, Some(&iv), &[], token, &mut tag).unwrap();
-            encrypted_tokens_openssl_chacha.push((ciphertext, tag.to_vec()));
+            encrypted_tokens_openssl_chacha.push((ciphertext, tag));
         }
     }
 
     let cipher_aes = Cipher::aes_256_gcm();
-    let mut encrypted_tokens_openssl_aes: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    let mut encrypted_tokens_openssl_aes: Vec<(Vec<u8>, [u8; 16])> = Vec::new();
     {
         let mut nonce_counter: u64 = 0;
         for token in tokens.iter() {
@@ -431,47 +480,48 @@ fn bench_decryption(tokens: &BytesCowsAuto) {
             let mut tag = [0u8; 16];
             let ciphertext =
                 encrypt_aead(cipher_aes, &key_bytes, Some(&iv), &[], token, &mut tag).unwrap();
-            encrypted_tokens_openssl_aes.push((ciphertext, tag.to_vec()));
+            encrypted_tokens_openssl_aes.push((ciphertext, tag));
         }
     }
 
     {
+        let mut plaintext = vec![0u8; longest_token + cipher_chacha.block_size()];
         measure(
             "decryption/openssl::chacha20poly1305",
             MeasureSpec::new(Unit::Bytes, decrypt_pass_work),
             || {
-                for index in 0..encrypted_tokens_openssl_chacha.len() {
-                    let (ciphertext, tag) = &encrypted_tokens_openssl_chacha[index];
+                for (index, (ciphertext, tag)) in encrypted_tokens_openssl_chacha.iter().enumerate()
+                {
                     let iv = openssl_iv_at(index as u64);
-                    black_box(expect_ok(decrypt_aead(
+                    black_box(openssl_open(
                         cipher_chacha,
                         &key_bytes,
-                        Some(&iv),
-                        &[],
+                        &iv,
                         ciphertext,
+                        &mut plaintext,
                         tag,
-                    )));
+                    ));
                 }
             },
         );
     }
 
     {
+        let mut plaintext = vec![0u8; longest_token + cipher_aes.block_size()];
         measure(
             "decryption/openssl::aes256gcm",
             MeasureSpec::new(Unit::Bytes, decrypt_pass_work),
             || {
-                for index in 0..encrypted_tokens_openssl_aes.len() {
-                    let (ciphertext, tag) = &encrypted_tokens_openssl_aes[index];
+                for (index, (ciphertext, tag)) in encrypted_tokens_openssl_aes.iter().enumerate() {
                     let iv = openssl_iv_at(index as u64);
-                    black_box(expect_ok(decrypt_aead(
+                    black_box(openssl_open(
                         cipher_aes,
                         &key_bytes,
-                        Some(&iv),
-                        &[],
+                        &iv,
                         ciphertext,
+                        &mut plaintext,
                         tag,
-                    )));
+                    ));
                 }
             },
         );
@@ -479,30 +529,41 @@ fn bench_decryption(tokens: &BytesCowsAuto) {
 
     use sodiumoxide::crypto::aead::chacha20poly1305_ietf::{self, Key as SodiumChaCha20Key};
     let key_sodium_chacha = SodiumChaCha20Key([0u8; chacha20poly1305_ietf::KEYBYTES]);
-    let mut encrypted_tokens_sodium_chacha: Vec<Vec<u8>> = Vec::new();
+    let mut encrypted_tokens_sodium_chacha: Vec<(Vec<u8>, chacha20poly1305_ietf::Tag)> = Vec::new();
     {
         let mut nonce_counter: u64 = 0;
         for token in tokens.iter() {
+            let mut ciphertext = token.to_vec();
             let nonce = next_sodium_chacha20_nonce(&mut nonce_counter);
-            let ciphertext = chacha20poly1305_ietf::seal(token, None, &nonce, &key_sodium_chacha);
-            encrypted_tokens_sodium_chacha.push(ciphertext);
+            let tag = chacha20poly1305_ietf::seal_detached(
+                &mut ciphertext,
+                None,
+                &nonce,
+                &key_sodium_chacha,
+            );
+            encrypted_tokens_sodium_chacha.push((ciphertext, tag));
         }
     }
 
     {
+        let mut in_out = Vec::with_capacity(longest_token);
         measure(
             "decryption/libsodium::chacha20poly1305_ietf",
             MeasureSpec::new(Unit::Bytes, decrypt_pass_work),
             || {
-                for index in 0..encrypted_tokens_sodium_chacha.len() {
-                    let ciphertext = &encrypted_tokens_sodium_chacha[index];
+                for (index, (ciphertext, tag)) in encrypted_tokens_sodium_chacha.iter().enumerate()
+                {
+                    in_out.clear();
+                    in_out.extend_from_slice(ciphertext);
                     let nonce = sodium_chacha20_nonce_at(index as u64);
-                    black_box(expect_ok(chacha20poly1305_ietf::open(
-                        ciphertext,
+                    expect_ok(chacha20poly1305_ietf::open_detached(
+                        &mut in_out,
                         None,
+                        tag,
                         &nonce,
                         &key_sodium_chacha,
-                    )));
+                    ));
+                    black_box(&in_out);
                 }
             },
         );
@@ -510,30 +571,42 @@ fn bench_decryption(tokens: &BytesCowsAuto) {
 
     use sodiumoxide::crypto::aead::xchacha20poly1305_ietf::{self, Key as SodiumXChaCha20Key};
     let key_sodium_xchacha = SodiumXChaCha20Key([0u8; xchacha20poly1305_ietf::KEYBYTES]);
-    let mut encrypted_tokens_sodium_xchacha: Vec<Vec<u8>> = Vec::new();
+    let mut encrypted_tokens_sodium_xchacha: Vec<(Vec<u8>, xchacha20poly1305_ietf::Tag)> =
+        Vec::new();
     {
         let mut nonce_counter: u64 = 0;
         for token in tokens.iter() {
+            let mut ciphertext = token.to_vec();
             let nonce = next_sodium_xchacha20_nonce(&mut nonce_counter);
-            let ciphertext = xchacha20poly1305_ietf::seal(token, None, &nonce, &key_sodium_xchacha);
-            encrypted_tokens_sodium_xchacha.push(ciphertext);
+            let tag = xchacha20poly1305_ietf::seal_detached(
+                &mut ciphertext,
+                None,
+                &nonce,
+                &key_sodium_xchacha,
+            );
+            encrypted_tokens_sodium_xchacha.push((ciphertext, tag));
         }
     }
 
     {
+        let mut in_out = Vec::with_capacity(longest_token);
         measure(
             "decryption/libsodium::xchacha20poly1305_ietf",
             MeasureSpec::new(Unit::Bytes, decrypt_pass_work),
             || {
-                for index in 0..encrypted_tokens_sodium_xchacha.len() {
-                    let ciphertext = &encrypted_tokens_sodium_xchacha[index];
+                for (index, (ciphertext, tag)) in encrypted_tokens_sodium_xchacha.iter().enumerate()
+                {
+                    in_out.clear();
+                    in_out.extend_from_slice(ciphertext);
                     let nonce = sodium_xchacha20_nonce_at(index as u64);
-                    black_box(expect_ok(xchacha20poly1305_ietf::open(
-                        ciphertext,
+                    expect_ok(xchacha20poly1305_ietf::open_detached(
+                        &mut in_out,
                         None,
+                        tag,
                         &nonce,
                         &key_sodium_xchacha,
-                    )));
+                    ));
+                    black_box(&in_out);
                 }
             },
         );

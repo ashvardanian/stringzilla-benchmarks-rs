@@ -47,27 +47,16 @@ def log_system_info():
     print()
 
 
-def bench_encrypt(name: str, tokens: list[bytes], encrypt: Callable[[bytes, bytes], object]):
-    """One pass encrypts every token; bytes/s is over the plaintext."""
-    nonces = [nonce_for(index) for index in range(len(tokens))]
-    work = MeasureSpec(
-        report="bytes",
-        elements=len(tokens),
-        total_bytes=sum(len(token) for token in tokens),
-    )
-    measure(name, work, pass_over(encrypt, tokens, nonces))
-
-
-def bench_decrypt(
+def bench_cipher(
     name: str,
-    blobs: list[object],
-    plaintext_lengths: list[int],
-    decrypt: Callable[[object, bytes], object],
+    items: list,
+    nonces: list[bytes],
+    token_bytes: int,
+    operation: Callable[[object, bytes], object],
 ):
-    """One pass decrypts every blob; bytes/s is over the original plaintext."""
-    nonces = [nonce_for(index) for index in range(len(blobs))]
-    work = MeasureSpec(report="bytes", elements=len(blobs), total_bytes=sum(plaintext_lengths))
-    measure(name, work, pass_over(decrypt, blobs, nonces))
+    """One pass over the corpus; bytes/s is over the plaintext, sealed or not."""
+    work = MeasureSpec(report="bytes", elements=len(items), total_bytes=token_bytes)
+    measure(name, work, pass_over(operation, items, nonces))
 
 
 # Each cipher is a (label, encrypt, decrypt) triple. `encrypt(data, nonce)` returns an opaque blob;
@@ -141,19 +130,19 @@ def main():
     log_timing_overhead()
     log_system_info()
 
-    plaintext_lengths = [len(token) for token in tokens]
+    nonces = [nonce_for(index) for index in range(len(tokens))]
 
     print("\n# encryption")
     for build in CIPHERS:
         label, encrypt, _ = build()
-        bench_encrypt(f"encryption/{label}", tokens, encrypt)
+        bench_cipher(f"encryption/{label}", tokens, nonces, dataset.token_bytes, encrypt)
 
     print("\n# decryption")
     for build in CIPHERS:
         label, encrypt, decrypt = build()
         if should_run(f"decryption/{label}"):
-            blobs = [encrypt(token, nonce_for(index)) for index, token in enumerate(tokens)]
-            bench_decrypt(f"decryption/{label}", blobs, plaintext_lengths, decrypt)
+            blobs = [encrypt(token, nonce) for token, nonce in zip(tokens, nonces, strict=True)]
+            bench_cipher(f"decryption/{label}", blobs, nonces, dataset.token_bytes, decrypt)
 
     finish()
     return 0

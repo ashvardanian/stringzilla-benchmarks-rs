@@ -70,7 +70,7 @@ def bench_fingerprint(name, documents, kernel, doc_bytes, dimensions, batch_size
 
     def one_pass() -> None:
         for low in range(0, count, batch_size):
-            kernel(documents[low : min(low + batch_size, count)])
+            kernel(documents[low : low + batch_size])
 
     measure(name, work, one_pass)
 
@@ -79,7 +79,7 @@ def document_byte_lengths(documents):
     return np.fromiter((len(document.encode("utf-8")) for document in documents), dtype=np.int64, count=len(documents))
 
 
-def benchmark_stringzillas(documents, dimensions, batch_size):
+def benchmark_stringzillas(documents, doc_bytes, dimensions, batch_size):
     """StringZilla Fingerprints on 1 core, all cores, and the GPU (if present)."""
     cpu_cores = resolve_core_count()
     default_scope = szs.DeviceScope()
@@ -90,8 +90,8 @@ def benchmark_stringzillas(documents, dimensions, batch_size):
         gpu_scope = None
 
     moved = sz.Strs(documents)
-    doc_bytes = document_byte_lengths(documents)
 
+    single_cpu_batch_size = auto_batch_size(1, base=batch_size, default_base=DEFAULT_BATCH_PER_CORE)
     all_cpu_batch_size = auto_batch_size(cpu_cores, base=batch_size, default_base=DEFAULT_BATCH_PER_CORE)
     gpu_batch_size = auto_batch_size(
         gpu_multiprocessor_count(0) or 64,
@@ -99,51 +99,50 @@ def benchmark_stringzillas(documents, dimensions, batch_size):
         default_base=DEFAULT_BATCH_PER_CORE,
     )
 
-    def run_variant(suffix, scope, variant_batch_size):
+    def run_variant(name, scope, variant_batch_size):
         engine = szs.Fingerprints(ndim=dimensions, window_widths=NGRAM_WIDTHS_ARRAY, capabilities=scope)
 
         def kernel(strs_slice):
             engine(strs_slice, device=scope)  # returns (hashes, counts); discarded for throughput
 
-        bench_fingerprint(
-            f"stringzillas.Fingerprints{suffix}",
-            moved,
-            kernel,
-            doc_bytes,
-            dimensions,
-            variant_batch_size,
-        )
+        bench_fingerprint(name, moved, kernel, doc_bytes, dimensions, variant_batch_size)
 
-    run_variant("<1cpu>", default_scope, 1)
-    if should_run(f"minhash/stringzillas.Fingerprints<{cpu_cores}cpu,batch={all_cpu_batch_size}>"):
-        run_variant(f"<{cpu_cores}cpu,batch={all_cpu_batch_size}>", cpu_scope, all_cpu_batch_size)
-    if gpu_scope is not None and should_run(
-        f"minhash/stringzillas.Fingerprints<1gpu,batch={gpu_batch_size}>",
-    ):
-        run_variant(f"<1gpu,batch={gpu_batch_size}>", gpu_scope, gpu_batch_size)
+    # Row names carry no batch size, matching what bench.rs prints, so `-k` selects the
+    # same rows in both harnesses.
+    single_cpu_name = "minhash/stringzillas.Fingerprints<1cpu>"
+    all_cpu_name = f"minhash/stringzillas.Fingerprints<{cpu_cores}cpu>"
+    gpu_name = "minhash/stringzillas.Fingerprints<1gpu>"
+
+    if should_run(single_cpu_name):
+        run_variant(single_cpu_name, default_scope, single_cpu_batch_size)
+    if should_run(all_cpu_name):
+        run_variant(all_cpu_name, cpu_scope, all_cpu_batch_size)
+    if gpu_scope is not None and should_run(gpu_name):
+        run_variant(gpu_name, gpu_scope, gpu_batch_size)
 
 
-def benchmark_datasketch(documents, dimensions, batch_size):
+def benchmark_datasketch(documents, doc_bytes, dimensions, batch_size):
     """datasketch MinHash on CPU: the common data-science baseline, n-grams built in Python."""
     if not should_run("minhash/datasketch.MinHash"):
         return
     cpu_batch_size = auto_batch_size(1, base=batch_size, default_base=DEFAULT_BATCH_PER_CORE)
     per_width = max(1, dimensions // len(NGRAM_WIDTHS))
-    doc_bytes = document_byte_lengths(documents)
     # Encoded once: doing it inside the kernel charged datasketch a full UTF-8
     # encode of the working set on every pass that the StringZilla rows never pay.
     encoded = [document.encode("utf-8") for document in documents]
+    # A fresh sketch per document is what the algorithm requires; a fresh permutation
+    # table is not, and regenerating one per document per width is pure setup cost.
+    prototype = MinHash(num_perm=per_width)
+    permutations, scheme = prototype.permutations, prototype.scheme
 
     def kernel(slice_of_documents):
         for data in slice_of_documents:
             for width in NGRAM_WIDTHS:
-                signature = MinHash(num_perm=per_width)
-                for offset in range(len(data) - width + 1):
-                    signature.update(data[offset : offset + width])
-                _ = signature.hashvalues  # force materialization
+                signature = MinHash(num_perm=per_width, permutations=permutations, scheme=scheme)
+                signature.update_batch(data[offset : offset + width] for offset in range(len(data) - width + 1))
 
     bench_fingerprint(
-        "datasketch.MinHash",
+        "minhash/datasketch.MinHash",
         encoded,
         kernel,
         doc_bytes,
@@ -152,25 +151,25 @@ def benchmark_datasketch(documents, dimensions, batch_size):
     )
 
 
-def benchmark_cudf(documents, dimensions, batch_size):
+def benchmark_cudf(documents, doc_bytes, dimensions, batch_size):
     """cuDF MinHash on the GPU: the CUDA first-party comparison (optional, best-effort)."""
     gpu_batch_size = auto_batch_size(
         gpu_multiprocessor_count(0) or 64,
         base=batch_size,
         default_base=DEFAULT_BATCH_PER_CORE,
     )
-    if not should_run(f"minhash/cudf.minhash<1gpu,batch={gpu_batch_size}>"):
+    name = "minhash/cudf.minhash<1gpu>"
+    if not should_run(name):
         return
     try:
         import cupy as cp
     except ImportError:
-        print("cudf.minhash<1gpu>: SKIPPED (cupy not available)")
+        print(f"{name}: SKIPPED (cupy not available)")
         return
 
     per_width = max(1, dimensions // len(NGRAM_WIDTHS))
     parameters_a = cp.arange(1, per_width + 1, dtype=cp.uint32)
     parameters_b = cp.arange(1, per_width + 1, dtype=cp.uint32)
-    doc_bytes = document_byte_lengths(documents)
     series = cudf.Series(documents)
 
     def kernel(series_slice):
@@ -179,7 +178,7 @@ def benchmark_cudf(documents, dimensions, batch_size):
 
     try:
         bench_fingerprint(
-            f"cudf.minhash<1gpu,batch={gpu_batch_size}>",
+            name,
             series,
             kernel,
             doc_bytes,
@@ -187,7 +186,7 @@ def benchmark_cudf(documents, dimensions, batch_size):
             gpu_batch_size,
         )
     except Exception as error:
-        print(f"cudf.minhash<1gpu>: SKIPPED ({type(error).__name__}: {error})")
+        print(f"{name}: SKIPPED ({type(error).__name__}: {error})")
 
 
 _main_epilog = """
@@ -198,7 +197,7 @@ Examples:
   %(prog)s --dataset leipzig1M.txt --max-docs 1000 --dimensions 128
 
   # Test only specific algorithms
-  %(prog)s --dataset leipzig1M.txt -k "(datasketch|szs.Fingerprints)"
+  %(prog)s --dataset leipzig1M.txt -k "(datasketch|stringzillas.Fingerprints)"
 
   # GPU-only benchmarks
   %(prog)s --dataset leipzig1M.txt -k "(cudf|GPU)"
@@ -250,13 +249,16 @@ def main():
 
     log_system_info()
 
+    # Encoding the corpus is not free, and every row prices its work off the same lengths.
+    doc_bytes = document_byte_lengths(tokens)
+
     print("\nMinHash Throughput")
-    benchmark_stringzillas(tokens, args.dimensions, args.batch_size)
-    benchmark_datasketch(tokens, args.dimensions, args.batch_size)
+    benchmark_stringzillas(tokens, doc_bytes, args.dimensions, args.batch_size)
+    benchmark_datasketch(tokens, doc_bytes, args.dimensions, args.batch_size)
     if not CUDF_AVAILABLE:
         note_unavailable("minhash/cudf.minhash<1gpu>", "cudf not installed")
     else:
-        benchmark_cudf(tokens, args.dimensions, args.batch_size)
+        benchmark_cudf(tokens, doc_bytes, args.dimensions, args.batch_size)
     finish()
     return 0
 

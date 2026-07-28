@@ -236,33 +236,21 @@ fn bench_byteset_forward(needles: &BytesCowsAuto) {
     );
 
     measure(
-        "byteset-forward/bstr::iter",
+        "byteset-forward/bstr::find_byteset",
         MeasureSpec::new(Unit::Bytes, byteset_work),
         || {
             for token in needles.iter() {
                 let token = black_box(token);
                 let mut position: usize = 0;
-                // Inline search for `BYTES_TABS`.
-                while let Some(found) = token[position..]
-                    .iter()
-                    .position(|&byte| BYTES_TABS.contains(&byte))
-                {
+                while let Some(found) = token[position..].find_byteset(BYTES_TABS) {
                     position += found + 1;
                 }
                 position = 0;
-                // Inline search for `BYTES_HTML`.
-                while let Some(found) = token[position..]
-                    .iter()
-                    .position(|&byte| BYTES_HTML.contains(&byte))
-                {
+                while let Some(found) = token[position..].find_byteset(BYTES_HTML) {
                     position += found + 1;
                 }
                 position = 0;
-                // Inline search for `BYTES_DIGITS`.
-                while let Some(found) = token[position..]
-                    .iter()
-                    .position(|&byte| BYTES_DIGITS.contains(&byte))
-                {
+                while let Some(found) = token[position..].find_byteset(BYTES_DIGITS) {
                     position += found + 1;
                 }
             }
@@ -279,35 +267,18 @@ fn bench_byteset_forward(needles: &BytesCowsAuto) {
         || {
             for token in needles.iter() {
                 let token = black_box(token);
-                black_box(re_tabs.find_iter(token.as_bytes()).count());
-                black_box(re_html.find_iter(token.as_bytes()).count());
-                black_box(re_digits.find_iter(token.as_bytes()).count());
+                black_box(re_tabs.find_iter(token).count());
+                black_box(re_html.find_iter(token).count());
+                black_box(re_digits.find_iter(token).count());
             }
         },
     );
 
     // Benchmark for Aho–Corasick-based byteset search.
-    let ac_tabs = AhoCorasick::new(
-        BYTES_TABS
-            .iter()
-            .map(|&byte| (byte as char).to_string())
-            .collect::<Vec<_>>(),
-    )
-    .expect("failed to create AhoCorasick FSA");
-    let ac_html = AhoCorasick::new(
-        BYTES_HTML
-            .iter()
-            .map(|&byte| (byte as char).to_string())
-            .collect::<Vec<_>>(),
-    )
-    .expect("failed to create AhoCorasick FSA");
-    let ac_digits = AhoCorasick::new(
-        BYTES_DIGITS
-            .iter()
-            .map(|&byte| (byte as char).to_string())
-            .collect::<Vec<_>>(),
-    )
-    .expect("failed to create AhoCorasick FSA");
+    let ac_tabs = AhoCorasick::new(BYTES_TABS.chunks(1)).expect("failed to create AhoCorasick FSA");
+    let ac_html = AhoCorasick::new(BYTES_HTML.chunks(1)).expect("failed to create AhoCorasick FSA");
+    let ac_digits =
+        AhoCorasick::new(BYTES_DIGITS.chunks(1)).expect("failed to create AhoCorasick FSA");
     measure(
         "byteset-forward/aho_corasick::find_iter",
         MeasureSpec::new(Unit::Bytes, byteset_work),

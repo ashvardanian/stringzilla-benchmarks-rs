@@ -1,5 +1,6 @@
 """Shared harness for the StringWars Python suites. Mirrors `utils.rs`."""
 
+import functools
 import math
 import os
 import re
@@ -15,7 +16,7 @@ from typing import Literal
 # costs nothing at runtime and keeps call sites spelling `report="bytes"`.
 ReportUnit = Literal["bytes", "cups", "hashes", "bits", "comparisons"]
 TokensMode = Literal["lines", "words", "file"]
-RowStatus = Literal["ok", "refused", "skipped", "filtered"]
+RowStatus = Literal["ok", "refused", "too_slow", "skipped", "filtered"]
 
 # region: Environment Variable Helpers
 # Standardized functions for fetching environment variables consistently.
@@ -200,8 +201,13 @@ def parse_size(size_str: str) -> int:
 # region: Manifest
 
 
+@functools.cache
 def manifest() -> dict:
-    """`stringwars.toml` — the single source of defaults shared with `utils.rs`."""
+    """`stringwars.toml` — the single source of defaults shared with `utils.rs`.
+
+    Parsed once: `limits()` runs per row, and re-reading the file there put an open and a
+    TOML parse between every pair of measurements.
+    """
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stringwars.toml")
     with open(path, "rb") as handle:
         return tomllib.load(handle)
@@ -440,6 +446,9 @@ def resolve_dataset(suite: str, as_bytes: bool = True, dataset_path: str | None 
 # run context through every call site would be noise.
 _RUN: dict | None = None
 
+# The fields that must agree across languages for a suite to be conformant.
+_IDENTITY_FIELDS = ("dataset", "mode", "tokens", "token_bytes", "crc")
+
 # The closed set of report units, mirroring Rust's `ReportAs` variants. A `Literal`
 # rather than an `Enum`: it costs nothing at runtime and keeps the 20 call sites
 # spelling `report="bytes"` instead of `ReportAs.BYTES`.
@@ -648,12 +657,17 @@ def measure(
     floor_nanoseconds = resolved.min_sample_ms * 1e6
 
     passes = 1
-    took = 0
-    while setup is None:
+    if setup is None:
+        while True:
+            took = run_sample(passes)
+            if took >= floor_nanoseconds or passes >= 1 << 40:
+                break
+            passes = min(max(2, math.ceil(floor_nanoseconds / max(took, 1))) * passes, 1 << 40)
+    else:
+        # A consuming kernel cannot batch passes, but one sample still prices one. Skipping
+        # it left `took` at zero, so the refusal below could never fire for `sequence` - the
+        # one suite whose work is superlinear and therefore most able to outrun the cap.
         took = run_sample(passes)
-        if took >= floor_nanoseconds or passes >= 1 << 40:
-            break
-        passes = min(max(2, math.ceil(floor_nanoseconds / max(took, 1))) * passes, 1 << 40)
 
     # Calibration is the first moment the cost of a pass is known. If one pass already
     # rules out the three samples a dispersion estimate needs, stop here rather than
@@ -753,7 +767,6 @@ def pass_over(function: Callable, *columns) -> Callable[[], None]:
     costs ~50-80 ns per item, which swamps a short kernel and gets attributed to it.
     `deque(..., maxlen=0)` drains the `map` at C speed and keeps no results.
     """
-    from collections import deque
 
     def run() -> None:
         deque(map(function, *columns), maxlen=0)
@@ -863,15 +876,10 @@ def check_conformance(directory: str) -> int:
     for path in sorted(glob.glob(os.path.join(directory, "*.ndjson"))):
         suite = os.path.basename(path).removesuffix(".ndjson")
         identities = {}
-        for line in open(path):
-            record = json.loads(line)
-            identities[record["lang"]] = (
-                record["dataset"],
-                record["mode"],
-                record["tokens"],
-                record["token_bytes"],
-                record["crc"],
-            )
+        with open(path) as handle:
+            for line in handle:
+                record = json.loads(line)
+                identities[record["lang"]] = tuple(record[field] for field in _IDENTITY_FIELDS)
         distinct = set(identities.values())
         if len(identities) < 2:
             print(f"{suite:<16} SKIP  only {'/'.join(identities) or 'no'} records")
@@ -882,8 +890,11 @@ def check_conformance(directory: str) -> int:
             failures += 1
             print(f"{suite:<16} FAIL  harnesses resolved different working sets")
             for lang, values in sorted(identities.items()):
-                for value in sorted(values):
-                    print(f"                  {lang:<8} {value}")
+                # Pair each value with its field name. Sorting the tuple instead raised
+                # TypeError on int-against-str, crashing the one branch that reports a
+                # mismatch.
+                fields = " ".join(f"{f}={v}" for f, v in zip(_IDENTITY_FIELDS, values, strict=True))
+                print(f"                  {lang:<8} {fields}")
     return failures
 
 

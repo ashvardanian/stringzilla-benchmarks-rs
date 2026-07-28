@@ -1,5 +1,10 @@
-# Single source of truth for both harnesses. `utils.rs` and `utils.py` hold no
-# defaults of their own — they read this file, so the two cannot drift.
+# Shared defaults for both harnesses. `utils.rs` and `utils.py` hold none of their own,
+# so everything below cannot drift between the two.
+#
+# Per-suite fixtures are not here yet and are still mirrored by hand: `DEFAULT_BATCH_PER_CORE`
+# (similarities, fingerprints), `NGRAM_WIDTHS` (fingerprints) and `NEEDLES_PER_PASS`
+# (normalization) each exist as a Rust `const` and a Python module constant. They agree
+# today, so the drift is latent rather than live.
 
 [limits]
 # Working-set budget, counted in *token bytes* (the denominator of every bytes/s
@@ -64,9 +69,15 @@ similarities = { dataset = "acgt_100.txt", tokens = "words", bytes = "8MB" }
 # 256MB pass would be tens of seconds.
 sequence = { dataset = "xlsum.csv", tokens = "lines", bytes = "32MB" }
 
-# Whole-corpus passes; the pure-Python normalization baseline runs at 5-40 MB/s,
-# so 256MB would be a ~50s pass.
-normalization = { dataset = "leipzig1M_en.txt", tokens = "file", bytes = "16MB" }
+# Whole-corpus passes over one `file`-mode token, so the budget is also the length of the
+# single string every engine is handed.
+#
+# `pyunormalize` sets this one: it holds ~53 MChar/s up to 800 K characters and then falls
+# off a cliff — 1.02 M characters did not finish in 295 s, a >20,000x collapse. A budget
+# above that ceiling cannot produce a number for it at all, and the too-slow refusal is no
+# help because it only fires *after* one pass has completed. 512KB keeps the whole field
+# collectable: pure ASCII yields 512 K characters and multi-byte scripts fewer still.
+normalization = { dataset = "leipzig1M_en.txt", tokens = "file", bytes = "512KB" }
 tokenization = { dataset = "leipzig1M_en.txt", tokens = "file", bytes = "16MB" }
 
 # Sweeps NDIM 64/128/256/512, so a pass is paid four times over. `serial::MinHash`

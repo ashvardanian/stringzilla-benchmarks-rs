@@ -47,14 +47,7 @@ fn measure_line_tokenizer<Count: FnMut(&[u8]) -> usize>(
 /// Each call splits a single document line, cycling through the line tokens. Throughput is
 /// reported as the bytes of that one line, so the per-byte rate still reflects the splitter's
 /// compute cost while the working set stays a single line rather than the whole file.
-fn bench_tokenize_whitespace(work: WorkUnits, _haystack: &[u8], needles: &BytesCowsAuto) {
-    // Pre-decode every line to `&str` once, outside the timed closures. The byte-based StringZilla
-    // variant operates on the raw line bytes; the `str`-based baselines reuse these validated lines.
-    let lines_str: Vec<&str> = needles
-        .iter()
-        .map(|line| std::str::from_utf8(line).unwrap_or(""))
-        .collect();
-
+fn bench_tokenize_whitespace(work: WorkUnits, needles: &BytesCowsAuto, lines_str: &[&str]) {
     measure_line_tokenizer(
         "tokenize-whitespace/stringzilla::utf8_split_whitespaces",
         work,
@@ -71,7 +64,7 @@ fn bench_tokenize_whitespace(work: WorkUnits, _haystack: &[u8], needles: &BytesC
             "tokenize-whitespace/std::split<is_whitespace>",
             MeasureSpec::new(Unit::Bytes, work),
             || {
-                for line in &lines_str {
+                for line in lines_str {
                     let count: usize = black_box(*line)
                         .split(char::is_whitespace)
                         .filter(|segment| !segment.is_empty())
@@ -88,7 +81,7 @@ fn bench_tokenize_whitespace(work: WorkUnits, _haystack: &[u8], needles: &BytesC
             "tokenize-whitespace/icu::WhiteSpace.split",
             MeasureSpec::new(Unit::Bytes, work),
             || {
-                for line in &lines_str {
+                for line in lines_str {
                     let count: usize = black_box(*line)
                         .split(|character: char| white_space.contains(character))
                         .filter(|segment: &&str| !segment.is_empty())
@@ -105,7 +98,7 @@ fn bench_tokenize_whitespace(work: WorkUnits, _haystack: &[u8], needles: &BytesC
 /// Each call splits a single document line, cycling through the line tokens; throughput is the
 /// bytes of that one line. (Per-line newline splitting is degenerate when lines were split on `\n`,
 /// but the kernels still exercise the full Unicode newline set across the seven characters.)
-fn bench_tokenize_newlines(work: WorkUnits, _haystack: &[u8], needles: &BytesCowsAuto) {
+fn bench_tokenize_newlines(work: WorkUnits, needles: &BytesCowsAuto, lines_str: &[&str]) {
     // Custom newline predicate matching StringZilla's 7 newline characters.
     fn is_unicode_newline(character: char) -> bool {
         matches!(
@@ -113,13 +106,6 @@ fn bench_tokenize_newlines(work: WorkUnits, _haystack: &[u8], needles: &BytesCow
             '\n' | '\r' | '\x0B' | '\x0C' | '\u{0085}' | '\u{2028}' | '\u{2029}'
         )
     }
-
-    // Pre-decode every line to `&str` once (only the custom `str` baseline needs it); the
-    // StringZilla variant splits the raw line bytes directly.
-    let lines_str: Vec<&str> = needles
-        .iter()
-        .map(|line| std::str::from_utf8(line).unwrap_or(""))
-        .collect();
 
     measure_line_tokenizer(
         "tokenize-newlines/stringzilla::utf8_split_newlines",
@@ -137,7 +123,7 @@ fn bench_tokenize_newlines(work: WorkUnits, _haystack: &[u8], needles: &BytesCow
             "tokenize-newlines/custom::split<is_unicode_newline>",
             MeasureSpec::new(Unit::Bytes, work),
             || {
-                for line in &lines_str {
+                for line in lines_str {
                     let count: usize = black_box(*line)
                         .split(is_unicode_newline)
                         .filter(|segment| !segment.is_empty())
@@ -158,14 +144,7 @@ fn bench_tokenize_newlines(work: WorkUnits, _haystack: &[u8], needles: &BytesCow
 /// also tile — `unicode-segmentation::split_word_bounds()` and `icu::segmenter::WordSegmenter`. The
 /// filtering `unicode_words()` (word-like segments only, dropping spaces/punctuation) is a different
 /// operation and is intentionally not compared here.
-fn bench_tokenize_words_tr29(work: WorkUnits, _haystack: &[u8], needles: &BytesCowsAuto) {
-    // Pre-decode every line to `&str` once. StringZilla segments the raw line bytes directly; the
-    // `unicode-segmentation`, ICU, and stdlib baselines reuse these validated lines per call.
-    let lines_str: Vec<&str> = needles
-        .iter()
-        .map(|line| std::str::from_utf8(line).unwrap_or(""))
-        .collect();
-
+fn bench_tokenize_words_tr29(work: WorkUnits, needles: &BytesCowsAuto, lines_str: &[&str]) {
     // Benchmark for StringZilla's single-pass TR29 word iterator. `.count()` consumes the
     // iterator without materializing the segments, so no allocation taints the measurement.
     measure_line_tokenizer(
@@ -184,7 +163,7 @@ fn bench_tokenize_words_tr29(work: WorkUnits, _haystack: &[u8], needles: &BytesC
             "tokenize-words-tr29/unicode-segmentation::split_word_bounds",
             MeasureSpec::new(Unit::Bytes, work),
             || {
-                for line in &lines_str {
+                for line in lines_str {
                     let line = black_box(*line);
                     let count: usize = line.split_word_bounds().count();
                     black_box(count);
@@ -199,7 +178,7 @@ fn bench_tokenize_words_tr29(work: WorkUnits, _haystack: &[u8], needles: &BytesC
             "tokenize-words-tr29/icu::WordSegmenter::new_dictionary.segment_str",
             MeasureSpec::new(Unit::Bytes, work),
             || {
-                for line in &lines_str {
+                for line in lines_str {
                     let line = black_box(*line);
                     // WordSegmenter returns boundary indices; count segments = boundaries - 1
                     let boundaries: usize = segmenter.segment_str(line).count();
@@ -214,7 +193,7 @@ fn bench_tokenize_words_tr29(work: WorkUnits, _haystack: &[u8], needles: &BytesC
             "tokenize-words-tr29/std::split_whitespace",
             MeasureSpec::new(Unit::Bytes, work),
             || {
-                for line in &lines_str {
+                for line in lines_str {
                     let line = black_box(*line);
                     let count: usize = line.split_whitespace().count();
                     black_box(count);
@@ -230,14 +209,7 @@ fn bench_tokenize_words_tr29(work: WorkUnits, _haystack: &[u8], needles: &BytesC
 /// emoji ZWJ sequences, and regional-indicator pairs count as one cluster.
 /// - `unicode-segmentation::graphemes(true)`: extended grapheme clusters
 /// - `icu::segmenter::GraphemeClusterSegmenter`: ICU4X implementation
-fn bench_tokenize_graphemes(work: WorkUnits, _haystack: &[u8], needles: &BytesCowsAuto) {
-    // Pre-decode every line to `&str` once. StringZilla segments the raw line bytes directly; the
-    // `unicode-segmentation` and ICU baselines reuse these validated lines per call.
-    let lines_str: Vec<&str> = needles
-        .iter()
-        .map(|line| std::str::from_utf8(line).unwrap_or(""))
-        .collect();
-
+fn bench_tokenize_graphemes(work: WorkUnits, needles: &BytesCowsAuto, lines_str: &[&str]) {
     // Benchmark for StringZilla's single-pass grapheme iterator. `.count()` consumes the
     // iterator without materializing the segments, so no allocation taints the measurement.
     measure_line_tokenizer(
@@ -256,7 +228,7 @@ fn bench_tokenize_graphemes(work: WorkUnits, _haystack: &[u8], needles: &BytesCo
             "tokenize-graphemes-tr29/unicode-segmentation::graphemes",
             MeasureSpec::new(Unit::Bytes, work),
             || {
-                for line in &lines_str {
+                for line in lines_str {
                     let line = black_box(*line);
                     let count: usize = UnicodeSegmentation::graphemes(line, true).count();
                     black_box(count);
@@ -271,7 +243,7 @@ fn bench_tokenize_graphemes(work: WorkUnits, _haystack: &[u8], needles: &BytesCo
             "tokenize-graphemes-tr29/icu::GraphemeClusterSegmenter.segment_str",
             MeasureSpec::new(Unit::Bytes, work),
             || {
-                for line in &lines_str {
+                for line in lines_str {
                     let line = black_box(*line);
                     // The segmenter returns boundary indices; count segments = boundaries - 1.
                     let boundaries: usize = segmenter.segment_str(line).count();
@@ -288,14 +260,7 @@ fn bench_tokenize_graphemes(work: WorkUnits, _haystack: &[u8], needles: &BytesCo
 /// scripts.
 /// - `unicode-segmentation::split_sentence_bounds()`: raw UAX#29 sentence boundaries
 /// - `icu::segmenter::SentenceSegmenter`: ICU4X implementation
-fn bench_tokenize_sentences(work: WorkUnits, _haystack: &[u8], needles: &BytesCowsAuto) {
-    // Pre-decode every line to `&str` once. StringZilla segments the raw line bytes directly; the
-    // `unicode-segmentation` and ICU baselines reuse these validated lines per call.
-    let lines_str: Vec<&str> = needles
-        .iter()
-        .map(|line| std::str::from_utf8(line).unwrap_or(""))
-        .collect();
-
+fn bench_tokenize_sentences(work: WorkUnits, needles: &BytesCowsAuto, lines_str: &[&str]) {
     // Benchmark for StringZilla's single-pass sentence iterator. `.count()` consumes the
     // iterator without materializing the segments, so no allocation taints the measurement.
     measure_line_tokenizer(
@@ -314,7 +279,7 @@ fn bench_tokenize_sentences(work: WorkUnits, _haystack: &[u8], needles: &BytesCo
             "tokenize-sentences-tr29/unicode-segmentation::split_sentence_bounds",
             MeasureSpec::new(Unit::Bytes, work),
             || {
-                for line in &lines_str {
+                for line in lines_str {
                     let line = black_box(*line);
                     let count: usize = line.split_sentence_bounds().count();
                     black_box(count);
@@ -329,7 +294,7 @@ fn bench_tokenize_sentences(work: WorkUnits, _haystack: &[u8], needles: &BytesCo
             "tokenize-sentences-tr29/icu::SentenceSegmenter.segment_str",
             MeasureSpec::new(Unit::Bytes, work),
             || {
-                for line in &lines_str {
+                for line in lines_str {
                     let line = black_box(*line);
                     // The segmenter returns boundary indices; count segments = boundaries - 1.
                     let boundaries: usize = segmenter.segment_str(line).count();
@@ -346,14 +311,7 @@ fn bench_tokenize_sentences(work: WorkUnits, _haystack: &[u8], needles: &BytesCo
 /// distinct from the hard newline splitting in `bench_tokenize_newlines`.
 /// - `unicode-linebreak::linebreaks()`: mandatory and allowed break opportunities
 /// - `icu::segmenter::LineSegmenter`: ICU4X implementation
-fn bench_tokenize_lines_uax14(work: WorkUnits, _haystack: &[u8], needles: &BytesCowsAuto) {
-    // Pre-decode every line to `&str` once. StringZilla segments the raw line bytes directly; the
-    // `unicode-linebreak` and ICU baselines reuse these validated lines per call.
-    let lines_str: Vec<&str> = needles
-        .iter()
-        .map(|line| std::str::from_utf8(line).unwrap_or(""))
-        .collect();
-
+fn bench_tokenize_lines_uax14(work: WorkUnits, needles: &BytesCowsAuto, lines_str: &[&str]) {
     // Benchmark for StringZilla's single-pass line-break iterator. `.count()` consumes the
     // iterator without materializing the segments, so no allocation taints the measurement.
     measure_line_tokenizer(
@@ -372,7 +330,7 @@ fn bench_tokenize_lines_uax14(work: WorkUnits, _haystack: &[u8], needles: &Bytes
             "tokenize-lines-uax14/unicode-linebreak::linebreaks",
             MeasureSpec::new(Unit::Bytes, work),
             || {
-                for line in &lines_str {
+                for line in lines_str {
                     let line = black_box(*line);
                     let count: usize = linebreaks(line).count();
                     black_box(count);
@@ -387,7 +345,7 @@ fn bench_tokenize_lines_uax14(work: WorkUnits, _haystack: &[u8], needles: &Bytes
             "tokenize-lines-uax14/icu::LineSegmenter::new_dictionary.segment_str",
             MeasureSpec::new(Unit::Bytes, work),
             || {
-                for line in &lines_str {
+                for line in lines_str {
                     let line = black_box(*line);
                     // The segmenter returns boundary indices; count segments = boundaries - 1.
                     let boundaries: usize = segmenter.segment_str(line).count();
@@ -563,25 +521,32 @@ fn main() {
     let haystack = tape.parent();
     let needles = &tape;
     let work = WorkUnits::new(tape.len() as u64, tape.iter().map(|t| t.len() as u64).sum());
+    // Decoded once for every `&str` baseline in the suite. A lossy fallback would be
+    // silent: in `file` mode the tape is a single token, so one undecodable byte would
+    // hand a no-op row the whole working set and call it throughput.
+    let lines_str: Vec<&str> = tape
+        .iter()
+        .map(|line| std::str::from_utf8(line).expect("dataset must be valid UTF-8"))
+        .collect();
     log_timing_overhead();
 
     println!("# tokenize-whitespace");
-    bench_tokenize_whitespace(work, haystack, needles);
+    bench_tokenize_whitespace(work, needles, &lines_str);
 
     println!("# tokenize-newlines");
-    bench_tokenize_newlines(work, haystack, needles);
+    bench_tokenize_newlines(work, needles, &lines_str);
 
     println!("# tokenize-words-tr29");
-    bench_tokenize_words_tr29(work, haystack, needles);
+    bench_tokenize_words_tr29(work, needles, &lines_str);
 
     println!("# tokenize-graphemes-tr29");
-    bench_tokenize_graphemes(work, haystack, needles);
+    bench_tokenize_graphemes(work, needles, &lines_str);
 
     println!("# tokenize-sentences-tr29");
-    bench_tokenize_sentences(work, haystack, needles);
+    bench_tokenize_sentences(work, needles, &lines_str);
 
     println!("# tokenize-lines-uax14");
-    bench_tokenize_lines_uax14(work, haystack, needles);
+    bench_tokenize_lines_uax14(work, needles, &lines_str);
 
     println!("# utf8-length");
     bench_utf8_length(work, haystack, needles);
