@@ -228,6 +228,12 @@ fn bench_argsort(unsorted: &CharsCowsAuto<'static>) {
 }
 
 fn main() {
+    // Before Polars sizes its pool, which it does once and lazily. Every other engine here
+    // sorts on one core, so leaving Polars on all of them made its rows several times
+    // faster than the contenders they sit beside.
+    if std::env::var_os("POLARS_MAX_THREADS").is_none() {
+        std::env::set_var("POLARS_MAX_THREADS", "1");
+    }
     install_panic_hook();
     log_stringzilla_metadata();
 

@@ -23,6 +23,8 @@ from utils import (
     add_common_args,
     auto_batch_size,
     finish,
+    get_env,
+    get_env_or_default,
     gpu_multiprocessor_count,
     log_dataset,
     log_timing_overhead,
@@ -221,8 +223,8 @@ def main():
         "-d",
         "--dimensions",
         type=int,
-        default=256,
-        help="Number of hash functions for MinHash (default: 256)",
+        default=None,
+        help="Pin one MinHash width; otherwise STRINGWARS_NDIM_SCALES sweeps 64,128,256,512",
     )
     parser.add_argument(
         "-b",
@@ -252,13 +254,25 @@ def main():
     # Encoding the corpus is not free, and every row prices its work off the same lengths.
     doc_bytes = document_byte_lengths(tokens)
 
-    print("\nMinHash Throughput")
-    benchmark_stringzillas(tokens, doc_bytes, args.dimensions, args.batch_size)
-    benchmark_datasketch(tokens, doc_bytes, args.dimensions, args.batch_size)
-    if not CUDF_AVAILABLE:
-        note_unavailable("minhash/cudf.minhash<1gpu>", "cudf not installed")
+    # Sweep the same widths as `bench.rs`: `--dimensions` pins one, otherwise
+    # STRINGWARS_NDIM / STRINGWARS_NDIM_SCALES decide, so both languages emit rows at the
+    # same scales. Python used to be fixed at 256 while Rust swept 64/128/256/512, which
+    # left every scale but one with no Python counterpart to compare against.
+    if args.dimensions is not None:
+        scales = [args.dimensions]
+    elif pinned := get_env("STRINGWARS_NDIM"):
+        scales = [int(pinned)]
     else:
-        benchmark_cudf(tokens, doc_bytes, args.dimensions, args.batch_size)
+        scales = [int(s) for s in get_env_or_default("STRINGWARS_NDIM_SCALES", "64,128,256,512").split(",")]
+
+    for dimensions in scales:
+        print(f"\n# minhash/ndim_{dimensions}")
+        benchmark_stringzillas(tokens, doc_bytes, dimensions, args.batch_size)
+        benchmark_datasketch(tokens, doc_bytes, dimensions, args.batch_size)
+        if not CUDF_AVAILABLE:
+            note_unavailable("minhash/cudf.minhash<1gpu>", "cudf not installed")
+        else:
+            benchmark_cudf(tokens, doc_bytes, dimensions, args.batch_size)
     finish()
     return 0
 

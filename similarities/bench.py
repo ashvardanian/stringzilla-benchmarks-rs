@@ -603,13 +603,13 @@ def perform_score_benchmarks(
         byte_lengths,
         gap_open,
         gap_extend,
-        "needleman-wunsch",
+        group_name,
         "global",
     )
     benchmark_stringzillas_scores(
         tokens,
         device_variants,
-        "needleman-wunsch",
+        group_name,
         "stringzillas.NeedlemanWunschScores",
         szs.NeedlemanWunschScores,
         byte_to_class,
@@ -625,13 +625,13 @@ def perform_score_benchmarks(
         byte_lengths,
         gap_open,
         gap_extend,
-        "smith-waterman",
+        group_name,
         "local",
     )
     benchmark_stringzillas_scores(
         tokens,
         device_variants,
-        "smith-waterman",
+        group_name,
         "stringzillas.SmithWatermanScores",
         szs.SmithWatermanScores,
         byte_to_class,
@@ -664,9 +664,10 @@ def main() -> int:
 
     add_common_args(parser)
     parser.add_argument(
-        "--bio",
-        action="store_true",
-        help="Include BioPython + NW/SW alignment score benchmarks (linear + affine gap costs)",
+        "--no-bio",
+        dest="bio",
+        action="store_false",
+        help="Skip the BioPython + NW/SW alignment score groups (linear and affine gap costs)",
     )
     parser.add_argument(
         "--batch-size",
@@ -716,6 +717,9 @@ def main() -> int:
         args.batch_size,
     )
 
+    # On by default, because `bench.rs` runs these groups unconditionally: gating them
+    # behind an opt-in meant a plain `bench.py` produced no Python column for any of the
+    # four alignment tables, while Rust filled all four.
     if args.bio:
         print("\n# linear")
         perform_score_benchmarks(

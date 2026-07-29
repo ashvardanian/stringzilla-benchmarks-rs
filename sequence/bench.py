@@ -14,13 +14,19 @@
 import argparse
 import functools
 import math
+import os
 import sys
 from collections.abc import Callable
 
+# Must precede `import polars`: Polars sizes its thread pool once, at import. Every other
+# engine in this suite sorts on one core, so leaving Polars on all 18 made its rows 5-10x
+# faster than the contenders they sit beside.
+os.environ.setdefault("POLARS_MAX_THREADS", "1")
+
 # Assume core deps are present; only cuDF is optional
-import numpy as np
-import pandas as pd
-import polars as pl
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+import polars as pl  # noqa: E402
 import pyarrow as pa
 import pyarrow.compute as pc
 import stringzilla as sz
