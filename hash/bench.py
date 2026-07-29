@@ -74,8 +74,11 @@ def run_stateless_benchmarks(
 ):
     print("\nStateless Hash Benchmarks")
 
-    # Python built-in hash
-    bench_hash_function("stateless/hash", tokens, hash, work)
+    # No built-in `hash` row: CPython caches a `bytes` object's hash inside the object, so
+    # every pass after the first reads the cache instead of hashing. Measured 5.19 GB/s
+    # computing against 63 GB/s re-reading, and since warm-up discards the one real pass
+    # the row reported 157 GB/s of cache lookups. Nothing here can be compared against
+    # contenders that recompute, so the row is gone rather than misleading.
 
     # xxHash
     bench_hash_function("stateless/xxhash.xxh3_64", tokens, xxhash.xxh3_64_intdigest, work)
