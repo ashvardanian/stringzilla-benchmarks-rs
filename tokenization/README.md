@@ -31,6 +31,19 @@ Unlike the optional break opportunities of UAX#14, these always end a line.
 
 > Rust measured June 23, 2026; Python June 28, 2026.
 
+### Apple M5 Pro
+
+| Library                            |       English |       Chinese |        Arabic |        French |        Korean |
+| ---------------------------------- | ------------: | ------------: | ------------: | ------------: | ------------: |
+| Rust                               |               |               |               |               |               |
+| `stringzilla::utf8_split_newlines` | __2.88 GB/s__ | __2.47 GB/s__ | __3.31 GB/s__ | __2.70 GB/s__ | __2.84 GB/s__ |
+| `std::split<is_unicode_newline>`   |     1.85 GB/s |     2.21 GB/s |     1.15 GB/s |     1.38 GB/s |     1.59 GB/s |
+|                                    |               |               |               |               |               |
+| Python                             |               |               |               |               |               |
+| `stringzilla.utf8_split_newlines`  |     2.42 GB/s |     2.02 GB/s |     2.87 GB/s |     2.24 GB/s |     2.36 GB/s |
+
+> Measured July 29, 2026.
+
 ## UAX#14 Line Break Opportunities
 
 Marks every position a renderer may wrap.
@@ -54,6 +67,21 @@ It emits far more opportunities than the hard newline set.
 
 > Rust measured June 23, 2026; Python June 28, 2026.
 
+### Apple M5 Pro
+
+| Library                         |       English |       Chinese |        Arabic |        French |        Korean |
+| ------------------------------- | ------------: | ------------: | ------------: | ------------: | ------------: |
+| Rust                            |               |               |               |               |               |
+| `stringzilla::utf8_linebreaks`  | __0.25 GB/s__ |     0.21 GB/s |     0.25 GB/s | __0.24 GB/s__ |     0.21 GB/s |
+| `unicode-linebreak::linebreaks` |     0.22 GB/s | __0.57 GB/s__ | __0.59 GB/s__ |     0.22 GB/s | __0.63 GB/s__ |
+| `icu::LineSegmenter`            |     0.16 GB/s |     0.27 GB/s |     0.29 GB/s |     0.16 GB/s |     0.25 GB/s |
+|                                 |               |               |               |               |               |
+| Python                          |               |               |               |               |               |
+| `stringzilla.utf8_linebreaks`   | __0.16 GB/s__ |     0.11 GB/s |     0.19 GB/s | __0.16 GB/s__ |     0.11 GB/s |
+| `icu.BreakIterator`             |     0.13 GB/s | __0.13 GB/s__ | __0.22 GB/s__ |     0.13 GB/s | __0.12 GB/s__ |
+
+> Measured July 29, 2026.
+
 ## TR29 Sentences
 
 UAX#29 sentence boundaries use 12 Sentence_Break classes (STerm, ATerm, Close, SContinue, Sep, CR, LF, Sp, Lower, Upper, OLetter, Numeric, Extend, Format).
@@ -76,6 +104,21 @@ Abbreviations (U.S.A.), decimals (3.14), and a following continuation do not bre
 
 > Rust measured June 23, 2026; Python June 28, 2026.
 
+### Apple M5 Pro
+
+| Library                                       |       English |       Chinese |        Arabic |        French |        Korean |
+| --------------------------------------------- | ------------: | ------------: | ------------: | ------------: | ------------: |
+| Rust                                          |               |               |               |               |               |
+| `stringzilla::utf8_sentences`                 | __0.44 GB/s__ | __0.55 GB/s__ | __0.51 GB/s__ | __0.41 GB/s__ | __0.56 GB/s__ |
+| `unicode-segmentation::split_sentence_bounds` |     0.09 GB/s |     0.34 GB/s |     0.20 GB/s |     0.09 GB/s |     0.36 GB/s |
+| `icu::SentenceSegmenter`                      |     0.41 GB/s |     0.55 GB/s |     0.47 GB/s |     0.39 GB/s |     0.44 GB/s |
+|                                               |               |               |               |               |               |
+| Python                                        |               |               |               |               |               |
+| `stringzilla.utf8_sentences`                  | __0.42 GB/s__ |     0.51 GB/s |     0.48 GB/s |     0.39 GB/s |     0.52 GB/s |
+| `icu.BreakIterator`                           |     0.41 GB/s | __0.73 GB/s__ | __0.69 GB/s__ | __0.41 GB/s__ | __0.85 GB/s__ |
+
+> Measured July 29, 2026.
+
 ## Whitespaces
 
 There are 25 characters classified as whitespace in Unicode.
@@ -97,9 +140,25 @@ The zero-width space _U+200B_, despite its name, is not among them — its `Whit
 | Python                                |               |               |               |               |               |
 | `stringzilla.utf8_split_whitespaces`  | __0.11 GB/s__ | __0.24 GB/s__ | __0.17 GB/s__ | __0.11 GB/s__ | __0.16 GB/s__ |
 | `regex.split`                         |     0.02 GB/s |     0.03 GB/s |     0.03 GB/s |     0.02 GB/s |     0.02 GB/s |
+| `regex.finditer`                      |             — |             — |             — |             — |             — |
 
 > Rust measured June 23, 2026; Python June 28, 2026.
 > `str.split()` is omitted: it also treats U+001C–U+001F (C0 separators) as whitespace, a different set than the Unicode `White_Space` property StringZilla, `char::is_whitespace`, and `regex \s` use.
+
+### Apple M5 Pro
+
+| Library                               |       English |       Chinese |        Arabic |        French |        Korean |
+| ------------------------------------- | ------------: | ------------: | ------------: | ------------: | ------------: |
+| Rust                                  |               |               |               |               |               |
+| `stringzilla::utf8_split_whitespaces` |     0.59 GB/s | __1.83 GB/s__ |     0.79 GB/s |     0.58 GB/s |     0.81 GB/s |
+| `std::split<is_whitespace>`           | __0.71 GB/s__ |     1.67 GB/s | __1.04 GB/s__ | __0.68 GB/s__ | __1.44 GB/s__ |
+| `icu::WhiteSpace`                     |     0.19 GB/s |     0.58 GB/s |     0.43 GB/s |     0.19 GB/s |     0.52 GB/s |
+|                                       |               |               |               |               |               |
+| Python                                |               |               |               |               |               |
+| `stringzilla.utf8_split_whitespaces`  | __0.27 GB/s__ | __1.33 GB/s__ | __0.41 GB/s__ | __0.27 GB/s__ | __0.39 GB/s__ |
+| `regex.finditer`                      |     0.06 GB/s |     0.43 GB/s |     0.10 GB/s |     0.06 GB/s |     0.10 GB/s |
+
+> Measured July 29, 2026.
 
 ## TR29 Words
 
@@ -116,6 +175,7 @@ Space-less scripts (Chinese, Japanese, Thai) need a dictionary, hence ICU's `Wor
 | `stringzilla::utf8_wordbreaks`            | __0.35 GB/s__ | __0.22 GB/s__ | __0.35 GB/s__ | __0.28 GB/s__ | __0.31 GB/s__ |
 | `unicode-segmentation::split_word_bounds` |     0.06 GB/s |     0.13 GB/s |     0.12 GB/s |     0.06 GB/s |     0.17 GB/s |
 | `icu::WordSegmenter`                      |     0.11 GB/s |     0.02 GB/s |     0.22 GB/s |     0.11 GB/s |     0.17 GB/s |
+| `std::split_whitespace`                   |             — |             — |             — |             — |             — |
 |                                           |               |               |               |               |               |
 | Python                                    |               |               |               |               |               |
 | `stringzilla.utf8_wordbreaks`             | __0.06 GB/s__ | __0.06 GB/s__ | __0.09 GB/s__ | __0.06 GB/s__ | __0.09 GB/s__ |
@@ -123,6 +183,22 @@ Space-less scripts (Chinese, Japanese, Thai) need a dictionary, hence ICU's `Wor
 | `icu.BreakIterator`                       |     0.03 GB/s |     0.01 GB/s |     0.05 GB/s |     0.03 GB/s |     0.03 GB/s |
 
 > Rust measured June 23, 2026; Python June 28, 2026.
+
+### Apple M5 Pro
+
+| Library                                   |       English |       Chinese |        Arabic |        French |        Korean |
+| ----------------------------------------- | ------------: | ------------: | ------------: | ------------: | ------------: |
+| Rust                                      |               |               |               |               |               |
+| `stringzilla::utf8_wordbreaks`            |     0.46 GB/s |     0.34 GB/s |     0.35 GB/s |     0.35 GB/s |     0.35 GB/s |
+| `unicode-segmentation::split_word_bounds` |     0.12 GB/s |     0.25 GB/s |     0.24 GB/s |     0.12 GB/s |     0.42 GB/s |
+| `icu::WordSegmenter`                      |     0.21 GB/s |     0.04 GB/s |     0.33 GB/s |     0.22 GB/s |     0.42 GB/s |
+| `std::split_whitespace`                   | __0.68 GB/s__ | __1.65 GB/s__ | __1.02 GB/s__ | __0.65 GB/s__ | __1.35 GB/s__ |
+|                                           |               |               |               |               |               |
+| Python                                    |               |               |               |               |               |
+| `stringzilla.utf8_wordbreaks`             | __0.13 GB/s__ | __0.12 GB/s__ | __0.17 GB/s__ | __0.13 GB/s__ | __0.16 GB/s__ |
+| `icu.BreakIterator`                       |     0.08 GB/s |     0.03 GB/s |     0.14 GB/s |     0.09 GB/s |     0.08 GB/s |
+
+> Measured July 29, 2026.
 
 ## TR29 Graphemes
 
@@ -148,6 +224,23 @@ It breaks between every pair except where rules GB3–GB11 forbid it.
 
 > Rust measured June 23, 2026; Python June 28, 2026.
 
+### Apple M5 Pro
+
+| Library                           |       English |       Chinese |        Arabic |        French |        Korean |
+| --------------------------------- | ------------: | ------------: | ------------: | ------------: | ------------: |
+| Rust                              |               |               |               |               |               |
+| `stringzilla::utf8_graphemes`     |     0.22 GB/s |     0.41 GB/s |     0.29 GB/s |     0.22 GB/s |     0.29 GB/s |
+| `unicode-segmentation::graphemes` |     0.15 GB/s |     0.23 GB/s |     0.22 GB/s |     0.15 GB/s |     0.17 GB/s |
+| `icu::GraphemeClusterSegmenter`   | __0.29 GB/s__ | __0.46 GB/s__ | __0.36 GB/s__ | __0.29 GB/s__ | __0.36 GB/s__ |
+|                                   |               |               |               |               |               |
+| Python                            |               |               |               |               |               |
+| `stringzilla.utf8_graphemes`      | __0.05 GB/s__ | __0.12 GB/s__ | __0.08 GB/s__ | __0.05 GB/s__ |     0.10 GB/s |
+| `regex.finditer`                  |     0.01 GB/s |     0.03 GB/s |     0.02 GB/s |     0.01 GB/s |     0.03 GB/s |
+| `grapheme.graphemes`              |    <0.01 GB/s |    <0.01 GB/s |    <0.01 GB/s |    <0.01 GB/s |    <0.01 GB/s |
+| `icu.BreakIterator`               |     0.04 GB/s |     0.11 GB/s |     0.08 GB/s |     0.05 GB/s | __0.11 GB/s__ |
+
+> Measured July 29, 2026.
+
 ## Codepoint Indexing
 
 UTF-8 encodes each codepoint in 1–4 bytes (lead bytes `0xxxxxxx`, `110xxxxx`, `1110xxxx`, `11110xxx`).
@@ -163,6 +256,16 @@ CPython stores `str` in a fixed-width representation (PEP 393), so `s[n]` and `l
 | `std::char_indices.nth`      |      1.61 GB/s |      1.07 GB/s |      0.73 GB/s |      1.12 GB/s |      0.71 GB/s |
 
 > Measured June 23, 2026.
+
+### Apple M5 Pro
+
+| Library                      |        English |        Chinese |         Arabic |         French |         Korean |
+| ---------------------------- | -------------: | -------------: | -------------: | -------------: | -------------: |
+| Rust                         |                |                |                |                |                |
+| `stringzilla::find_nth_utf8` | __34.14 GB/s__ | __34.27 GB/s__ | __34.28 GB/s__ | __34.26 GB/s__ | __34.27 GB/s__ |
+| `std::char_indices.nth`      |      2.67 GB/s |      1.12 GB/s |      0.66 GB/s |      1.79 GB/s |      0.96 GB/s |
+
+> Measured July 29, 2026.
 
 To rerun the benchmarks for all languages:
 

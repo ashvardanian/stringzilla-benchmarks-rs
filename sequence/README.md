@@ -44,8 +44,32 @@ For the case-folded column every folding sort shares one comparator, StringZilla
 | `polars.Series.arg_sort`       |      31.47 M compares/s |                       — |
 | `numpy.argsort`                |      21.65 M compares/s |                       — |
 
-> Measured June 17, 2026 on an Intel Xeon4 Sapphire Rapids, single-threaded (Polars pinned to one thread), sorting short words from `xlsum.csv`.
+> Measured June 17, 2026, single-threaded (Polars pinned to one thread), sorting short words from `xlsum.csv`.
+
+### Apple M5 Pro
+
+| Library                        |              Byte Order |     Unicode Case-Folded |
+| ------------------------------ | ----------------------: | ----------------------: |
+| Rust                           |                         |                         |
+| `stringzilla::argsort`         | __540.89 M compares/s__ | __232.68 M compares/s__ |
+| `arrow::lexsort_to_indices`    |     328.57 M compares/s |                       — |
+| `polars::Series::sort`         |     283.13 M compares/s |                       — |
+| `polars::DataFrame::sort`      |     277.38 M compares/s |                       — |
+| `polars::Series::arg_sort`     |     207.91 M compares/s |                       — |
+| `std::sort_by_key`             |     116.47 M compares/s |      52.72 M compares/s |
+|                                |                         |                         |
+| Python                         |                         |                         |
+| `stringzilla.Strs.argsort`     | __577.80 M compares/s__ | __303.35 M compares/s__ |
+| `stringzilla.Strs.sorted`      |     537.43 M compares/s |     288.58 M compares/s |
+| `polars.Series.sort`           |     281.42 M compares/s |                       — |
+| `pyarrow.compute.sort_indices` |     128.68 M compares/s |                       — |
+| `pandas.Series.sort_values`    |     117.46 M compares/s |                       — |
+| `polars.Series.arg_sort`       |     114.46 M compares/s |                       — |
+| `list.sort`                    |     107.48 M compares/s |      22.25 M compares/s |
+| `numpy.argsort`                |      46.34 M compares/s |                       — |
+
+> Measured July 29, 2026.
 
 ---
 
-See [README.md](README.md) for dataset information and replication instructions.
+See the [top-level README](../README.md) for dataset information and replication instructions.

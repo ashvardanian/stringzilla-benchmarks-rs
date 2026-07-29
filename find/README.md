@@ -23,9 +23,27 @@ The C standard library is, however, also implemented by humans, and a better sol
 |                        |                    |                   |
 | Python                 |                    |                   |
 | `str.find`             |          0.73 GB/s |         1.14 GB/s |
+| `pyahocorasick.iter`   |                  — |                 — |
 | `stringzilla.Str.find` |      __3.37 GB/s__ |    __11.64 GB/s__ |
 
-> Measured June 17, 2026 on an Intel Xeon4 Sapphire Rapids.
+> Measured June 17, 2026.
+
+### Apple M5 Pro
+
+| Library                | Short Word Queries | Long Line Queries |
+| ---------------------- | -----------------: | ----------------: |
+| Rust                   |                    |                   |
+| `std::str::find`       |         35.70 GB/s |        50.65 GB/s |
+| `memmem::find`         |         35.68 GB/s |        50.56 GB/s |
+| `memmem::Finder`       |     __37.85 GB/s__ |    __50.71 GB/s__ |
+| `stringzilla::find`    |         30.04 GB/s |        33.19 GB/s |
+|                        |                    |                   |
+| Python                 |                    |                   |
+| `str.find`             |          3.04 GB/s |        18.03 GB/s |
+| `pyahocorasick.iter`   |          1.32 GB/s |         1.24 GB/s |
+| `stringzilla.Str.find` |     __26.80 GB/s__ |    __38.08 GB/s__ |
+
+> Measured July 29, 2026.
 
 ### Reverse Search
 
@@ -46,7 +64,23 @@ Still, those are provided by StringZilla mostly for parsing tasks and feature pa
 | `str.rfind`             |          1.39 GB/s |         3.80 GB/s |
 | `stringzilla.Str.rfind` |      __7.76 GB/s__ |    __11.63 GB/s__ |
 
-> Measured June 17, 2026 on an Intel Xeon4 Sapphire Rapids.
+> Measured June 17, 2026.
+
+### Apple M5 Pro
+
+| Library                 | Short Word Queries | Long Line Queries |
+| ----------------------- | -----------------: | ----------------: |
+| Rust                    |                    |                   |
+| `std::str::rfind`       |          6.08 GB/s |         4.46 GB/s |
+| `memmem::rfind`         |          6.07 GB/s |         4.47 GB/s |
+| `memmem::FinderRev`     |          6.12 GB/s |         4.44 GB/s |
+| `stringzilla::rfind`    |     __28.92 GB/s__ |    __32.85 GB/s__ |
+|                         |                    |                   |
+| Python                  |                    |                   |
+| `str.rfind`             |          2.83 GB/s |         4.13 GB/s |
+| `stringzilla.Str.rfind` |     __22.56 GB/s__ |    __32.71 GB/s__ |
+
+> Measured July 29, 2026.
 
 ## Byte-Set Search
 
@@ -64,7 +98,7 @@ Once that object is constructed, all of its inclusions in each token (word or li
 | Library                         |   Short Words |    Long Lines |
 | ------------------------------- | ------------: | ------------: |
 | Rust                            |               |               |
-| `bstr::iter`                    |     0.26 GB/s |     0.36 GB/s |
+| `bstr::find_byteset`            |             — |             — |
 | `regex::find_iter`              |     0.20 GB/s |     5.07 GB/s |
 | `aho_corasick::find_iter`       |     0.34 GB/s |     0.51 GB/s |
 | `stringzilla::find_byteset`     | __1.20 GB/s__ | __8.34 GB/s__ |
@@ -73,8 +107,24 @@ Once that object is constructed, all of its inclusions in each token (word or li
 | `re.finditer`                   |     0.05 GB/s |     0.21 GB/s |
 | `stringzilla.Str.find_first_of` | __0.12 GB/s__ | __9.35 GB/s__ |
 
-> Measured June 17, 2026 on an Intel Xeon4 Sapphire Rapids.
+> Measured June 17, 2026.
+
+### Apple M5 Pro
+
+| Library                         |     Short Words |      Long Lines |
+| ------------------------------- | --------------: | --------------: |
+| Rust                            |                 |                 |
+| `bstr::find_byteset`            |       1.47 GB/s |       3.67 GB/s |
+| `regex::find_iter`              |     409.15 MB/s |       9.41 GB/s |
+| `aho_corasick::find_iter`       |     728.46 MB/s |     985.73 MB/s |
+| `stringzilla::find_byteset`     |   __1.54 GB/s__ |  __13.10 GB/s__ |
+|                                 |                 |                 |
+| Python                          |                 |                 |
+| `re.finditer`                   |     751.84 MB/s |     617.54 MB/s |
+| `stringzilla.Str.find_first_of` |   __4.01 GB/s__ |   __4.37 GB/s__ |
+
+> Measured July 29, 2026.
 
 ---
 
-See [README.md](README.md) for dataset information and replication instructions.
+See the [top-level README](../README.md) for dataset information and replication instructions.

@@ -31,8 +31,8 @@ StringZilla scores every column with the same unary 32-class match/mismatch cost
 | ------------------------------------------------ | ----------------: | ------------------: | ------------: | ----------------: |
 | Rust                                             |                   |                     |               |                   |
 | `bio::levenshtein<1xSPR>`                        |         337 MCUPS |           674 MCUPS |     184 MCUPS |         124 MCUPS |
-| `rapidfuzz::levenshtein<Bytes><1xSPR>`           |       3,300 MCUPS |        12,390 MCUPS |   1,110 MCUPS |       9,990 MCUPS |
-| `rapidfuzz::levenshtein<Chars><1xSPR>`           |       2,300 MCUPS |         8,990 MCUPS |     181 MCUPS |      11,070 MCUPS |
+| `rapidfuzz::levenshtein<Bytes,1xSPR>`            |       3,300 MCUPS |        12,390 MCUPS |   1,110 MCUPS |       9,990 MCUPS |
+| `rapidfuzz::levenshtein<Chars,1xSPR>`            |       2,300 MCUPS |         8,990 MCUPS |     181 MCUPS |      11,070 MCUPS |
 | `stringzillas::LevenshteinDistances<1xSPR>`      |  __15,680 MCUPS__ |        12,770 MCUPS |   3,360 MCUPS |       5,850 MCUPS |
 | `stringzillas::LevenshteinDistances<16xSPR>`     |     127,860 MCUPS |   __141,800 MCUPS__ |  20,820 MCUPS |      36,780 MCUPS |
 | `stringzillas::LevenshteinDistances<H100>`       |   5,980,110 MCUPS | __6,237,990 MCUPS__ | 139,850 MCUPS |      41,850 MCUPS |
@@ -57,6 +57,34 @@ StringZilla scores every column with the same unary 32-class match/mismatch cost
 
 > Measured June 19, 2026.
 
+### Apple M5 Pro
+
+| Library                                         |        ACGT 100B |          ACGT 1KB |      XLSum words |       XLSum lines |
+| ----------------------------------------------- | ---------------: | ----------------: | ---------------: | ----------------: |
+| Rust                                            |                  |                   |                  |                   |
+| `bio::levenshtein<1xM5>`                        |        900 MCUPS |       1,567 MCUPS |        436 MCUPS |         217 MCUPS |
+| `rapidfuzz::levenshtein<Bytes,1xM5>`            |      9,119 MCUPS |      24,876 MCUPS |      2,037 MCUPS |      21,589 MCUPS |
+| `rapidfuzz::levenshtein<Chars,1xM5>`            |      8,664 MCUPS |      24,464 MCUPS |        468 MCUPS |      21,075 MCUPS |
+| `stringzillas::LevenshteinDistances<1xM5>`      |     22,422 MCUPS |      54,250 MCUPS |      2,482 MCUPS |      14,073 MCUPS |
+| `stringzillas::LevenshteinDistances<18xM5>`     |     49,922 MCUPS | __715,914 MCUPS__ |      2,537 MCUPS |     150,332 MCUPS |
+| `stringzillas::LevenshteinDistancesUtf8<1xM5>`  |     22,392 MCUPS |      54,255 MCUPS |        711 MCUPS |      28,444 MCUPS |
+| `stringzillas::LevenshteinDistancesUtf8<18xM5>` | __53,979 MCUPS__ |     694,590 MCUPS | __11,028 MCUPS__ | __316,631 MCUPS__ |
+|                                                 |                  |                   |                  |                   |
+| Python                                          |                  |                   |                  |                   |
+| `rapidfuzz.Levenshtein.distance`                |      9,704 MCUPS |      29,245 MCUPS |        215 MCUPS |      26,394 MCUPS |
+| `Levenshtein.distance`                          |      9,189 MCUPS |      29,192 MCUPS |        140 MCUPS |      26,423 MCUPS |
+| `jellyfish.levenshtein_distance`                |        214 MCUPS |         252 MCUPS |         59 MCUPS |         432 MCUPS |
+| `editdistance.eval`                             |      4,652 MCUPS |         814 MCUPS |         51 MCUPS |         780 MCUPS |
+| `nltk.edit_distance`                            |       5.94 MCUPS |        4.64 MCUPS |       3.78 MCUPS |                 — |
+| `edlib.align`                                   |      4,864 MCUPS |      24,552 MCUPS |         19 MCUPS |      26,314 MCUPS |
+| `polyleven.levenshtein`                         |     10,828 MCUPS |      11,316 MCUPS |        461 MCUPS |      26,301 MCUPS |
+| `stringzillas.LevenshteinDistances<1xM5>`       |     22,084 MCUPS |      54,549 MCUPS |  __1,396 MCUPS__ |      14,478 MCUPS |
+| `stringzillas.LevenshteinDistances<18xM5>`      | __46,893 MCUPS__ | __723,480 MCUPS__ |        445 MCUPS |     181,045 MCUPS |
+| `stringzillas.LevenshteinDistancesUTF8<1xM5>`   |     22,074 MCUPS |      54,532 MCUPS |        479 MCUPS |      27,126 MCUPS |
+| `stringzillas.LevenshteinDistancesUTF8<18xM5>`  |     46,047 MCUPS |     696,989 MCUPS |        166 MCUPS | __399,501 MCUPS__ |
+
+> Measured July 29, 2026.
+
 ## Needleman-Wunsch for Global Alignment
 
 ### Intel Xeon4 Sapphire Rapids & NVIDIA H100
@@ -76,6 +104,22 @@ StringZilla scores every column with the same unary 32-class match/mismatch cost
 | `stringzillas.NeedlemanWunschScores<H100>`    | 396,550 MCUPS | __700,900 MCUPS__ | 18,800 MCUPS | 203,490 MCUPS |
 
 > Measured June 19, 2026.
+
+### Apple M5 Pro
+
+| Library                                      |        ACGT 100B |         ACGT 1KB |     XLSum words |     XLSum lines |
+| -------------------------------------------- | ---------------: | ---------------: | --------------: | --------------: |
+| Rust                                         |                  |                  |                 |                 |
+| `bio::pairwise::global<1xM5>`                |        153 MCUPS |        157 MCUPS |       124 MCUPS |   __124 MCUPS__ |
+| `stringzillas::NeedlemanWunschScores<1xM5>`  |        974 MCUPS |      1,071 MCUPS |       252 MCUPS |               — |
+| `stringzillas::NeedlemanWunschScores<18xM5>` | __11,684 MCUPS__ | __15,581 MCUPS__ | __1,065 MCUPS__ |               — |
+|                                              |                  |                  |                 |                 |
+| Python                                       |                  |                  |                 |                 |
+| `biopython.PairwiseAligner.global`           |        914 MCUPS |        842 MCUPS |        34 MCUPS | __1,894 MCUPS__ |
+| `stringzillas.NeedlemanWunschScores<1xM5>`   |        823 MCUPS |      1,017 MCUPS |        24 MCUPS |               — |
+| `stringzillas.NeedlemanWunschScores<18xM5>`  | __10,193 MCUPS__ | __14,331 MCUPS__ |   __210 MCUPS__ |               — |
+
+> Measured July 29, 2026.
 
 ## Smith-Waterman for Local Alignment
 
@@ -97,6 +141,22 @@ StringZilla scores every column with the same unary 32-class match/mismatch cost
 
 > Measured June 19, 2026.
 
+### Apple M5 Pro
+
+| Library                                    |        ACGT 100B |         ACGT 1KB |   XLSum words |     XLSum lines |
+| ------------------------------------------ | ---------------: | ---------------: | ------------: | --------------: |
+| Rust                                       |                  |                  |               |                 |
+| `bio::pairwise::local<1xM5>`               |        144 MCUPS |        147 MCUPS |     128 MCUPS |   __127 MCUPS__ |
+| `stringzillas::SmithWatermanScores<1xM5>`  |        960 MCUPS |      1,048 MCUPS |     249 MCUPS |               — |
+| `stringzillas::SmithWatermanScores<18xM5>` | __11,465 MCUPS__ | __14,810 MCUPS__ | __931 MCUPS__ |               — |
+|                                            |                  |                  |               |                 |
+| Python                                     |                  |                  |               |                 |
+| `biopython.PairwiseAligner.local`          |        776 MCUPS |        782 MCUPS |      34 MCUPS | __1,905 MCUPS__ |
+| `stringzillas.SmithWatermanScores<1xM5>`   |        843 MCUPS |      1,055 MCUPS |      24 MCUPS |               — |
+| `stringzillas.SmithWatermanScores<18xM5>`  | __10,436 MCUPS__ | __15,984 MCUPS__ | __209 MCUPS__ |               — |
+
+> Measured July 29, 2026.
+
 ## Needleman-Wunsch-Gotoh for Global Alignment
 
 ### Intel Xeon4 Sapphire Rapids & NVIDIA H100
@@ -116,6 +176,22 @@ StringZilla scores every column with the same unary 32-class match/mismatch cost
 | `stringzillas.NeedlemanWunschScores<H100>`    |   211,610 MCUPS | __395,760 MCUPS__ | 16,180 MCUPS | 119,740 MCUPS |
 
 > Measured June 19, 2026.
+
+### Apple M5 Pro
+
+| Library                                      |        ACGT 100B |         ACGT 1KB |   XLSum words |     XLSum lines |
+| -------------------------------------------- | ---------------: | ---------------: | ------------: | --------------: |
+| Rust                                         |                  |                  |               |                 |
+| `bio::pairwise::global<1xM5>`                |        138 MCUPS |        142 MCUPS |     126 MCUPS |   __123 MCUPS__ |
+| `stringzillas::NeedlemanWunschScores<1xM5>`  |        929 MCUPS |        986 MCUPS |     243 MCUPS |               — |
+| `stringzillas::NeedlemanWunschScores<18xM5>` | __10,780 MCUPS__ | __14,184 MCUPS__ | __862 MCUPS__ |               — |
+|                                              |                  |                  |               |                 |
+| Python                                       |                  |                  |               |                 |
+| `biopython.PairwiseAligner.global`           |        610 MCUPS |        700 MCUPS |      34 MCUPS | __1,631 MCUPS__ |
+| `stringzillas.NeedlemanWunschScores<1xM5>`   |        902 MCUPS |      1,007 MCUPS |      43 MCUPS |               — |
+| `stringzillas.NeedlemanWunschScores<18xM5>`  | __10,683 MCUPS__ | __15,219 MCUPS__ | __232 MCUPS__ |               — |
+
+> Measured July 29, 2026.
 
 ## Smith-Waterman-Gotoh for Local Alignment
 
@@ -137,6 +213,22 @@ StringZilla scores every column with the same unary 32-class match/mismatch cost
 
 > Measured June 19, 2026.
 
+### Apple M5 Pro
+
+| Library                                    |        ACGT 100B |         ACGT 1KB |   XLSum words |   XLSum lines |
+| ------------------------------------------ | ---------------: | ---------------: | ------------: | ------------: |
+| Rust                                       |                  |                  |               |               |
+| `bio::pairwise::local<1xM5>`               |        119 MCUPS |        124 MCUPS |     131 MCUPS | __117 MCUPS__ |
+| `stringzillas::SmithWatermanScores<1xM5>`  |        886 MCUPS |        956 MCUPS |     232 MCUPS |             — |
+| `stringzillas::SmithWatermanScores<18xM5>` | __10,565 MCUPS__ | __13,303 MCUPS__ | __887 MCUPS__ |             — |
+|                                            |                  |                  |               |               |
+| Python                                     |                  |                  |               |               |
+| `biopython.PairwiseAligner.local`          |        387 MCUPS |        396 MCUPS |      33 MCUPS | __999 MCUPS__ |
+| `stringzillas.SmithWatermanScores<1xM5>`   |        879 MCUPS |        975 MCUPS |      43 MCUPS |             — |
+| `stringzillas.SmithWatermanScores<18xM5>`  | __10,421 MCUPS__ | __14,582 MCUPS__ | __260 MCUPS__ |             — |
+
+> Measured July 29, 2026.
+
 ---
 
-See [README.md](README.md) for dataset information and replication instructions.
+See the [top-level README](../README.md) for dataset information and replication instructions.

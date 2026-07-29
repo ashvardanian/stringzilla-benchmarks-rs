@@ -33,10 +33,26 @@ Every value is independent and each variant writes into one preallocated buffer 
 | `stringzilla.hash`            |     300.58 M bits/s |    380.23 M bits/s |    458.91 M bits/s |    506.59 M bits/s |
 | `stringzilla.hash_multiseed`  | __860.00 M bits/s__ |  __1.67 G bits/s__ |  __3.37 G bits/s__ |  __6.48 G bits/s__ |
 
-> Measured June 17, 2026 on an Intel Xeon4 Sapphire Rapids, single-threaded, hashing short words from `xlsum.csv`.
+> Measured June 17, 2026, single-threaded, hashing short words from `xlsum.csv`.
+
+### Apple M5 Pro
+
+| Variant                       |            128 bits |           256 bits |           512 bits |          1024 bits |
+| ----------------------------- | ------------------: | -----------------: | -----------------: | -----------------: |
+| Rust                          |                     |                    |                    |                    |
+| `xxh3::xxh3_128`              |  __27.01 G bits/s__ | __44.01 G bits/s__ | __65.47 G bits/s__ | __79.79 G bits/s__ |
+| `stringzilla::hash`           |      13.62 G bits/s |     18.11 G bits/s |     23.10 G bits/s |     26.90 G bits/s |
+| `stringzilla::hash_multiseed` |      14.90 G bits/s |     25.73 G bits/s |     39.67 G bits/s |     55.96 G bits/s |
+|                               |                     |                    |                    |                    |
+| Python                        |                     |                    |                    |                    |
+| `xxhash.xxh3_128`             |     855.43 M bits/s |    932.45 M bits/s |      1.02 G bits/s |                  — |
+| `stringzilla.hash`            |     841.71 M bits/s |    963.04 M bits/s |      1.07 G bits/s |                  — |
+| `stringzilla.hash_multiseed`  |   __3.34 G bits/s__ |  __6.35 G bits/s__ | __11.88 G bits/s__ | __21.30 G bits/s__ |
+
+> Measured July 29, 2026.
 
 The multi-seed path prepares the input once and replays cheap per-seed rounds, so its throughput climbs almost linearly with the digest width while the naive variants plateau — StringZilla's own `hash` flattens near 22 G bits/s because it re-prepares the key every 64 bits.
-`xxh3_128` keeps its full 128-bit output, so it re-prepares only every 128 bits and overtakes `stringzilla::hash` once the digest reaches 512 bits, but it never catches `hash_multiseed`.
+`xxh3_128` keeps its full 128-bit output, so it re-prepares only every 128 bits and stays ahead of `stringzilla::hash` throughout. Whether it also beats `hash_multiseed` is machine-dependent: it trails on Xeon4 and leads at every width on M5.
 In Python the picture inverts for the baselines: per-call interpreter dispatch dominates, so `stringzilla.hash` (one native call per 64 bits) stays ahead of `xxhash.xxh3_128` (whose 128-bit output costs an extra big-integer split), while `hash_multiseed` — a single native call that fills the whole buffer — runs an order of magnitude ahead of both.
 
 ## Probabilistic Membership
@@ -58,7 +74,23 @@ Each filter is compared StringZilla-fed against its practical default with the s
 | `pyprobables<fnv>`               |     0.08 M keys/s |      0.09 M keys/s | 9.59 bits/key | 1.032% |
 | `pyprobables<stringzilla>`       | __0.40 M keys/s__ |  __0.40 M keys/s__ | 9.59 bits/key | 0.978% |
 
-> Measured June 17, 2026 on an Intel Xeon4 Sapphire Rapids, single-threaded, over `xlsum.csv` words at a 1% target false-positive rate.
+> Measured June 17, 2026, single-threaded, over `xlsum.csv` words at a 1% target false-positive rate.
+
+### Apple M5 Pro
+
+| Variant                          |              Build |              Query |      bits/key |    FPR |
+| -------------------------------- | -----------------: | -----------------: | ------------: | -----: |
+| Rust                             |                    |                    |               |        |
+| `fastbloom<siphash>`             |     19.24 M keys/s |     18.98 M keys/s | 9.59 bits/key | 0.993% |
+| `fastbloom<stringzilla>`         | __35.58 M keys/s__ | __35.09 M keys/s__ | 9.59 bits/key | 0.993% |
+| `xorf::BinaryFuse8<xxh3>`        | __28.42 M keys/s__ |     61.29 M keys/s | 9.04 bits/key | 0.390% |
+| `xorf::BinaryFuse8<stringzilla>` |     25.97 M keys/s | __64.96 M keys/s__ | 9.04 bits/key | 0.384% |
+|                                  |                    |                    |               |        |
+| Python                           |                    |                    |               |        |
+| `pyprobables<fnv>`               |      0.14 M keys/s |      0.15 M keys/s | 9.59 bits/key | 1.012% |
+| `pyprobables<stringzilla>`       |  __0.89 M keys/s__ |  __0.95 M keys/s__ | 9.59 bits/key | 0.995% |
+
+> Measured July 29, 2026.
 
 Feeding StringZilla helps exactly where the filter accepts a precomputed hash.
 In Rust, `fastbloom`'s `insert_hash` / `contains_hash` take a single `sz::hash` and expand it internally, roughly doubling build and query throughput at identical bits-per-key and FPR, and `xorf` — built from a deduplicated `u64` array — queries faster with StringZilla keys.
