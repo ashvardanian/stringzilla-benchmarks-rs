@@ -723,12 +723,16 @@ def measure(
     mean_seconds = sum(seconds_per_sample) / len(seconds_per_sample)
     gap = abs(mean_seconds - median_seconds) / max(median_seconds, 1e-12)
 
+    # Two forms on purpose: `status` is what the NDJSON carries and must match the string
+    # `utils.rs` writes, or a reader cannot compare the two languages; `label` is for the
+    # console. The display string used to be recorded verbatim, so Rust wrote
+    # `unconverged:0.0666` where Python wrote `UNCONVERGED 6%` for the same condition.
     if gap > 2.0 * resolved.target_spread:
-        status = f"NON-STATIONARY {100.0 * gap:.0f}%"
+        status, label = f"non_stationary:{gap:.4f}", f"NON-STATIONARY {100.0 * gap:.0f}%"
     elif spread / 2.0 > resolved.target_spread:
-        status = f"UNCONVERGED {100.0 * spread:.0f}%"
+        status, label = f"unconverged:{spread:.4f}", f"UNCONVERGED {100.0 * spread:.0f}%"
     else:
-        status = "converged"
+        status = label = "converged"
 
     elements_per_second = spec.elements * passes / median_seconds
     bytes_per_second = spec.total_bytes * passes / median_seconds
@@ -740,7 +744,7 @@ def measure(
         columns.append(format_byte_rate(_round_to_earned_digits(bytes_per_second, halfwidth)))
     columns.append(f"+-{100.0 * halfwidth:.1f}% n={len(seconds_per_sample)}")
     if status != "converged":
-        columns.append(status)
+        columns.append(label)
     print(f"{name:<{REPORT_NAME_WIDTH}} {' | '.join(columns)}")
 
     outcome = Outcome(name, primary, spread, len(seconds_per_sample), passes, status)
