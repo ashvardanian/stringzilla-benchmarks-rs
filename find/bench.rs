@@ -300,8 +300,13 @@ fn main() {
     let tape = resolve_dataset("find").unwrap_nice();
     log_timing_overhead();
 
-    // Get the parent data directly from the tape (zero-copy)
-    let haystack = tape.parent();
+    // The resolved tokens concatenated, not `tape.parent()`. The parent is the raw read:
+    // it carries the separators between tokens and whatever trailing bytes the reader
+    // pulled past the budget, so it is neither `token_bytes` long nor the same haystack
+    // `find/bench.py` scans, which is exactly this concatenation. One startup allocation
+    // buys a denominator both languages agree on.
+    let joined: Vec<u8> = tape.iter().flatten().copied().collect();
+    let haystack: &[u8] = &joined;
     let needles = &tape;
     let sample = needle_sample(needles);
 

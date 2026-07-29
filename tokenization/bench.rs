@@ -517,8 +517,10 @@ fn main() {
 
     let tape = resolve_dataset("tokenization").unwrap_nice();
 
-    // Get the parent data directly from the tape (zero-copy)
-    let haystack = tape.parent();
+    // The tape's single token, not `parent()`: the parent is the raw read, cut at exactly
+    // the budget and so liable to end mid-character, while the token carries the UTF-8
+    // backoff. It is also what the Python side measures, so the two stay comparable.
+    let haystack: &[u8] = tape.iter().next().expect("empty working set");
     let needles = &tape;
     let work = WorkUnits::new(tape.len() as u64, tape.iter().map(|t| t.len() as u64).sum());
     // Decoded once for every `&str` baseline in the suite. A lossy fallback would be

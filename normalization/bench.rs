@@ -474,8 +474,10 @@ fn main() {
     let tape = resolve_dataset("normalization").unwrap_nice();
     log_timing_overhead();
 
-    // Get the parent data directly from the tape (zero-copy)
-    let haystack = tape.parent();
+    // The tape's single token, not `parent()`: the parent is the raw read, cut at exactly
+    // the budget and so liable to end mid-character, while the token carries the UTF-8
+    // backoff. It is also what the Python side measures, so the two stay comparable.
+    let haystack: &[u8] = tape.iter().next().expect("empty working set");
     // The manifest gives this suite `tokens = "file"`, so the tape is one 16 MB
     // token. Case-folding and normalization want exactly that, but the find and
     // compare groups need real needles - searching for the whole haystack inside

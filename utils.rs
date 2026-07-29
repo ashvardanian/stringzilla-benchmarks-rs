@@ -237,12 +237,19 @@ static IS_ASCII_WHITESPACE: [bool; 256] = {
     table
 };
 
-/// Largest `end <= index` that does not sit inside a UTF-8 continuation byte.
-fn char_boundary_floor(bytes: &[u8], mut end: usize) -> usize {
-    while end > 0 && end < bytes.len() && (bytes[end] & 0b1100_0000) == 0b1000_0000 {
-        end -= 1;
+/// Largest `end` at or below `limit` where `bytes[..end]` is still valid UTF-8.
+///
+/// Asking the validator rather than walking back over continuation bytes: the hand-rolled
+/// form guarded on `end < bytes.len()`, which is never true in `file` mode, where the read
+/// is itself cut at exactly the budget. So a buffer ending mid-sequence was passed through
+/// whole — Rust panicked on the first multi-byte corpus and Python quietly dropped the
+/// partial character under `errors="ignore"`, which is also how the two disagreed.
+fn char_boundary_floor(bytes: &[u8], limit: usize) -> usize {
+    let end = limit.min(bytes.len());
+    match std::str::from_utf8(&bytes[..end]) {
+        Ok(_) => end,
+        Err(error) => error.valid_up_to(),
     }
-    end
 }
 
 /// Global measurement limits and per-suite overrides, read from `stringwars.toml`.
@@ -1524,6 +1531,28 @@ mod tests {
 
     /// The rule `memory` used to fork. Its copy ignored the budget in `file` mode
     /// and split `words` on a narrower set, so the two disagreed silently.
+    #[test]
+    fn file_mode_never_tears_a_character() {
+        // A budget landing inside a multi-byte sequence must back off, including when it
+        // lands at the very end of the buffer -- the case `file` mode always hits, since
+        // the read is cut at exactly the budget.
+        let text = "мама мыла раму".as_bytes();
+        for budget in 1..=text.len() {
+            let ranges = token_ranges(text, "file", budget as u64);
+            let kept = &text[ranges[0].clone()];
+            assert!(
+                std::str::from_utf8(kept).is_ok(),
+                "budget {budget} produced {kept:?}",
+            );
+            assert!(kept.len() <= budget);
+        }
+        // And an exact-length budget keeps everything.
+        assert_eq!(
+            token_ranges(text, "file", text.len() as u64)[0].end,
+            text.len()
+        );
+    }
+
     #[test]
     fn token_ranges_match_the_reference_state_machine() {
         // The pre-`split` implementation, kept only as a fuzzing oracle: this is the

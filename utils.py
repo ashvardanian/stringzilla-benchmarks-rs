@@ -337,6 +337,22 @@ class Dataset:
     path: str
 
 
+def _char_boundary_floor(raw: bytes, limit: int) -> int:
+    """Largest `end <= limit` where `raw[:end]` is still valid UTF-8.
+
+    Mirrors `utils.rs::char_boundary_floor`. The old form walked back over continuation
+    bytes but guarded on `end < len(raw)`, which is never true in `file` mode where the
+    read is cut at exactly the budget — so a buffer ending mid-sequence went through whole,
+    and only `errors="ignore"` downstream hid it here while Rust panicked.
+    """
+    end = min(limit, len(raw))
+    try:
+        raw[:end].decode("utf-8")
+    except UnicodeDecodeError as error:
+        return error.start
+    return end
+
+
 def _token_bytes(token) -> int:
     return len(token) if isinstance(token, (bytes, bytearray)) else len(token.encode("utf-8"))
 
@@ -401,10 +417,7 @@ def resolve_dataset(suite: str, as_bytes: bool = True, dataset_path: str | None 
         # `file` mode unbounded — Rust capped and Python did not, silently comparing a
         # 128 MB working set against a 1 MB one. Back off to a UTF-8 boundary so both
         # harnesses cap at the same byte.
-        end = min(budget, len(raw))
-        while 0 < end < len(raw) and (raw[end] & 0b1100_0000) == 0b1000_0000:
-            end -= 1
-        raw = raw[:end]
+        raw = raw[: _char_boundary_floor(raw, budget)]
 
     haystack = raw if as_bytes else raw.decode("utf-8", errors="ignore")
 
