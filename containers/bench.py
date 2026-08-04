@@ -27,8 +27,8 @@ Environment variables:
 - STRINGWARS_TOKENS: Tokenization mode ('lines', 'words', 'file')
 
 Examples:
-  uv run containers/bench.py --dataset xlsum.csv --tokens words
-  uv run containers/bench.py --dataset data.txt --tokens words -k "multiseed"
+  uv run containers/bench.py --dataset data/xlsum/xlsum.csv --tokens words
+  uv run containers/bench.py --dataset README.md --tokens words -k "multiseed"
 """
 
 import argparse

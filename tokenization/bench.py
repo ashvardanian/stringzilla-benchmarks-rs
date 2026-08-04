@@ -26,7 +26,7 @@ Environment variables:
 
 Examples:
   uv run tokenization/bench.py --dataset README.md
-  STRINGWARS_DATASET=data.txt uv run tokenization/bench.py
+  STRINGWARS_DATASET=README.md uv run tokenization/bench.py
 
 Timing via time.monotonic_ns; throughput in decimal GB/s. Filter with -k/--filter.
 """
@@ -307,7 +307,7 @@ Examples:
   %(prog)s --dataset README.md --tokens file
 
   # Test only word segmentation
-  %(prog)s --dataset data.txt --tokens file -k "words"
+  %(prog)s --dataset README.md --tokens file -k "words"
 """
 
 

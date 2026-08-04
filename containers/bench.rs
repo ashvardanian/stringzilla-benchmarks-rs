@@ -22,7 +22,7 @@ structure fixed.
 ## Usage
 
 ```sh
-STRINGWARS_DATASET=xlsum.csv \
+STRINGWARS_DATASET=data/xlsum/xlsum.csv \
     STRINGWARS_TOKENS=words \
     cargo bench --features bench_containers --bench bench_containers
 ```

@@ -47,7 +47,7 @@ disjoint, i.e. ``2 * side <= num_tokens``.
 
 Examples:
   uv run --with stringzillas-cpus similarities/bench.py --dataset README.md
-  STRINGWARS_DATASET=data.txt STRINGWARS_TOKENS=lines uv run --with stringzillas-cpus similarities/bench.py
+  STRINGWARS_DATASET=README.md STRINGWARS_TOKENS=lines uv run --with stringzillas-cpus similarities/bench.py
 """
 
 import argparse
@@ -802,13 +802,13 @@ _main_epilog = """
 Examples:
 
   # Benchmark with a file
-  %(prog)s --dataset leipzig1M.txt
+  %(prog)s --dataset data/leipzig-1m/leipzig1M_en.txt
 
   # Benchmark protein sequences with BioPython scoring baselines
-  %(prog)s --bio --dataset acgt_1k.txt
+  %(prog)s --bio --dataset data/acgt/acgt_1k.txt
 
   # Custom time limit
-  %(prog)s --dataset leipzig1M.txt --time-limit 30
+  %(prog)s --dataset data/leipzig-1m/leipzig1M_en.txt --time-limit 30
 """
 
 

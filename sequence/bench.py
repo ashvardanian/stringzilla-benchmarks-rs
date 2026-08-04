@@ -20,8 +20,8 @@ Environment variables:
 
 Examples:
   uv run sequence/bench.py --dataset README.md --tokens lines
-  uv run sequence/bench.py --dataset xlsum.csv --tokens words -k "list.sort"
-  STRINGWARS_DATASET=data.txt STRINGWARS_TOKENS=lines uv run sequence/bench.py
+  uv run sequence/bench.py --dataset data/xlsum/xlsum.csv --tokens words -k "list.sort"
+  STRINGWARS_DATASET=README.md STRINGWARS_TOKENS=lines uv run sequence/bench.py
 """
 
 import argparse
@@ -118,7 +118,7 @@ Examples:
   %(prog)s --dataset README.md --tokens lines
 
   # Test only Python list.sort
-  %(prog)s --dataset data.txt --tokens lines -k "list.sort"
+  %(prog)s --dataset README.md --tokens lines -k "list.sort"
 
   # Compare StringZilla vs other libraries
   %(prog)s --dataset large.txt --tokens words -k "stringzilla.Strs|pandas|polars"

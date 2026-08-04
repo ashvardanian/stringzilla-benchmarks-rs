@@ -20,8 +20,8 @@ Environment variables:
 - STRINGWARS_TOKENS: Tokenization mode ('lines', 'words', 'file')
 
 Examples:
-  uv run encryption/bench.py --dataset acgt_100.txt --tokens lines
-  uv run encryption/bench.py --dataset acgt_1k.txt --tokens lines -k "chacha"
+  uv run encryption/bench.py --dataset data/acgt/acgt_100.txt --tokens lines
+  uv run encryption/bench.py --dataset data/acgt/acgt_1k.txt --tokens lines -k "chacha"
 """
 
 import argparse

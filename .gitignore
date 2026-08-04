@@ -15,3 +15,5 @@ __pycache__
 /unicode/
 /unicode_tests.txt
 .cargo/
+data/*
+!data/.gitkeep

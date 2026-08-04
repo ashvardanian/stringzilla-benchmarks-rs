@@ -18,8 +18,8 @@ Environment variables:
 
 Examples:
   uv run find/bench.py --dataset README.md --tokens lines
-  uv run find/bench.py --dataset xlsum.csv --tokens words -k "str.find"
-  STRINGWARS_DATASET=data.txt STRINGWARS_TOKENS=lines uv run find/bench.py
+  uv run find/bench.py --dataset data/xlsum/xlsum.csv --tokens words -k "str.find"
+  STRINGWARS_DATASET=README.md STRINGWARS_TOKENS=lines uv run find/bench.py
 
 Timing via time.monotonic_ns.; throughput in decimal GB/s. Filter with -k/--filter.
 """
@@ -141,7 +141,7 @@ Examples:
   %(prog)s --dataset README.md --tokens lines
 
   # Test only substring search operations
-  %(prog)s --dataset data.txt --tokens lines -k "str.find|sz.Str.find"
+  %(prog)s --dataset README.md --tokens lines -k "str.find|sz.Str.find"
 
   # Benchmark character set searches
   %(prog)s --dataset large.txt --tokens words -k "find_first_of"

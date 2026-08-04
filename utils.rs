@@ -172,7 +172,7 @@ impl fmt::Display for DatasetError {
                      Usage: STRINGWARS_DATASET=<file> STRINGWARS_TOKENS=<mode> cargo bench --features <bench> --bench <bench>\n\n\
                      Examples:\n  \
                        STRINGWARS_DATASET=README.md STRINGWARS_TOKENS=lines cargo bench --features bench_hash --bench bench_hash\n  \
-                       STRINGWARS_DATASET=data.txt STRINGWARS_TOKENS=words cargo bench --features bench_find --bench bench_find"
+                       STRINGWARS_DATASET=README.md STRINGWARS_TOKENS=words cargo bench --features bench_find --bench bench_find"
                 )
             }
             DatasetError::FileNotFound { path } => {
@@ -316,10 +316,7 @@ pub fn load_dataset_with_default_mode(
                 let mut seen: HashSet<&'static [u8]> = HashSet::new();
                 let unique_tokens: Vec<&'static [u8]> =
                     iter.filter(|token| seen.insert(*token)).collect();
-                BytesCowsAuto::from_iter_and_data(
-                    unique_tokens,
-                    Cow::Borrowed(content_static),
-                )
+                BytesCowsAuto::from_iter_and_data(unique_tokens, Cow::Borrowed(content_static))
             } else {
                 BytesCowsAuto::from_iter_and_data(iter, Cow::Borrowed(content_static))
             }
@@ -333,10 +330,7 @@ pub fn load_dataset_with_default_mode(
                 let mut seen: HashSet<&'static [u8]> = HashSet::new();
                 let unique_tokens: Vec<&'static [u8]> =
                     iter.filter(|token| seen.insert(*token)).collect();
-                BytesCowsAuto::from_iter_and_data(
-                    unique_tokens,
-                    Cow::Borrowed(content_static),
-                )
+                BytesCowsAuto::from_iter_and_data(unique_tokens, Cow::Borrowed(content_static))
             } else {
                 BytesCowsAuto::from_iter_and_data(iter, Cow::Borrowed(content_static))
             }
@@ -928,16 +922,12 @@ impl PerfSection {
     /// Helper to build and enable a hardware counter
     #[allow(dead_code)]
     fn build_counter(kind: Hardware) -> Option<Counter> {
-        Builder::new()
-            .kind(kind)
-            .build()
-            .ok()
-            .map(|mut counter| {
-                if counter.enable().is_err() {
-                    eprintln!("Warning: Failed to enable counter {:?}", kind);
-                }
-                counter
-            })
+        Builder::new().kind(kind).build().ok().map(|mut counter| {
+            if counter.enable().is_err() {
+                eprintln!("Warning: Failed to enable counter {:?}", kind);
+            }
+            counter
+        })
     }
 
     /// Helper to build and enable a cache counter

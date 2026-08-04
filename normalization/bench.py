@@ -21,7 +21,7 @@ Environment variables:
 
 Examples:
   uv run normalization/bench.py --dataset README.md --tokens lines
-  uv run normalization/bench.py --dataset xlsum.csv --tokens words -k "casefold"
+  uv run normalization/bench.py --dataset data/xlsum/xlsum.csv --tokens words -k "casefold"
 
 Timing via time.monotonic_ns; throughput in decimal GB/s. Filter with -k/--filter.
 """
@@ -352,10 +352,10 @@ Examples:
   %(prog)s --dataset README.md --tokens lines
 
   # Test only case folding
-  %(prog)s --dataset data.txt --tokens lines -k "casefold"
+  %(prog)s --dataset README.md --tokens lines -k "casefold"
 
   # Test only normalization
-  %(prog)s --dataset data.txt --tokens lines -k "normalize"
+  %(prog)s --dataset README.md --tokens lines -k "normalize"
 """
 
 

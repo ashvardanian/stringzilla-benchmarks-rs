@@ -26,8 +26,8 @@ The --batch-size flag overrides STRINGWARS_BATCH_PER_CORE as the per-core base.
 
 Examples:
   uv run --with stringzillas-cpus fingerprints/bench.py --dataset README.md --tokens lines
-  uv run --with stringzillas-cpus fingerprints/bench.py --dataset xlsum.csv --tokens words -k "datasketch"
-  STRINGWARS_DATASET=data.txt STRINGWARS_TOKENS=lines uv run --with stringzillas-cpus fingerprints/bench.py
+  uv run --with stringzillas-cpus fingerprints/bench.py --dataset data/xlsum/xlsum.csv --tokens words -k "datasketch"
+  STRINGWARS_DATASET=README.md STRINGWARS_TOKENS=lines uv run --with stringzillas-cpus fingerprints/bench.py
 """
 
 import argparse
@@ -217,19 +217,19 @@ _main_epilog = """
 Examples:
 
   # Benchmark all algorithms with default settings
-  %(prog)s --dataset leipzig1M.txt
+  %(prog)s --dataset data/leipzig-1m/leipzig1M_en.txt
 
   # Benchmark with limited docs and specific dimensions
-  %(prog)s --dataset leipzig1M.txt --max-docs 1000 --dimensions 128
+  %(prog)s --dataset data/leipzig-1m/leipzig1M_en.txt --max-docs 1000 --dimensions 128
 
   # Test only specific algorithms
-  %(prog)s --dataset leipzig1M.txt -k "(datasketch|szs.Fingerprints)"
+  %(prog)s --dataset data/leipzig-1m/leipzig1M_en.txt -k "(datasketch|szs.Fingerprints)"
 
   # GPU-only benchmarks
-  %(prog)s --dataset leipzig1M.txt -k "(cudf|GPU)"
+  %(prog)s --dataset data/leipzig-1m/leipzig1M_en.txt -k "(cudf|GPU)"
 
   # High-throughput batch processing
-  %(prog)s --dataset leipzig1M.txt --batch-size 1024
+  %(prog)s --dataset data/leipzig-1m/leipzig1M_en.txt --batch-size 1024
 """
 
 

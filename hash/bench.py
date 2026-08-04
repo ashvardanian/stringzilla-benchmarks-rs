@@ -33,8 +33,8 @@ Environment variables:
 
 Examples:
   uv run hash/bench.py --dataset README.md --tokens lines
-  uv run hash/bench.py --dataset xlsum.csv --tokens words -k "xxhash"
-  STRINGWARS_DATASET=data.txt STRINGWARS_TOKENS=lines uv run hash/bench.py
+  uv run hash/bench.py --dataset data/xlsum/xlsum.csv --tokens words -k "xxhash"
+  STRINGWARS_DATASET=README.md STRINGWARS_TOKENS=lines uv run hash/bench.py
 """
 
 import argparse
@@ -223,7 +223,7 @@ Examples:
   %(prog)s --dataset README.md --tokens lines
 
   # Test only specific hash functions
-  %(prog)s --dataset data.txt --tokens lines -k "xxhash|stringzilla"
+  %(prog)s --dataset README.md --tokens lines -k "xxhash|stringzilla"
 
   # Compare stateless vs stateful hashing
   %(prog)s --dataset large.txt --tokens words -k "hash"
