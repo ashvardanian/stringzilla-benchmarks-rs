@@ -1,0 +1,124 @@
+// Zed workspace settings for StringWars, mirroring rustfmt.toml, pyproject.toml,
+// and the repo's Markdown conventions.
+{
+    // Languages Zed doesn't ship built-in.
+    "auto_install_extensions": {
+        "toml": true
+    },
+    // Keep the project panel, search, and file-watcher out of the heavy dirs.
+    // `data` symlinks into the 12 TB share, which the scanner must not walk, and
+    // `.v5venv` holds the locally built StringZilla the Python benches import.
+    "file_scan_exclusions": [
+        "**/.git",
+        "**/target",
+        "**/node_modules",
+        "**/data",
+        "**/unicode",
+        "**/__pycache__",
+        "**/.v5venv",
+        "**/.venv",
+        "**/venv",
+        "**/.cache",
+        "**/.pytest_cache",
+        "**/.ruff_cache",
+        "**/.mypy_cache",
+        "**/tmp",
+        "**/*.log"
+    ],
+    // Matches .editorconfig and rustfmt: 4 spaces, final newline.
+    "format_on_save": "on",
+    "tab_size": 4,
+    "hard_tabs": false,
+    "ensure_final_newline_on_save": true,
+    "remove_trailing_whitespace_on_save": true,
+    // Git panel and outline default to the right dock; keep everything left.
+    "project_panel": {
+        "dock": "left"
+    },
+    "git_panel": {
+        "dock": "left"
+    },
+    "outline_panel": {
+        "dock": "left"
+    },
+    "lsp": {
+        // Every bench is its own `[[bench]]` behind a feature, so analysis needs
+        // all of them enabled or the bench files read as dead code.
+        "rust-analyzer": {
+            "initialization_options": {
+                "cargo": {
+                    "features": "all"
+                },
+                "check": {
+                    "command": "clippy"
+                }
+            }
+        },
+        // Optional native deps aren't always importable in the editor: the
+        // stringzillas GPU wheels in particular.
+        "pyright": {
+            "settings": {
+                "python": {
+                    "analysis": {
+                        "diagnosticSeverityOverrides": {
+                            "reportMissingImports": "none"
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "languages": {
+        "Rust": {
+            "format_on_save": "on"
+        },
+        // ruff formats and sorts imports per pyproject.toml; pyright types.
+        "Python": {
+            "language_servers": [
+                "pyright",
+                "ruff"
+            ],
+            "format_on_save": "on",
+            "formatter": [
+                {
+                    "code_actions": {
+                        "source.organizeImports.ruff": true
+                    }
+                },
+                {
+                    "language_server": {
+                        "name": "ruff"
+                    }
+                }
+            ]
+        },
+        // YAML at 2 spaces per .editorconfig.
+        "YAML": {
+            "tab_size": 2,
+            "prettier": {
+                "single_quote": true,
+                "tab_width": 2
+            }
+        },
+        // `_` for emphasis and strong keeps remark from rewriting the repo's
+        // __bold__ into asterisks, and `rule` keeps thematic breaks as `---`.
+        // --no-install pins to the repo-local node_modules that package.json
+        // declares, so run `npm install` once before saving Markdown.
+        "Markdown": {
+            "formatter": {
+                "external": {
+                    "command": "npx",
+                    "arguments": [
+                        "--no-install",
+                        "remark",
+                        "--quiet",
+                        "--use",
+                        "remark-gfm",
+                        "-s",
+                        "emphasis:'_',strong:'_',bullet:'-',rule:'-'"
+                    ]
+                }
+            }
+        }
+    }
+}

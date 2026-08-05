@@ -36,7 +36,7 @@ Measured on the full Leipzig corpora (`STRINGWARS_TOKENS=file`), single-threaded
 | Ukrainian 🇺🇦  |    69 MB/s |     1.23 GB/s |  18x |   203 MB/s |      283 MB/s |   1x |
 | Vietnamese 🇻🇳 |    86 MB/s |     1.25 GB/s |  15x |   155 MB/s |      255 MB/s |   2x |
 
-> Measured June 17, 2026 on an Intel Xeon4 Sapphire Rapids.
+> Measured June 17, 2026.
 
 ### AMD Zen5 Turin
 
@@ -85,6 +85,8 @@ done
 
 ## Case-Insensitive Substring Search
 
+### Intel Xeon4 Sapphire Rapids
+
 | Language     | Standard 🦀 | StringZilla 🦀 |      | Standard 🐍 | StringZilla 🐍 |      |
 | ------------ | ---------: | ------------: | ---: | ---------: | ------------: | ---: |
 | Arabic 🇸🇦     |   103 MB/s |     7.24 GB/s |  70x |  3.01 GB/s |    14.78 GB/s |   5x |
@@ -112,7 +114,7 @@ done
 | Ukrainian 🇺🇦  |    97 MB/s |     2.97 GB/s |  31x |  2.26 GB/s |     5.35 GB/s |   2x |
 | Vietnamese 🇻🇳 |    76 MB/s |     5.06 GB/s |  67x |  1.07 GB/s |     1.12 GB/s |   1x |
 
-> Measured June 17, 2026 on an Intel Xeon4 Sapphire Rapids.
+> Measured June 17, 2026.
 
 To rerun the benchmarks for all languages:
 

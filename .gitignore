@@ -17,3 +17,6 @@ __pycache__
 .cargo/
 data/*
 !data/.gitkeep
+node_modules/
+# Markdown formatter only; nothing measured depends on its exact version
+package-lock.json

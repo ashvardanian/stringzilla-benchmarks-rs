@@ -26,7 +26,7 @@ That's true not only for strings but for any data type, and StringZilla has been
 | `pycryptodome.AES-CTR`         |     0.01 GB/s |      0.37 GB/s |
 | `stringzilla.random`           | __0.11 GB/s__ | __18.46 GB/s__ |
 
-> Measured June 17, 2026 on an Intel Xeon4 Sapphire Rapids.
+> Measured June 17, 2026.
 
 ## Lookup Tables
 
@@ -48,7 +48,7 @@ Performing in-place lookups in a precomputed table of 256 bytes:
 | `stringzilla.translate<new>`     |     0.09 GB/s |      7.94 GB/s |
 | `stringzilla.translate<inplace>` |     0.07 GB/s |  __8.02 GB/s__ |
 
-> Measured June 17, 2026 on an Intel Xeon4 Sapphire Rapids.
+> Measured June 17, 2026.
 
 ---
 

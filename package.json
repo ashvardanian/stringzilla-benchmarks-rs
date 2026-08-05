@@ -1,0 +1,12 @@
+{
+  "name": "stringwars",
+  "private": true,
+  "description": "Markdown tooling for the benchmark write-ups",
+  "devDependencies": {
+    "remark-cli": "^12.0.1",
+    "remark-gfm": "^4.0.1"
+  },
+  "scripts": {
+    "format:md": "remark . --quiet --output --use remark-gfm"
+  }
+}

@@ -44,7 +44,7 @@ For the case-folded column every folding sort shares one comparator, StringZilla
 | `polars.Series.arg_sort`       |      31.47 M compares/s |                       — |
 | `numpy.argsort`                |      21.65 M compares/s |                       — |
 
-> Measured June 17, 2026 on an Intel Xeon4 Sapphire Rapids, single-threaded (Polars pinned to one thread), sorting short words from `xlsum.csv`.
+> Measured June 17, 2026, single-threaded (Polars pinned to one thread), sorting short words from `xlsum.csv`.
 
 ---
 

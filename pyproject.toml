@@ -18,14 +18,14 @@ Repository = "https://github.com/ashvardanian/StringWars"
 
 [project.optional-dependencies]
 # Substring/byteset + transforms
-find = ["stringzilla>=4.5.0", "pyahocorasick"]
+find = ["stringzilla>=5.1.0", "pyahocorasick"]
 
 # Sequence ops (split/sort)
-sequence = ["stringzilla>=4.5.0", "numpy", "pandas", "pyarrow", "polars"]
+sequence = ["stringzilla>=5.1.0", "numpy", "pandas", "pyarrow", "polars"]
 
 # Fingerprinting/sketching
 fingerprints = [
-  "stringzilla>=4.5.0",
+  "stringzilla>=5.1.0",
   "stringzillas-cpus",
   "datasketch",
   "numpy",
@@ -34,7 +34,7 @@ fingerprints = [
 
 # Similarities / edit distances
 similarities = [
-  "stringzilla>=4.5.0",
+  "stringzilla>=5.1.0",
   "stringzillas-cpus",
   "jellyfish",
   "python-Levenshtein",
@@ -48,7 +48,8 @@ similarities = [
 
 # Hash functions
 hash = [
-  "stringzilla>=4.5.0",
+  "stringzilla>=5.1.0",
+  "numpy",
   "xxhash",
   "blake3",
   "google-crc32c",
@@ -57,19 +58,19 @@ hash = [
 ]
 
 # Random byte generators and translation tables
-memory = ["stringzilla>=4.5.0", "numpy", "pycryptodome", "opencv-python"]
+memory = ["stringzilla>=5.1.0", "numpy", "pycryptodome", "opencv-python"]
 
 # UTF-8 tokenization / iteration (whitespace, newline, TR29 words, codepoints)
-tokenization = ["stringzilla>=4.5.0", "regex", "PyICU"]
+tokenization = ["stringzilla>=5.1.0", "regex", "PyICU"]
 
 # Case folding + Unicode normalization
-normalization = ["stringzilla>=4.5.0", "regex", "PyICU"]
+normalization = ["stringzilla>=5.1.0", "regex", "PyICU"]
 
 # Multi-way hashing + probabilistic membership
-containers = ["stringzilla>=4.5.0", "pyprobables", "xxhash", "numpy"]
+containers = ["stringzilla>=5.1.0", "pyprobables", "xxhash", "numpy"]
 
 # AEAD encryption/decryption (ChaCha20-Poly1305, AES-256-GCM)
-encryption = ["cryptography", "pycryptodome", "pynacl"]
+encryption = ["stringzilla>=5.1.0", "cryptography", "pycryptodome", "pynacl"]
 
 [tool.ruff]
 # Enforce 120-column lines across formatting and linting

@@ -25,7 +25,7 @@ The C standard library is, however, also implemented by humans, and a better sol
 | `str.find`             |          0.73 GB/s |         1.14 GB/s |
 | `stringzilla.Str.find` |      __3.37 GB/s__ |    __11.64 GB/s__ |
 
-> Measured June 17, 2026 on an Intel Xeon4 Sapphire Rapids.
+> Measured June 17, 2026.
 
 ### Reverse Search
 
@@ -46,7 +46,7 @@ Still, those are provided by StringZilla mostly for parsing tasks and feature pa
 | `str.rfind`             |          1.39 GB/s |         3.80 GB/s |
 | `stringzilla.Str.rfind` |      __7.76 GB/s__ |    __11.63 GB/s__ |
 
-> Measured June 17, 2026 on an Intel Xeon4 Sapphire Rapids.
+> Measured June 17, 2026.
 
 ## Byte-Set Search
 
@@ -73,7 +73,7 @@ Once that object is constructed, all of its inclusions in each token (word or li
 | `re.finditer`                   |     0.05 GB/s |     0.21 GB/s |
 | `stringzilla.Str.find_first_of` | __0.12 GB/s__ | __9.35 GB/s__ |
 
-> Measured June 17, 2026 on an Intel Xeon4 Sapphire Rapids.
+> Measured June 17, 2026.
 
 ---
 

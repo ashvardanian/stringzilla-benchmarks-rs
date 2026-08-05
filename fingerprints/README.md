@@ -19,7 +19,7 @@ Adjusting all implementations to the same tokenization scheme, one may experienc
 
 Fingerprint throughput is measured at __512 dimensions__.
 
-### Intel Xeon4 Sapphire Rapids
+### Intel Xeon4 Sapphire Rapids & NVIDIA H100
 
 | Library                              |  ~100 bytes lines | ~1,000 bytes lines |
 | ------------------------------------ | ----------------: | -----------------: |
@@ -37,7 +37,7 @@ Fingerprint throughput is measured at __512 dimensions__.
 |                                      | 64.64% collisions |  48.30% collisions |
 |                                      |    0.9980 entropy |     0.9977 entropy |
 
-> Measured June 17, 2026 on an Intel Xeon4 Sapphire Rapids with an NVIDIA H100.
+> Measured June 17, 2026.
 
 ## Quality Analysis
 

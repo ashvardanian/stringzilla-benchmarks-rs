@@ -33,7 +33,7 @@ Every value is independent and each variant writes into one preallocated buffer 
 | `stringzilla.hash`            |     300.58 M bits/s |    380.23 M bits/s |    458.91 M bits/s |    506.59 M bits/s |
 | `stringzilla.hash_multiseed`  | __860.00 M bits/s__ |  __1.67 G bits/s__ |  __3.37 G bits/s__ |  __6.48 G bits/s__ |
 
-> Measured June 17, 2026 on an Intel Xeon4 Sapphire Rapids, single-threaded, hashing short words from `xlsum.csv`.
+> Measured June 17, 2026, single-threaded, hashing short words from `xlsum.csv`.
 
 The multi-seed path prepares the input once and replays cheap per-seed rounds, so its throughput climbs almost linearly with the digest width while the naive variants plateau — StringZilla's own `hash` flattens near 22 G bits/s because it re-prepares the key every 64 bits.
 `xxh3_128` keeps its full 128-bit output, so it re-prepares only every 128 bits and overtakes `stringzilla::hash` once the digest reaches 512 bits, but it never catches `hash_multiseed`.
@@ -58,7 +58,7 @@ Each filter is compared StringZilla-fed against its practical default with the s
 | `pyprobables<fnv>`               |     0.08 M keys/s |      0.09 M keys/s | 9.59 bits/key | 1.032% |
 | `pyprobables<stringzilla>`       | __0.40 M keys/s__ |  __0.40 M keys/s__ | 9.59 bits/key | 0.978% |
 
-> Measured June 17, 2026 on an Intel Xeon4 Sapphire Rapids, single-threaded, over `xlsum.csv` words at a 1% target false-positive rate.
+> Measured June 17, 2026, single-threaded, over `xlsum.csv` words at a 1% target false-positive rate.
 
 Feeding StringZilla helps exactly where the filter accepts a precomputed hash.
 In Rust, `fastbloom`'s `insert_hash` / `contains_hash` take a single `sz::hash` and expand it internally, roughly doubling build and query throughput at identical bits-per-key and FPR, and `xorf` — built from a deduplicated `u64` array — queries faster with StringZilla keys.

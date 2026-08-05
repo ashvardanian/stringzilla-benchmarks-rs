@@ -26,7 +26,7 @@ stringtape = "2.4.1"
 # `default-features = false` keeps StringZilla's `dynamic-dispatch` feature OFF, so the SIMD backend
 # is resolved at compile time (static dispatch) rather than via a per-call indirection. This is the
 # fair default for these latency-sensitive benchmarks; do not add `stringzilla/dynamic-dispatch`.
-stringzilla = { version = "5.0.0", default-features = false }
+stringzilla = { version = "5.1.0", default-features = false }
 
 # Feature-based dependencies for benchmarks
 [features]
