@@ -454,8 +454,8 @@ def tokenize_dataset(
 def resolve_tokens(cli_value: str | None, default: str) -> str:
     """Resolve the token granularity with precedence: an explicit --tokens flag wins, then the
     STRINGWARS_TOKENS environment variable, then the bench's own default. Each bench passes the
-    granularity its kernel measures (e.g. "words" for hashing/similarity, "lines" for
-    normalization/fingerprinting), matching the Rust `load_dataset_with_default_mode`.
+    granularity its kernel measures (e.g. "words" for similarity, "lines" for hashing,
+    normalization and fingerprinting), matching the Rust `load_dataset_with_default_mode`.
     """
     if cli_value is not None:
         return cli_value

@@ -18,7 +18,7 @@ hash/bench.rs implementation, focusing on three categories of hashing patterns.
 Benchmark categories:
 - Stateless: Hash each token independently (non-cryptographic)
 - Stateful: Incremental hashing across all tokens (non-cryptographic)
-- Checksum: Cryptographic hashes and reference bounds
+- Crypto: SHA256 across backends, and the reference bounds they are read against
 
 Hash functions compared:
 - Built-in Python: hash()
@@ -39,6 +39,7 @@ Examples:
 
 import argparse
 import hashlib
+import math
 import re
 import sys
 from collections.abc import Callable
@@ -49,6 +50,7 @@ import blake3
 import cityhash
 import google_crc32c
 import mmh3
+import numpy as np
 import stringzilla as sz
 import xxhash
 
@@ -74,6 +76,92 @@ def log_system_info():
     print(f"- mmh3: {pkg_version('mmh3')}")
     print(f"- cityhash: {pkg_version('cityhash')}")
     print()  # Add blank line
+
+
+SHA256_LANES = 16
+"""How many messages the multi-state SHA256 hasher advances together, one per lane."""
+
+SHA256_BATCHES_PER_WINDOW = 64
+"""How many consecutive batches one window covers."""
+
+
+def stride_coprime_to(count: int) -> int:
+    """
+    Pick a stride coprime to `count`, near the golden-ratio fraction of it, so repeatedly stepping by
+    it visits every index once before repeating and samples the whole range early.
+    """
+    if count <= 2:
+        return 1
+    stride = int(count * 0.6180339887) | 1
+    while stride > 1 and math.gcd(stride, count) != 1:
+        stride -= 2
+    return max(stride, 1)
+
+
+def walk_batches(batches_count: int):
+    """
+    Yield batch indices, stepping whole windows on a stride coprime to the window count and walking
+    each window front to back.
+
+    The budget expires long before a full pass over a corpus of this size, and on length-ordered
+    tokens a forward walk would spend all of it among the shortest. The stride reaches every length,
+    while the run inside a window keeps the reads contiguous: striding one batch at a time would
+    scatter reads across the corpus and report the cache rather than the kernel.
+    """
+    windows_count = math.ceil(batches_count / SHA256_BATCHES_PER_WINDOW)
+    stride = stride_coprime_to(windows_count)
+    for windows_visited in range(windows_count):
+        window_index = (windows_visited * stride) % windows_count
+        for batch_in_window in range(SHA256_BATCHES_PER_WINDOW):
+            yield (window_index * SHA256_BATCHES_PER_WINDOW + batch_in_window) % batches_count
+
+
+def bench_batched_sha256(
+    name: str,
+    tokens: list[bytes],
+    time_limit_seconds: float = 10.0,
+    sorted_by_length: bool = False,
+) -> None:
+    """
+    Benchmark SHA256 over whole batches of tokens, one lane per token, and report throughput.
+
+    Hashing one message is a serial dependency chain that bounds the per-token row however wide the
+    machine is. Independent messages compress in parallel lanes instead. The batches, their byte
+    counts, the lane hashers and the digest matrix are built up front, so the row reports the kernel
+    rather than Python object churn.
+
+    A batch retires when its longest member does, so `sorted_by_length` groups tokens of near-equal
+    length into each batch, where the default takes them in dataset order.
+    """
+    if len(tokens) < SHA256_LANES:
+        return
+
+    if sorted_by_length:
+        tokens = sorted(tokens, key=len)
+
+    batches = [tokens[start : start + SHA256_LANES] for start in range(0, len(tokens) - SHA256_LANES + 1, SHA256_LANES)]
+    batch_bytes = [sum(len(token) for token in batch) for batch in batches]
+    lane_hashers = sz.Sha256s(SHA256_LANES)
+    digests = np.empty((SHA256_LANES, sz.Sha256.digest_length), np.uint8)
+    visits = walk_batches(len(batches))
+
+    start_time = now_nanoseconds()
+    deadline_nanoseconds = start_time + int(time_limit_seconds * 1e9)
+
+    processed_tokens = 0
+    processed_bytes = 0
+
+    for batch, bytes_in_batch in paced_items(
+        ((batches[index], batch_bytes[index]) for index in visits), deadline_nanoseconds
+    ):
+        lane_hashers.reset().update(batch).digest(out=digests)
+        processed_tokens += SHA256_LANES
+        processed_bytes += bytes_in_batch
+
+    end_time = now_nanoseconds()
+
+    seconds = (end_time - start_time) / 1e9
+    report_stats(name, "bytes", seconds, processed_tokens, processed_bytes)
 
 
 def bench_hash_function(
@@ -191,29 +279,35 @@ def run_stateful_benchmarks(
         bench_stateful_hash("google_crc32c.Checksum", tokens, lambda: google_crc32c.Checksum(), time_limit_seconds)
 
 
-def run_checksum_benchmarks(
+def run_crypto_benchmarks(
     tokens: list[bytes],
     filter_pattern: re.Pattern | None = None,
     time_limit_seconds: float = 10.0,
 ):
-    """Run checksum/cryptographic hash benchmarks."""
-    print("\nChecksum Hash Benchmarks")
+    """Run SHA256 benchmarks and the reference bounds they are read against."""
+    print("\nCryptographic Hash Benchmarks")
 
     # StringZilla bytesum - reference lower bound
-    if should_run("checksum/stringzilla.bytesum", filter_pattern):
+    if should_run("reference/stringzilla.bytesum", filter_pattern):
         bench_hash_function("stringzilla.bytesum", tokens, lambda x: sz.bytesum(x), time_limit_seconds)
 
     # Blake3 - cryptographic hash
-    if should_run("checksum/blake3.blake3", filter_pattern):
+    if should_run("reference/blake3.blake3", filter_pattern):
         bench_hash_function("blake3.blake3", tokens, lambda x: blake3.blake3(x).digest(), time_limit_seconds)
 
     # SHA256 via hashlib (Python standard library)
-    if should_run("checksum/hashlib.sha256", filter_pattern):
+    if should_run("crypto/hashlib.sha256", filter_pattern):
         bench_hash_function("hashlib.sha256", tokens, lambda x: hashlib.sha256(x).digest(), time_limit_seconds)
 
     # SHA256 via StringZilla
-    if should_run("checksum/stringzilla.Sha256", filter_pattern):
+    if should_run("crypto/stringzilla.Sha256", filter_pattern):
         bench_hash_function("stringzilla.Sha256", tokens, lambda x: sz.Sha256().update(x).digest(), time_limit_seconds)
+
+    # SHA256 over whole batches, one lane per token, in dataset order and in length order
+    if should_run("crypto/stringzilla.Sha256s", filter_pattern):
+        bench_batched_sha256("stringzilla.Sha256s", tokens, time_limit_seconds)
+    if should_run("crypto/stringzilla.Sha256s<sorted>", filter_pattern):
+        bench_batched_sha256("stringzilla.Sha256s<sorted>", tokens, time_limit_seconds, sorted_by_length=True)
 
 
 _main_epilog = """
@@ -255,7 +349,10 @@ def main():
 
     # Load and tokenize dataset
     dataset = load_dataset(args.dataset, as_bytes=True, size_limit=args.dataset_limit)
-    tokens_mode = resolve_tokens(args.tokens, "words")
+    # Lines rather than words: a word is around five bytes, so every hash is one padding block and the
+    # row measures call overhead instead of the compression function. Article-length lines from a corpus
+    # like XLSum span several blocks, which is where the kernels differ.
+    tokens_mode = resolve_tokens(args.tokens, "lines")
     tokens = tokenize_dataset(dataset, tokens_mode)
 
     if not tokens:
@@ -271,7 +368,7 @@ def main():
     # Run benchmarks
     run_stateless_benchmarks(tokens, filter_pattern, args.time_limit)
     run_stateful_benchmarks(tokens, filter_pattern, args.time_limit)
-    run_checksum_benchmarks(tokens, filter_pattern, args.time_limit)
+    run_crypto_benchmarks(tokens, filter_pattern, args.time_limit)
 
     return 0
 

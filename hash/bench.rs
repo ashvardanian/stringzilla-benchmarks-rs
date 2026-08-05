@@ -59,10 +59,13 @@ To run the benchmarks with the appropriate CPU features enabled, you can use the
 
 ```sh
 RUSTFLAGS="-C target-cpu=native" \
-    STRINGWARS_DATASET=README.md \
+    STRINGWARS_DATASET=data/xlsum/xlsum.csv \
     STRINGWARS_TOKENS=lines \
     cargo bench --features bench_hash --bench bench_hash
 ```
+
+`lines` is the default mode here, and a corpus of article-length rows such as XLSum is the one to reach for.
+Word-tokenized input makes every row shorter than a single 64-byte block, so the whole benchmark measures per-call overhead and the padding block, and never reaches the compression loop the backends actually differ in.
 
 Note: `cityhash` is only compiled on x86_64 targets as it requires x86-specific instructions.
 "#]
@@ -79,7 +82,6 @@ use sha2::{Digest, Sha256};
 use stringzilla::sz;
 use wyhash::wyhash;
 use xxhash_rust::xxh3::xxh3_64;
-
 
 #[path = "../utils.rs"]
 mod utils;
@@ -295,8 +297,103 @@ fn bench_stateless(budget: &BenchBudget, tokens: &BytesCowsAuto) {
     }
 }
 
-/// Benchmarks checksum hashes including cryptographic hashes and reference bounds.
-fn bench_checksum(budget: &BenchBudget, tokens: &BytesCowsAuto) {
+/// Picks a stride coprime to `count`, near the golden-ratio fraction of it, so repeatedly stepping
+/// by it visits every index once before repeating and samples the whole range early.
+fn stride_coprime_to(count: usize) -> usize {
+    fn greatest_common_divisor(first: usize, second: usize) -> usize {
+        if second == 0 {
+            first
+        } else {
+            greatest_common_divisor(second, first % second)
+        }
+    }
+
+    if count <= 2 {
+        return 1;
+    }
+    let mut stride = ((count as f64) * 0.6180339887) as usize | 1;
+    while stride > 1 && greatest_common_divisor(stride, count) != 1 {
+        stride -= 2;
+    }
+    stride.max(1)
+}
+
+/// How many messages the multi-state SHA256 hasher advances together, one per lane.
+const SHA256_LANES: usize = 16;
+
+/// How many consecutive batches one window covers.
+const SHA256_BATCHES_PER_WINDOW: usize = 64;
+
+/// Hands out the first token index of each successive batch, stepping whole windows on a stride
+/// coprime to the window count and walking each window front to back.
+///
+/// The budget expires long before a full pass over a corpus of this size, and on length-ordered
+/// tokens a forward walk would spend all of it among the shortest. The stride reaches every length,
+/// while the run inside a window keeps the reads contiguous: striding one batch at a time would
+/// scatter reads across the corpus and report the cache rather than the kernel.
+struct BatchWalker {
+    batches_count: usize,
+    windows_count: usize,
+    stride: usize,
+    windows_visited: usize,
+    batch_in_window: usize,
+}
+
+impl BatchWalker {
+    fn new(tokens_count: usize) -> Self {
+        let batches_count = tokens_count / SHA256_LANES;
+        let windows_count = batches_count.div_ceil(SHA256_BATCHES_PER_WINDOW);
+        Self {
+            batches_count,
+            windows_count,
+            stride: stride_coprime_to(windows_count),
+            windows_visited: 0,
+            batch_in_window: 0,
+        }
+    }
+
+    fn next_batch_start(&mut self) -> usize {
+        if self.batch_in_window == SHA256_BATCHES_PER_WINDOW {
+            self.batch_in_window = 0;
+            self.windows_visited += 1;
+        }
+        let window_index = self.windows_visited.wrapping_mul(self.stride) % self.windows_count;
+        let batch_index =
+            (window_index * SHA256_BATCHES_PER_WINDOW + self.batch_in_window) % self.batches_count;
+        self.batch_in_window += 1;
+        batch_index * SHA256_LANES
+    }
+}
+
+/// Times SHA256 over a whole batch at once, one lane per token. Hashing one message is a serial
+/// dependency chain that bounds the per-token rows however wide the machine is; independent
+/// messages compress in parallel lanes instead.
+///
+/// A batch retires when its longest member does, so the caller decides whether `tokens` arrives in
+/// dataset order or length order, and the distance between those two rows is what length skew costs.
+fn bench_lane_batches(name: &str, budget: &BenchBudget, tokens: &[&[u8]]) {
+    if tokens.len() < SHA256_LANES {
+        return;
+    }
+    let mut walker = BatchWalker::new(tokens.len());
+    let initial_hasher = sz::Sha256::new();
+    let mut lane_hashers = vec![initial_hasher; SHA256_LANES];
+    let mut digests = vec![[0u8; sz::SHA256_DIGEST_LENGTH]; SHA256_LANES];
+    measure_throughput(name, ReportAs::Bytes, budget, || {
+        let first_token = walker.next_batch_start();
+        let batch = &tokens[first_token..first_token + SHA256_LANES];
+
+        lane_hashers.fill(initial_hasher);
+        sz::sha256_multistate_update(&mut lane_hashers, black_box(batch)).unwrap();
+        sz::sha256_multistate_digest(&lane_hashers, &mut digests).unwrap();
+
+        let bytes: u64 = batch.iter().map(|token| token.len() as u64).sum();
+        WorkUnits::new(SHA256_LANES as u64, bytes)
+    });
+}
+
+/// Benchmarks cryptographic hashes, plus the reference bounds they are read against.
+fn bench_crypto(budget: &BenchBudget, tokens: &BytesCowsAuto) {
     let enable_collision_detection = get_env_bool("STRINGWARS_COLLISIONS");
     let unique_tokens: Vec<&[u8]> = if enable_collision_detection {
         let unique_set: HashSet<&[u8]> = tokens.iter().collect();
@@ -318,16 +415,16 @@ fn bench_checksum(budget: &BenchBudget, tokens: &BytesCowsAuto) {
     let view = tokens_tape.view();
     let slices: Vec<&[u8]> = (&view).into_iter().collect();
 
-    // Benchmark: StringZilla `bytesum` reference lower bound
-    bench_each_token("checksum/stringzilla::bytesum", budget, &slices, |token| {
+    // Benchmark: StringZilla `bytesum`, the floor a 64-bit pass over the bytes cannot beat
+    bench_each_token("reference/stringzilla::bytesum", budget, &slices, |token| {
         let _ = black_box(sz::bytesum(token));
     });
 
-    // Benchmark: Blake3 - cryptographic hash
-    bench_each_token("checksum/blake3::hash", budget, &slices, |token| {
+    // Benchmark: Blake3, a different construction with its own security argument
+    bench_each_token("reference/blake3::hash", budget, &slices, |token| {
         let _ = black_box(blake3::hash(token));
     });
-    if !unique_tokens.is_empty() && should_run("checksum/blake3::hash") {
+    if !unique_tokens.is_empty() && should_run("reference/blake3::hash") {
         print_collision_rate(&unique_tokens, |token_bytes| {
             let hash = blake3::hash(token_bytes);
             let bytes = hash.as_bytes();
@@ -338,12 +435,12 @@ fn bench_checksum(budget: &BenchBudget, tokens: &BytesCowsAuto) {
     }
 
     // Benchmark: SHA256 via sha2
-    bench_each_token("checksum/sha2::Sha256", budget, &slices, |token| {
+    bench_each_token("crypto/sha2::Sha256", budget, &slices, |token| {
         let mut hasher = Sha256::new();
         hasher.update(token);
         let _ = black_box(hasher.finalize());
     });
-    if !unique_tokens.is_empty() && should_run("checksum/sha2::Sha256") {
+    if !unique_tokens.is_empty() && should_run("crypto/sha2::Sha256") {
         print_collision_rate(&unique_tokens, |token_bytes| {
             let mut hasher = Sha256::new();
             hasher.update(token_bytes);
@@ -356,10 +453,10 @@ fn bench_checksum(budget: &BenchBudget, tokens: &BytesCowsAuto) {
     }
 
     // Benchmark: SHA256 via ring
-    bench_each_token("checksum/ring::SHA256", budget, &slices, |token| {
+    bench_each_token("crypto/ring::SHA256", budget, &slices, |token| {
         let _ = black_box(ring_digest::digest(&ring_digest::SHA256, token));
     });
-    if !unique_tokens.is_empty() && should_run("checksum/ring::SHA256") {
+    if !unique_tokens.is_empty() && should_run("crypto/ring::SHA256") {
         print_collision_rate(&unique_tokens, |token_bytes| {
             let digest = ring_digest::digest(&ring_digest::SHA256, token_bytes);
             let bytes = digest.as_ref();
@@ -370,10 +467,10 @@ fn bench_checksum(budget: &BenchBudget, tokens: &BytesCowsAuto) {
     }
 
     // Benchmark: SHA256 via stringzilla
-    bench_each_token("checksum/stringzilla::Sha256", budget, &slices, |token| {
+    bench_each_token("crypto/stringzilla::Sha256", budget, &slices, |token| {
         let _ = black_box(sz::Sha256::hash(token));
     });
-    if !unique_tokens.is_empty() && should_run("checksum/stringzilla::Sha256") {
+    if !unique_tokens.is_empty() && should_run("crypto/stringzilla::Sha256") {
         print_collision_rate(&unique_tokens, |token_bytes| {
             let digest = sz::Sha256::hash(token_bytes);
             u64::from_le_bytes([
@@ -382,6 +479,16 @@ fn bench_checksum(budget: &BenchBudget, tokens: &BytesCowsAuto) {
             ])
         });
     }
+
+    // Benchmark: SHA256 over whole batches, in dataset order and in length order
+    bench_lane_batches("crypto/stringzilla::Sha256s", budget, &slices);
+    let mut sorted_by_length: Vec<&[u8]> = slices.clone();
+    sorted_by_length.sort_unstable_by_key(|token| token.len());
+    bench_lane_batches(
+        "crypto/stringzilla::Sha256s<sorted>",
+        budget,
+        &sorted_by_length,
+    );
 
     if !unique_tokens.is_empty() {
         println!();
@@ -478,7 +585,10 @@ fn main() {
     log_stringzilla_metadata();
 
     // Load the dataset defined by the environment variables.
-    let tape = load_dataset_with_default_mode("words").unwrap_nice();
+    // Lines rather than words: a word is around five bytes, so every hash is one padding block and the
+    // row measures call overhead instead of the compression function. Article-length lines from a corpus
+    // like XLSum span several blocks, which is where the kernels differ.
+    let tape = load_dataset_with_default_mode("lines").unwrap_nice();
 
     let budget = BenchBudget::from_env(2.0, 10.0);
 
@@ -488,6 +598,6 @@ fn main() {
     println!("# stateful");
     bench_stateful(&budget, &tape);
 
-    println!("# checksum");
-    bench_checksum(&budget, &tape);
+    println!("# crypto");
+    bench_crypto(&budget, &tape);
 }
