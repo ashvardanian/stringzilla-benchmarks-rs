@@ -4,6 +4,7 @@
 #   "cryptography",
 #   "pycryptodome",
 #   "pynacl",
+#   "stringzilla",
 # ]
 # ///
 """
@@ -11,7 +12,10 @@ AEAD encryption/decryption benchmarks in Python, mirroring encryption/bench.rs.
 
 Both files compare the two AEAD ciphers that dominate TLS 1.3 and the Noise framework — AES-256-GCM
 (hardware-accelerated) and ChaCha20-Poly1305 (software-optimized) — across the common Python crypto
-libraries: `cryptography` (OpenSSL backend), `pycryptodome`, and `pynacl` (libsodium).
+libraries: `cryptography` (OpenSSL backend), `pycryptodome`, `pynacl` (libsodium), and `stringzilla`.
+
+StringZilla also contributes an AES-256-CTR row. Counter mode is unauthenticated, so it is not
+comparable to the AEAD rows on security, only on what the cipher costs without a tag to accumulate.
 
 Throughput is reported in bytes/s over the plaintext, encrypting/decrypting one token per call.
 
@@ -30,6 +34,7 @@ import sys
 from collections.abc import Callable
 
 import nacl.bindings as libsodium
+import stringzilla as sz
 from Crypto.Cipher import AES, ChaCha20_Poly1305
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 
@@ -147,12 +152,34 @@ def pynacl_chacha():
     )
 
 
+def stringzilla_aesgcm():
+    key = sz.Aes256GcmKey(KEY)
+    return (
+        "stringzilla.Aes256GcmKey",
+        lambda d, n: key.encrypt(d, n),
+        lambda b, n: key.decrypt(b[0], n, b[1]),
+    )
+
+
+def stringzilla_aesctr():
+    # Counter mode is unauthenticated, so this row is not comparable to the AEAD ones on security.
+    # It is its own inverse, which is why one call serves both directions.
+    key = sz.Aes256CtrKey(KEY)
+    return (
+        "stringzilla.Aes256CtrKey",
+        lambda d, n: key.xor(d, n),
+        lambda b, n: key.xor(b, n),
+    )
+
+
 CIPHERS = [
     cryptography_aesgcm,
     cryptography_chacha,
     pycryptodome_aesgcm,
     pycryptodome_chacha,
     pynacl_chacha,
+    stringzilla_aesgcm,
+    stringzilla_aesctr,
 ]
 
 
