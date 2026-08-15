@@ -33,7 +33,8 @@ throughput is reported in CUPS (Cell Updates Per Second). This mirrors the Rust 
 - BioPython: PairwiseAligner baseline (unary match/mismatch scoring)
 - cuDF: GPU-accelerated edit distance (optional)
 
-Environment variables (identical to bench.rs / the C++ harness):
+Common environment variables mirror bench.rs / the C++ harness; the bounded-only controls are
+specific to this Python benchmark:
 - STRINGWARS_DATASET: Path to the input dataset file
 - STRINGWARS_TOKENS: Tokenization mode ('lines', 'words', 'file')
 - STRINGWARS_MAX_TOKENS: Limit on the number of tokens loaded
@@ -44,12 +45,8 @@ Environment variables (identical to bench.rs / the C++ harness):
 - STRINGWARS_FILTER: Regex selecting which benchmark variants run
 - STRINGWARS_WITHIN_K: Comma-separated bounds for the `within_k` category (default: "1,2,4")
 - STRINGWARS_WITHIN_CANDIDATES: Candidate construction for `within_k`: 'random' (default,
-  reject-heavy natural mix), 'mutated' (each candidate is a within-bound mutation of its query,
-  accept-heavy worst case), or 'both'
-- STRINGWARS_WITHIN_CDIST_SIDE: Matrix side for the batched rapidfuzz cdist baselines
-  (default: 4096). cdist has a large fixed per-call cost (numpy dispatch, worker pool), so at the
-  tiny baseline side it measures overhead, not throughput — a fair batched comparison needs a
-  matrix big enough to amortize it
+  reject-heavy natural mix), 'sparse' (one guaranteed diagonal match per query), 'dense' (all
+  pairs guaranteed within the bound), or 'all'
 
 Every `within_k` (category, bound) pair is verified before benchmarking: the szs boolean matrix on
 a fixed slice is compared cell-by-cell against a byte-level rapidfuzz oracle, and a single mismatch
@@ -657,7 +654,8 @@ def mutate_token(token: str, edits: int, rng: random.Random) -> str:
     """Copy of `token` with `edits` random unit-cost mutations (substitution / insertion / deletion).
 
     The result is guaranteed to differ from `token` and to be within `edits` of it, so pairs built
-    this way always satisfy the `within_k` bound — the accept-heavy worst case for bounded kernels.
+    this way always satisfy the `within_k` bound. In the cross-product workload this guarantees
+    one accepted diagonal pair per query; it does not make the full matrix accept-heavy.
     """
     alphabet = "abcdefghijklmnopqrstuvwxyz"
     mutated = list(token)
@@ -678,26 +676,32 @@ def within_k_candidate_tokens(
     tokens: Sequence,
     side: int,
     bound: int,
-    mutated_candidates: bool,
+    candidate_mode: str,
     rng: random.Random,
 ) -> tuple[list, list]:
     """Disjoint (queries, candidates) token lists for one `within_k` variant.
 
     Random mode takes the disjoint slices ``[0, side)`` and ``[side, 2 * side)`` — the reject-heavy
-    natural mix. Mutated mode derives every candidate from its diagonal query with `bound` edits,
-    so diagonal pairs accept while off-diagonal pairs stay random — a sparse-match scan.
+    natural mix. Sparse mode derives every candidate from its diagonal query with `bound` edits,
+    so diagonal pairs accept while off-diagonal pairs stay random. Dense mode repeats one query and
+    mutates every candidate from it, guaranteeing that every cell accepts.
     """
     query_tokens = list(tokens[0:side])
-    if mutated_candidates:
+    if candidate_mode == "sparse":
         candidate_tokens = [mutate_token(query_tokens[index], bound, rng) for index in range(side)]
+    elif candidate_mode == "dense":
+        query_tokens = [query_tokens[0]] * side
+        candidate_tokens = [mutate_token(query_tokens[0], bound, rng) for _ in range(side)]
     else:
         candidate_tokens = list(tokens[side : 2 * side])
     return query_tokens, candidate_tokens
 
 
-def within_k_candidate_bytes(candidate_tokens: list, byte_lengths: np.ndarray, side: int, mutated: bool) -> np.ndarray:
+def within_k_candidate_bytes(
+    candidate_tokens: list, byte_lengths: np.ndarray, side: int, candidate_mode: str
+) -> np.ndarray:
     """Per-candidate UTF-8 byte counts, recomputed when candidates were mutated."""
-    if not mutated:
+    if candidate_mode == "random":
         return byte_lengths[side : 2 * side]
     return np.fromiter((len(token.encode("utf-8")) for token in candidate_tokens), dtype=np.int64, count=side)
 
@@ -709,8 +713,8 @@ def benchmark_stringzillas_within(
     engine_name: str,
     bound: int,
     byte_lengths: np.ndarray,
-    mutated_candidates: bool,
-    rng: random.Random,
+    candidate_mode: str,
+    seed: int,
     warmup_seconds: float,
     time_limit_seconds: float,
     filter_pattern: re.Pattern | None,
@@ -723,12 +727,16 @@ def benchmark_stringzillas_within(
     pair count ``side * side`` per cross-product.
     """
     for variant in device_variants:
-        full_name = f"{engine_name}_k{bound}{variant.label}"
-        if not should_run(f"{category}/{full_name}", filter_pattern):
+        full_name = f"{engine_name}_k{bound}{variant.label}<{variant.side}^2,reuse>"
+        allocating_name = f"{engine_name}_k{bound}{variant.label}<{variant.side}^2,alloc>"
+        run_reuse = should_run(f"{category}/{full_name}", filter_pattern)
+        run_allocating = should_run(f"{category}/{allocating_name}", filter_pattern)
+        if not run_reuse and not run_allocating:
             continue
 
         side = variant.side
-        query_tokens, candidate_tokens = within_k_candidate_tokens(tokens, side, bound, mutated_candidates, rng)
+        rng = random.Random(f"{seed}:{category}:{bound}:{side}")
+        query_tokens, candidate_tokens = within_k_candidate_tokens(tokens, side, bound, candidate_mode, rng)
         queries = sz.Strs(query_tokens)
         candidates = sz.Strs(candidate_tokens)
 
@@ -743,8 +751,9 @@ def benchmark_stringzillas_within(
             continue
 
         total_pairs = side * side
-        candidate_bytes = within_k_candidate_bytes(candidate_tokens, byte_lengths, side, mutated_candidates)
-        total_bytes = int(byte_lengths[:side].sum()) + int(candidate_bytes.sum())
+        candidate_bytes = within_k_candidate_bytes(candidate_tokens, byte_lengths, side, candidate_mode)
+        query_bytes = np.fromiter((len(token.encode("utf-8")) for token in query_tokens), dtype=np.int64, count=side)
+        total_bytes = int(query_bytes.sum()) + int(candidate_bytes.sum())
         matrix = np.zeros((side, side), dtype=np.bool_)
 
         def compute(engine=engine, queries=queries, candidates=candidates, scope=variant.scope, matrix=matrix):
@@ -757,18 +766,37 @@ def benchmark_stringzillas_within(
             print(f"{full_name}: SKIPPED ({compute_error})")
             continue
 
-        measure_crossproduct(
-            full_name, compute, total_pairs, total_bytes, warmup_seconds, time_limit_seconds, report="comparisons"
-        )
+        if run_reuse:
+            measure_crossproduct(
+                full_name, compute, total_pairs, total_bytes, warmup_seconds, time_limit_seconds, report="comparisons"
+            )
+
+        # RapidFuzz's cdist API allocates its result on every call. Publish an allocation-inclusive
+        # StringZilla row as the direct comparison and keep the reuse row as a separately labelled
+        # steady-state measurement for callers that provide an output buffer.
+        if run_allocating:
+
+            def compute_allocating(engine=engine, queries=queries, candidates=candidates, scope=variant.scope):
+                return engine(queries, candidates, scope)
+
+            measure_crossproduct(
+                allocating_name,
+                compute_allocating,
+                total_pairs,
+                total_bytes,
+                warmup_seconds,
+                time_limit_seconds,
+                report="comparisons",
+            )
 
 
 def benchmark_within_k_baselines(
     tokens: Sequence,
-    baseline_side: int,
+    device_variants: list[DeviceVariant],
     bound: int,
     byte_lengths: np.ndarray,
-    mutated_candidates: bool,
-    rng: random.Random,
+    candidate_mode: str,
+    seed: int,
     category: str,
     warmup_seconds: float,
     time_limit_seconds: float,
@@ -780,9 +808,15 @@ def benchmark_within_k_baselines(
     result to a boolean membership count and throughput is reported in cmp/s, matching the
     StringZilla membership engine.
     """
-    query_tokens, candidate_tokens = within_k_candidate_tokens(tokens, baseline_side, bound, mutated_candidates, rng)
-    candidate_bytes = within_k_candidate_bytes(candidate_tokens, byte_lengths, baseline_side, mutated_candidates)
-    query_bytes = byte_lengths[:baseline_side]
+    baseline_side = device_variants[0].side
+    rng = random.Random(f"{seed}:{category}:{bound}:{baseline_side}")
+    query_tokens, candidate_tokens = within_k_candidate_tokens(tokens, baseline_side, bound, candidate_mode, rng)
+    candidate_bytes = within_k_candidate_bytes(candidate_tokens, byte_lengths, baseline_side, candidate_mode)
+    query_bytes = np.fromiter(
+        (len(token.encode("utf-8")) for token in query_tokens), dtype=np.int64, count=baseline_side
+    )
+    encoded_queries = [token.encode("utf-8") for token in query_tokens]
+    encoded_candidates = [token.encode("utf-8") for token in candidate_tokens]
 
     def run(name: str, scalar_function: Callable[[Any, Any], int]):
         if not should_run(f"{category}/{name}", filter_pattern):
@@ -790,8 +824,8 @@ def benchmark_within_k_baselines(
         measure_pairwise_baseline(
             name,
             scalar_function,
-            query_tokens,
-            candidate_tokens,
+            encoded_queries,
+            encoded_candidates,
             baseline_side,
             query_bytes,
             candidate_bytes,
@@ -804,57 +838,114 @@ def benchmark_within_k_baselines(
 
     if RAPIDFUZZ_AVAILABLE:
 
-        def rapidfuzz_within(first_string: str, second_string: str) -> int:
+        def rapidfuzz_within(first_string: bytes, second_string: bytes) -> int:
             return 1 if rapidfuzz_levenshtein.distance(first_string, second_string, score_cutoff=bound) <= bound else 0
 
-        run(f"rapidfuzz.Levenshtein.distance_k{bound}", rapidfuzz_within)
-    if POLYLEVEN_AVAILABLE:
+        run(f"rapidfuzz.Levenshtein.distance_k{bound}<1cpu,scalar,bytes>", rapidfuzz_within)
+    if POLYLEVEN_AVAILABLE and all(token.isascii() for token in query_tokens + candidate_tokens):
 
         def polyleven_within(first_string: str, second_string: str) -> int:
             return 1 if polyleven.levenshtein(first_string, second_string, bound) <= bound else 0
 
-        run(f"polyleven.levenshtein_k{bound}", polyleven_within)
-
-    # Batched baselines: rapidfuzz's own cross-product (mbleven / banded bit-parallel Myers under
-    # the hood) at a LARGE side — at the tiny baseline side cdist's fixed per-call cost (numpy
-    # dispatch, worker pool spawn) swamps the measurement (~0.3M cmp/s artifact), so a fair batched
-    # comparison needs matrices big enough to amortize the call. Both single-worker and all-core
-    # variants, mirroring the szs <1cpu> / <Ncpu> split; the side is part of the label.
-    if RAPIDFUZZ_AVAILABLE:
-        cdist_side = min(int(os.environ.get("STRINGWARS_WITHIN_CDIST_SIDE", "4096")), len(tokens) // 2)
-        cdist_queries, cdist_candidates = within_k_candidate_tokens(tokens, cdist_side, bound, mutated_candidates, rng)
-        total_pairs = cdist_side * cdist_side
-        cdist_candidate_bytes = within_k_candidate_bytes(cdist_candidates, byte_lengths, cdist_side, mutated_candidates)
-        total_bytes = int(byte_lengths[:cdist_side].sum()) + int(cdist_candidate_bytes.sum())
-
-        for workers, label in ((1, "1cpu"), (-1, "allcpu")):
-            name = f"rapidfuzz.process.cdist_k{bound}<{label},{cdist_side}^2>"
+        # polyleven accepts text rather than arbitrary byte strings. It is comparable only for
+        # ASCII inputs, where codepoint and UTF-8 byte semantics coincide.
+        def run_polyleven(name: str):
             if not should_run(f"{category}/{name}", filter_pattern):
-                continue
+                return
+            measure_pairwise_baseline(
+                name,
+                polyleven_within,
+                query_tokens,
+                candidate_tokens,
+                baseline_side,
+                query_bytes,
+                candidate_bytes,
+                query_bytes,
+                candidate_bytes,
+                warmup_seconds,
+                time_limit_seconds,
+                report="comparisons",
+            )
 
-            def compute(workers=workers):
-                rapidfuzz_cdist(
+        run_polyleven(f"polyleven.levenshtein_k{bound}<ASCII>")
+
+    # Batched baseline: use the exact same deterministic inputs, dimensions, and CPU scope as each
+    # StringZilla CPU variant. cdist allocates the result, so compare this row to StringZilla's
+    # explicitly labelled `alloc` row rather than its caller-buffer `reuse` row.
+    if RAPIDFUZZ_AVAILABLE:
+        for variant in device_variants:
+            if "gpu" in variant.label:
+                continue
+            cdist_side = variant.side
+            cdist_rng = random.Random(f"{seed}:{category}:{bound}:{cdist_side}")
+            cdist_queries_text, cdist_candidates_text = within_k_candidate_tokens(
+                tokens, cdist_side, bound, candidate_mode, cdist_rng
+            )
+            cdist_queries = [token.encode("utf-8") for token in cdist_queries_text]
+            cdist_candidates = [token.encode("utf-8") for token in cdist_candidates_text]
+            total_pairs = cdist_side * cdist_side
+            cdist_candidate_bytes = within_k_candidate_bytes(
+                cdist_candidates_text, byte_lengths, cdist_side, candidate_mode
+            )
+            cdist_query_bytes = sum(len(token) for token in cdist_queries)
+            total_bytes = cdist_query_bytes + int(cdist_candidate_bytes.sum())
+            workers = 1 if variant.label == "<1cpu>" else -1
+            raw_name = f"rapidfuzz.process.cdist_k{bound}{variant.label}<{cdist_side}^2,uint8-distance>"
+            membership_name = f"rapidfuzz.process.cdist_k{bound}{variant.label}<{cdist_side}^2,bool-membership>"
+
+            def compute_raw(workers=workers, cdist_queries=cdist_queries, cdist_candidates=cdist_candidates):
+                return rapidfuzz_cdist(
                     cdist_queries,
                     cdist_candidates,
                     scorer=rapidfuzz_levenshtein.distance,
                     score_cutoff=bound,
+                    dtype=np.uint8,
                     workers=workers,
                 )
 
-            try:
-                compute()
-            except Exception as compute_error:
-                print(f"{name}: SKIPPED ({compute_error})")
-            else:
-                measure_crossproduct(
-                    name, compute, total_pairs, total_bytes, warmup_seconds, time_limit_seconds, report="comparisons"
-                )
+            if should_run(f"{category}/{raw_name}", filter_pattern):
+                try:
+                    compute_raw()
+                except Exception as compute_error:
+                    print(f"{raw_name}: SKIPPED ({compute_error})")
+                else:
+                    measure_crossproduct(
+                        raw_name,
+                        compute_raw,
+                        total_pairs,
+                        total_bytes,
+                        warmup_seconds,
+                        time_limit_seconds,
+                        report="comparisons",
+                    )
+
+            # This is the like-for-like public result: RapidFuzz's batched API returns cutoff
+            # distances, so include the conversion needed to produce the boolean membership matrix.
+            if should_run(f"{category}/{membership_name}", filter_pattern):
+
+                def compute_membership(compute_raw=compute_raw, bound=bound):
+                    return compute_raw() <= bound
+
+                try:
+                    compute_membership()
+                except Exception as compute_error:
+                    print(f"{membership_name}: SKIPPED ({compute_error})")
+                else:
+                    measure_crossproduct(
+                        membership_name,
+                        compute_membership,
+                        total_pairs,
+                        total_bytes,
+                        warmup_seconds,
+                        time_limit_seconds,
+                        report="comparisons",
+                    )
 
 
 def verify_within_k(
     tokens: Sequence,
     bound: int,
-    mutated_candidates: bool,
+    candidate_mode: str,
     category: str,
     seed: int,
 ) -> None:
@@ -868,7 +959,7 @@ def verify_within_k(
     if verify_side < 2 or not RAPIDFUZZ_AVAILABLE:
         return
     rng = random.Random(f"{seed}:verify:{category}:{bound}")
-    query_tokens, candidate_tokens = within_k_candidate_tokens(tokens, verify_side, bound, mutated_candidates, rng)
+    query_tokens, candidate_tokens = within_k_candidate_tokens(tokens, verify_side, bound, candidate_mode, rng)
     ours = np.asarray(
         szs.LevenshteinWithinK(bound=bound)(sz.Strs(query_tokens), sz.Strs(candidate_tokens)), dtype=np.bool_
     )
@@ -899,9 +990,10 @@ def perform_within_k_benchmarks(
     """Bounded-membership group: szs.LevenshteinWithinK vs cutoff baselines, per bound.
 
     STRINGWARS_WITHIN_K selects the bounds; STRINGWARS_WITHIN_CANDIDATES selects the candidate
-    construction — 'random' (reject-heavy, category `within_k`), 'mutated' (accept-heavy, category
-    `within_k_accepts`), or 'both'. Skipped entirely when the installed stringzillas lacks the
-    LevenshteinWithinK engine.
+    construction — 'random' (reject-heavy, category `within_k`), 'sparse' (one guaranteed
+    diagonal acceptance per query, category `within_k_sparse`), 'dense' (every pair accepted,
+    category `within_k_dense`), or 'all'. Skipped entirely when the installed stringzillas lacks
+    the LevenshteinWithinK engine.
     """
     if not hasattr(szs, "LevenshteinWithinK"):
         print("within_k: SKIPPED (installed stringzillas lacks the LevenshteinWithinK engine)")
@@ -909,26 +1001,28 @@ def perform_within_k_benchmarks(
 
     bounds = parse_within_k_bounds()
     mode = os.environ.get("STRINGWARS_WITHIN_CANDIDATES", "random").strip().lower()
-    mutated_modes = {"random": [False], "mutated": [True], "both": [False, True]}.get(mode)
-    if mutated_modes is None:
-        print(f"within_k: unknown STRINGWARS_WITHIN_CANDIDATES={mode!r}, expected random|mutated|both")
+    candidate_modes = {
+        "random": ["random"],
+        "sparse": ["sparse"],
+        "dense": ["dense"],
+        "all": ["random", "sparse", "dense"],
+    }.get(mode)
+    if candidate_modes is None:
+        print(f"within_k: unknown STRINGWARS_WITHIN_CANDIDATES={mode!r}, expected random|sparse|dense|all")
         return
 
-    for mutated in mutated_modes:
-        category = "within_k_accepts" if mutated else "within_k"
+    for candidate_mode in candidate_modes:
+        category = "within_k" if candidate_mode == "random" else f"within_k_{candidate_mode}"
         for bound in bounds:
             # Oracle first: never benchmark an engine whose matrix disagrees with the reference.
-            verify_within_k(tokens, bound, mutated, category, seed)
-            # Re-seed per (mode, bound) so baselines and the StringZilla engine score the
-            # exact same mutated candidate sets within one bound.
-            rng = random.Random(f"{seed}:{category}:{bound}")
+            verify_within_k(tokens, bound, candidate_mode, category, seed)
             benchmark_within_k_baselines(
                 tokens,
-                device_variants[0].side,
+                device_variants,
                 bound,
                 byte_lengths,
-                mutated,
-                rng,
+                candidate_mode,
+                seed,
                 category,
                 warmup_seconds,
                 time_limit_seconds,
@@ -941,8 +1035,8 @@ def perform_within_k_benchmarks(
                 "stringzillas.LevenshteinWithinK",
                 bound,
                 byte_lengths,
-                mutated,
-                rng,
+                candidate_mode,
+                seed,
                 warmup_seconds,
                 time_limit_seconds,
                 filter_pattern,
