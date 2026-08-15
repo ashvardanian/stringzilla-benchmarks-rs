@@ -727,8 +727,8 @@ def benchmark_stringzillas_within(
     pair count ``side * side`` per cross-product.
     """
     for variant in device_variants:
-        full_name = f"{engine_name}_k{bound}{variant.label}<{variant.side}^2,reuse>"
-        allocating_name = f"{engine_name}_k{bound}{variant.label}<{variant.side}^2,alloc>"
+        full_name = f"{engine_name}_k{bound}[{candidate_mode}]{variant.label}<{variant.side}^2,reuse>"
+        allocating_name = f"{engine_name}_k{bound}[{candidate_mode}]{variant.label}<{variant.side}^2,alloc>"
         run_reuse = should_run(f"{category}/{full_name}", filter_pattern)
         run_allocating = should_run(f"{category}/{allocating_name}", filter_pattern)
         if not run_reuse and not run_allocating:
@@ -841,7 +841,7 @@ def benchmark_within_k_baselines(
         def rapidfuzz_within(first_string: bytes, second_string: bytes) -> int:
             return 1 if rapidfuzz_levenshtein.distance(first_string, second_string, score_cutoff=bound) <= bound else 0
 
-        run(f"rapidfuzz.Levenshtein.distance_k{bound}<1cpu,scalar,bytes>", rapidfuzz_within)
+        run(f"rapidfuzz.Levenshtein.distance_k{bound}[{candidate_mode}]<1cpu,scalar,bytes>", rapidfuzz_within)
     if POLYLEVEN_AVAILABLE and all(token.isascii() for token in query_tokens + candidate_tokens):
 
         def polyleven_within(first_string: str, second_string: str) -> int:
@@ -867,7 +867,7 @@ def benchmark_within_k_baselines(
                 report="comparisons",
             )
 
-        run_polyleven(f"polyleven.levenshtein_k{bound}<ASCII>")
+        run_polyleven(f"polyleven.levenshtein_k{bound}[{candidate_mode}]<ASCII>")
 
     # Batched baseline: use the exact same deterministic inputs, dimensions, and CPU scope as each
     # StringZilla CPU variant. cdist allocates the result, so compare this row to StringZilla's
@@ -890,8 +890,14 @@ def benchmark_within_k_baselines(
             cdist_query_bytes = sum(len(token) for token in cdist_queries)
             total_bytes = cdist_query_bytes + int(cdist_candidate_bytes.sum())
             workers = 1 if variant.label == "<1cpu>" else -1
-            raw_name = f"rapidfuzz.process.cdist_k{bound}{variant.label}<{cdist_side}^2,uint8-distance>"
-            membership_name = f"rapidfuzz.process.cdist_k{bound}{variant.label}<{cdist_side}^2,bool-membership>"
+            raw_name = (
+                f"rapidfuzz.process.cdist_k{bound}[{candidate_mode}]"
+                f"{variant.label}<{cdist_side}^2,uint8-distance>"
+            )
+            membership_name = (
+                f"rapidfuzz.process.cdist_k{bound}[{candidate_mode}]"
+                f"{variant.label}<{cdist_side}^2,bool-membership>"
+            )
 
             def compute_raw(workers=workers, cdist_queries=cdist_queries, cdist_candidates=cdist_candidates):
                 return rapidfuzz_cdist(
@@ -1013,6 +1019,7 @@ def perform_within_k_benchmarks(
 
     for candidate_mode in candidate_modes:
         category = "within_k" if candidate_mode == "random" else f"within_k_{candidate_mode}"
+        print(f"\n## {category}")
         for bound in bounds:
             # Oracle first: never benchmark an engine whose matrix disagrees with the reference.
             verify_within_k(tokens, bound, candidate_mode, category, seed)
