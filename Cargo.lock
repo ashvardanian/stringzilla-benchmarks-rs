@@ -27,6 +27,7 @@ dependencies = [
  "const-random",
  "getrandom 0.3.4",
  "once_cell",
+ "serde",
  "version_check 0.9.5",
  "zerocopy",
 ]
@@ -1690,6 +1691,15 @@ name = "glob"
 version = "0.3.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
+
+[[package]]
+name = "gxhash"
+version = "3.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f3ce1bab7aa741d4e7042b2aae415b78741f267a98a7271ea226cd5ba6c43d7d"
+dependencies = [
+ "rustversion",
+]
 
 [[package]]
 name = "h2"
@@ -4784,6 +4794,7 @@ dependencies = [
  "sodiumoxide",
  "stringtape",
  "stringzilla",
+ "symspell_rs",
  "twox-hash",
  "unicase",
  "unicode-linebreak",
@@ -4867,6 +4878,20 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "symspell_rs"
+version = "6.8.3"
+source = "git+https://github.com/wolfgarbe/symspell_rs.git?rev=df6b21abbb3500b99e9e75857a616ff60f30f50f#df6b21abbb3500b99e9e75857a616ff60f30f50f"
+dependencies = [
+ "ahash",
+ "gxhash",
+ "itertools 0.14.0",
+ "regex",
+ "smallvec",
+ "strsim 0.11.1",
+ "unicode-normalization",
+]
 
 [[package]]
 name = "syn"

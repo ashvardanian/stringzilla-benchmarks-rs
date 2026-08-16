@@ -64,6 +64,9 @@ bench_hash = [
   "ring",         # SHA256
   "cityhash",     # CityHash (x86_64 only)
 ]
+bench_levenshtein = [
+  "symspell_rs", # SymSpell deletion index
+]
 bench_memory = [
   "rand",         # Randomize Buffer
   "zeroize",      # Obfuscate Buffer
@@ -174,6 +177,11 @@ version = "0.2.11"
 [dependencies.rapidfuzz]
 optional = true
 version = "0.5.0"
+
+[dependencies.symspell_rs]
+git = "https://github.com/wolfgarbe/symspell_rs.git"
+optional = true
+rev = "df6b21abbb3500b99e9e75857a616ff60f30f50f"
 
 [dependencies.forkunion]
 optional = true
@@ -315,6 +323,12 @@ harness = false
 name = "bench_hash"
 path = "hash/bench.rs"
 required-features = ["bench_hash"]
+
+[[bench]]
+harness = false
+name = "bench_levenshtein"
+path = "levenshtein/bench.rs"
+required-features = ["bench_levenshtein"]
 
 [[bench]]
 harness = false
