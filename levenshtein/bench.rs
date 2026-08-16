@@ -1,12 +1,14 @@
 //! Repeated bounded Levenshtein search over an immutable dictionary.
 //!
-//! The dictionary is built once and reused for every query. Use `STRINGWARS_FILTER=symspell`
-//! to select this comparison.
+//! The dictionary is built once and reused for every query. Use `STRINGWARS_FILTER` to select
+//! `levenshtein/fst` or `levenshtein/symspell`.
 
 #[allow(dead_code)]
 #[path = "../utils.rs"]
 mod utils;
 
+use fst::automaton::Levenshtein;
+use fst::{IntoStreamer, Map, Streamer};
 use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
@@ -42,6 +44,12 @@ fn load_lines(path: &str, limit: usize) -> Result<Vec<String>, AnyError> {
         .take(if limit == 0 { usize::MAX } else { limit })
         .map(|line| line.trim_end_matches('\r').to_owned())
         .collect())
+}
+
+fn checksum_id(checksum: u64, id: u64) -> u64 {
+    checksum
+        .wrapping_mul(0x9E37_79B1_85EB_CA87)
+        .wrapping_add(id)
 }
 
 fn evict_cache(buffer: &mut [u8], checksum: &mut u64) {
@@ -197,6 +205,110 @@ fn run_symspell(
     Ok(())
 }
 
+fn verify_fst_unicode_contract() -> Result<(), AnyError> {
+    let mut keys = vec!["é", "Ѐ", "А"];
+    keys.sort_unstable();
+    let map = Map::from_iter(keys.iter().enumerate().map(|(id, key)| (*key, id as u64)))?;
+    let mut matches = 0usize;
+    for query in &keys {
+        let automaton = Levenshtein::new(query, 1)?;
+        let mut stream = map.search(&automaton).into_stream();
+        while stream.next().is_some() {
+            matches += 1;
+        }
+    }
+    if matches != 9 {
+        return Err(format!(
+            "fst Unicode smoke test failed: expected 9 one-character matches, observed {matches}"
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn run_fst(dictionary: &[String], queries: &[String], settings: &Settings) -> Result<(), AnyError> {
+    let allow_unicode = env::var_os("STRINGWARS_ALLOW_FST_UNICODE").is_some();
+    if allow_unicode {
+        verify_fst_unicode_contract()?;
+    } else if dictionary
+        .iter()
+        .chain(queries)
+        .any(|text| !text.is_ascii())
+    {
+        return Err("fst requires ASCII input for byte-for-byte semantic parity".into());
+    }
+
+    let mut keyed_words: Vec<(&str, u64)> = dictionary
+        .iter()
+        .enumerate()
+        .map(|(id, word)| (word.as_str(), id as u64))
+        .collect();
+    keyed_words.sort_unstable_by_key(|&(word, _)| word);
+    if keyed_words.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err("fst cannot preserve duplicate dictionary entries".into());
+    }
+
+    let build_start = Instant::now();
+    let map = Map::from_iter(keyed_words)?;
+    println!("# levenshtein/fst");
+    println!(
+        "dictionary={} queries={} semantics={} build={:.6}s fst_bytes={} output=id-only",
+        dictionary.len(),
+        queries.len(),
+        if allow_unicode {
+            "unicode-codepoints"
+        } else {
+            "ascii-byte-parity"
+        },
+        build_start.elapsed().as_secs_f64(),
+        map.as_fst().as_bytes().len()
+    );
+
+    let state_limit = env::var("STRINGWARS_FST_STATE_LIMIT")
+        .ok()
+        .map(|value| value.parse::<usize>())
+        .transpose()?;
+    let mut cache = vec![0u8; settings.cache_evict_bytes];
+    let mut cache_checksum = 0u64;
+    for bound in settings.min_distance..=settings.max_distance {
+        for repeat in 0..settings.repeats {
+            evict_cache(&mut cache, &mut cache_checksum);
+            let start = Instant::now();
+            let mut matches_count = 0usize;
+            let mut checksum = 0u64;
+            let mut failed = None;
+            for query in queries {
+                let automaton = match state_limit {
+                    Some(limit) => Levenshtein::new_with_limit(query, bound as u32, limit),
+                    None => Levenshtein::new(query, bound as u32),
+                };
+                let automaton = match automaton {
+                    Ok(automaton) => automaton,
+                    Err(error) => {
+                        failed = Some(error);
+                        break;
+                    }
+                };
+                let mut stream = map.search(&automaton).into_stream();
+                while let Some((_, id)) = stream.next() {
+                    matches_count += 1;
+                    checksum = checksum_id(checksum, id);
+                }
+            }
+            if let Some(error) = failed {
+                println!("k={bound} skipped={error}");
+                break;
+            }
+            println!(
+                "k={bound} repeat={repeat} query={:.6}s matches={matches_count} checksum={checksum:016x} cache_evict_bytes={}",
+                start.elapsed().as_secs_f64(),
+                cache.len()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), AnyError> {
     let args: Vec<String> = env::args()
         .filter(|argument| argument != "--bench")
@@ -229,6 +341,9 @@ fn main() -> Result<(), AnyError> {
         );
     }
 
+    if should_run("levenshtein/fst") {
+        run_fst(&dictionary, &queries, &settings)?;
+    }
     if should_run("levenshtein/symspell") {
         run_symspell(&dictionary, &queries, &settings)?;
     }

@@ -65,6 +65,7 @@ bench_hash = [
   "cityhash",     # CityHash (x86_64 only)
 ]
 bench_levenshtein = [
+  "fst",         # Levenshtein automaton over a finite-state dictionary
   "symspell_rs", # SymSpell deletion index
 ]
 bench_memory = [
@@ -177,6 +178,11 @@ version = "0.2.11"
 [dependencies.rapidfuzz]
 optional = true
 version = "0.5.0"
+
+[dependencies.fst]
+features = ["levenshtein"]
+optional = true
+version = "0.4.7"
 
 [dependencies.symspell_rs]
 git = "https://github.com/wolfgarbe/symspell_rs.git"
