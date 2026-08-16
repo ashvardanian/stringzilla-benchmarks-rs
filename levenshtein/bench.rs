@@ -1,7 +1,7 @@
 //! Repeated bounded Levenshtein search over an immutable dictionary.
 //!
 //! The dictionary is built once and reused for every query. Use `STRINGWARS_FILTER` to select
-//! `levenshtein/fst` or `levenshtein/symspell`.
+//! `levenshtein/fst`, `levenshtein/symspell`, or `levenshtein/tantivy`.
 
 #[allow(dead_code)]
 #[path = "../utils.rs"]
@@ -15,6 +15,10 @@ use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::time::Instant;
 use symspell_rs::{SymSpell, Verbosity};
+use tantivy::collector::DocSetCollector;
+use tantivy::query::FuzzyTermQuery;
+use tantivy::schema::{Schema, STRING};
+use tantivy::{doc, Index, Term};
 use utils::should_run;
 
 type AnyError = Box<dyn std::error::Error>;
@@ -309,6 +313,74 @@ fn run_fst(dictionary: &[String], queries: &[String], settings: &Settings) -> Re
     Ok(())
 }
 
+fn run_tantivy(
+    dictionary: &[String],
+    queries: &[String],
+    settings: &Settings,
+) -> Result<(), AnyError> {
+    let mut schema_builder = Schema::builder();
+    let word_field = schema_builder.add_text_field("word", STRING);
+    let index = Index::create_in_ram(schema_builder.build());
+    let build_start = Instant::now();
+    let mut writer = index.writer(50_000_000)?;
+    for word in dictionary {
+        writer.add_document(doc!(word_field => word.as_str()))?;
+    }
+    writer.commit()?;
+    writer.wait_merging_threads()?;
+    let reader = index.reader()?;
+    let searcher = reader.searcher();
+    println!("# levenshtein/tantivy");
+    println!(
+        "dictionary={} queries={} build={:.6}s segments={} output=id-only",
+        dictionary.len(),
+        queries.len(),
+        build_start.elapsed().as_secs_f64(),
+        searcher.segment_readers().len()
+    );
+
+    let mut cache = vec![0u8; settings.cache_evict_bytes];
+    let mut cache_checksum = 0u64;
+    for bound in settings.min_distance..=settings.max_distance {
+        if bound > u8::MAX as usize {
+            break;
+        }
+        for repeat in 0..settings.repeats {
+            evict_cache(&mut cache, &mut cache_checksum);
+            let start = Instant::now();
+            let mut matches_count = 0usize;
+            let mut checksum = 0u64;
+            let mut failed = None;
+            for query_text in queries {
+                let term = Term::from_field_text(word_field, query_text);
+                let query = FuzzyTermQuery::new(term, bound as u8, false);
+                let matches = match searcher.search(&query, &DocSetCollector) {
+                    Ok(matches) => matches,
+                    Err(error) => {
+                        failed = Some(error);
+                        break;
+                    }
+                };
+                matches_count += matches.len();
+                for address in matches {
+                    let id = (u64::from(address.segment_ord) << 32) | u64::from(address.doc_id);
+                    checksum = checksum_id(checksum, id);
+                }
+            }
+            if let Some(error) = failed {
+                println!("k={bound} skipped={error}");
+                break;
+            }
+            println!(
+                "k={bound} repeat={repeat} query={:.6}s matches={matches_count} checksum={checksum:016x} cache_evict_bytes={}",
+                start.elapsed().as_secs_f64(),
+                cache.len()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), AnyError> {
     let args: Vec<String> = env::args()
         .filter(|argument| argument != "--bench")
@@ -346,6 +418,9 @@ fn main() -> Result<(), AnyError> {
     }
     if should_run("levenshtein/symspell") {
         run_symspell(&dictionary, &queries, &settings)?;
+    }
+    if should_run("levenshtein/tantivy") {
+        run_tantivy(&dictionary, &queries, &settings)?;
     }
     Ok(())
 }

@@ -67,6 +67,7 @@ bench_hash = [
 bench_levenshtein = [
   "fst",         # Levenshtein automaton over a finite-state dictionary
   "symspell_rs", # SymSpell deletion index
+  "tantivy",     # Search-engine fuzzy term lookup
 ]
 bench_memory = [
   "rand",         # Randomize Buffer
@@ -188,6 +189,10 @@ version = "0.4.7"
 git = "https://github.com/wolfgarbe/symspell_rs.git"
 optional = true
 rev = "df6b21abbb3500b99e9e75857a616ff60f30f50f"
+
+[dependencies.tantivy]
+optional = true
+version = "0.26.1"
 
 [dependencies.forkunion]
 optional = true
