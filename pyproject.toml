@@ -20,6 +20,16 @@ Repository = "https://github.com/ashvardanian/StringWars"
 # Substring/byteset + transforms
 find = ["stringzilla>=5.1.0", "pyahocorasick"]
 
+# Multi-pattern search: one dictionary walked over every document
+substrings = [
+  "stringzilla>=5.1.0",
+  "stringzillas-cpus",
+  "pyahocorasick",
+  "ahocorasick-rs",
+  "bm25s",
+  "numpy",
+]
+
 # Sequence ops (split/sort)
 sequence = ["stringzilla>=5.1.0", "numpy", "pandas", "pyarrow", "polars"]
 

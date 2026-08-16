@@ -133,6 +133,16 @@ re.finditer         ▍                      0.19 GB/s
 
 See [find/README.md](find/README.md) for details
 
+### Multi-Pattern Search
+
+Matching a whole dictionary of needles against a whole corpus in one pass is what Aho-Corasick automata are for, and how the automaton is laid out in memory decides the throughput far more than the search loop does.
+Counting, resolving a leftmost cover, rewriting, and BM25 scoring all ride the same compiled dictionary.
+Numbers await a quiet machine; the sweep and its framing are in [substrings/README.md](substrings/README.md).
+
+Two things that table has to say out loud: every rival is single-threaded and CPU-only, so the honest head-to-head is against `stringzillas::Substrings<1cpu>` rather than its multi-core or GPU rows; and BM25 here is a scan against a fixed query, not an inverted index, so `bm25` and `bm25s` are compared on index build and on query separately.
+
+See [substrings/README.md](substrings/README.md) for details
+
 ### UTF-8 Processing
 
 Different scripts stress UTF-8 differently: Korean has 3-byte Hangul with single-byte whitespace (representative for tokenization), Arabic uses 2-byte characters, English is mostly 1-byte ASCII.

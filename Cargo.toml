@@ -88,6 +88,12 @@ bench_similarities = [
   "bio",       # Needleman-Wunsch score
   "forkunion", # Parallelizing RapidFuzz calls
 ]
+bench_substrings = [
+  "aho-corasick", # Reference multi-pattern automaton, DFA and contiguous NFA
+  "daachorse",    # Double-array Aho-Corasick, the analog of our cold tier
+  "bm25",         # Index-then-query scorer, for the scoring regime we do not occupy
+  "forkunion",    # CPU core counting for device scopes
+]
 bench_tokenization = [
   "icu",                  # Unicode properties, TR29 word/grapheme/sentence + UAX#14 line segmentation
   "simdutf",              # SIMD UTF-8 validation and transcoding
@@ -112,10 +118,20 @@ features = ["runtime-dispatch-simd"]
 optional = true
 version = "4.0.1"
 
+[dependencies.bm25]
+# `default_tokenizer` is the point of the comparison: an inverted index needs tokens, and building
+# them is the cost this engine does not pay.
+optional = true
+version = "2.3.2"
+
 [dependencies.bstr]
 default-features = false
 optional = true
 version = "1.13.0"
+
+[dependencies.daachorse]
+optional = true
+version = "5.0.0"
 
 [dependencies.aho-corasick]
 optional = true
@@ -329,6 +345,12 @@ harness = false
 name = "bench_encryption"
 path = "encryption/bench.rs"
 required-features = ["bench_encryption"]
+
+[[bench]]
+harness = false
+name = "bench_substrings"
+path = "substrings/bench.rs"
+required-features = ["bench_substrings"]
 
 [profile.release]
 # Incremental release builds: after the first full optimize, editing a single bench.rs
