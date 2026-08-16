@@ -41,8 +41,8 @@ use xxhash_rust::xxh3::{xxh3_128_with_seed, xxh3_64};
 #[path = "../utils.rs"]
 mod utils;
 use utils::{
-    install_panic_hook, load_dataset_with_default_mode, log_stringzilla_metadata,
-    measure_throughput, should_run, BenchBudget, ReportAs, ResultExt, WorkUnits,
+    install_panic_hook, load_dataset, log_stringzilla_metadata, measure_throughput, should_run,
+    BenchBudget, ReportAs, ResultExt, WorkUnits,
 };
 
 /// Sixteen fixed odd seeds, enough for the widest 1024-bit digest, shared across every multi-hash
@@ -361,7 +361,7 @@ fn main() {
     log_stringzilla_metadata();
     verify_multiseed_matches_naive();
 
-    let tokens: BytesCowsAuto = load_dataset_with_default_mode("words").unwrap_nice();
+    let tokens: BytesCowsAuto = load_dataset("words", "0", "data/xlsum/xlsum.csv").unwrap_nice();
 
     let mut tape = BytesTape::<u64>::new();
     tape.extend(tokens.iter())

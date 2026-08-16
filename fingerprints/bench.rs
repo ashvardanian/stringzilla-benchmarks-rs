@@ -19,7 +19,7 @@ Environment variables control dataset and processing:
   streaming multiprocessor (SM) is one core, so the actual batch is auto-derived as `STRINGWARS_BATCH_PER_CORE * cores`:
   `cores` is 1 for the single-core variant, the logical core count for the multi-core variant, and the device's SM count
   for the GPU variant.
-- `STRINGWARS_MAX_TOKENS`: Optional cap for total lines to process.
+- `STRINGWARS_DATASET_LIMIT`: Read at most this many bytes of the dataset (`0` reads all).
 - `STRINGWARS_NDIM`: Total hash functions distributed across n-gram widths (default: 256).
 
 N-gram configuration:
@@ -78,7 +78,7 @@ mod utils;
 use utils::{
     auto_batch_size, get_env, get_env_or_default, gpu_multiprocessor_count, install_panic_hook,
     load_dataset, log_stringzilla_metadata, measure_throughput, BenchBudget, ReportAs, ResultExt,
-    WorkUnits,
+    WorkUnits, COMPUTE_BOUND_SLICE,
 };
 
 // Fixed n-gram widths for multi-scale fingerprinting
@@ -233,7 +233,8 @@ fn measure_fingerprints(
 
 fn bench_fingerprints(budget: &BenchBudget) {
     // Load dataset using unified loader
-    let tape_bytes = load_dataset().unwrap_nice();
+    let tape_bytes =
+        load_dataset("lines", COMPUTE_BOUND_SLICE, "data/xlsum/xlsum.csv").unwrap_nice();
     let tape = tape_bytes
         .as_chars()
         .expect("Dataset must be valid UTF-8 for fingerprinting");

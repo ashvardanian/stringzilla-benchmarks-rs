@@ -367,7 +367,7 @@ def main():
         epilog=_main_epilog,
     )
 
-    add_common_args(parser)
+    add_common_args(parser, default_dataset="data/xlsum/xlsum.csv", default_dataset_limit="64mb")
 
     args = parser.parse_args()
 

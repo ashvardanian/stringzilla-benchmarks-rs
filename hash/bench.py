@@ -60,7 +60,6 @@ from utils import (
     now_nanoseconds,
     paced_items,
     report_stats,
-    resolve_tokens,
     should_run,
     tokenize_dataset,
 )
@@ -335,7 +334,7 @@ def main():
         epilog=_main_epilog,
     )
 
-    add_common_args(parser)
+    add_common_args(parser, default_dataset="data/xlsum/xlsum.csv")
 
     args = parser.parse_args()
 
@@ -352,7 +351,7 @@ def main():
     # Lines rather than words: a word is around five bytes, so every hash is one padding block and the
     # row measures call overhead instead of the compression function. Article-length lines from a corpus
     # like XLSum span several blocks, which is where the kernels differ.
-    tokens_mode = resolve_tokens(args.tokens, "lines")
+    tokens_mode = args.tokens
     tokens = tokenize_dataset(dataset, tokens_mode)
 
     if not tokens:

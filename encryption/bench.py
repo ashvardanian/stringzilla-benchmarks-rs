@@ -44,7 +44,6 @@ from utils import (
     now_nanoseconds,
     paced_items,
     report_stats,
-    resolve_tokens,
     should_run,
     tokenize_dataset,
 )
@@ -188,7 +187,7 @@ def main():
         description="Benchmark AEAD encryption/decryption across Python crypto libraries",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    add_common_args(parser)
+    add_common_args(parser, default_dataset="data/xlsum/xlsum.csv")
     args = parser.parse_args()
 
     filter_pattern = None
@@ -199,7 +198,7 @@ def main():
             parser.error(f"Invalid regex for --filter: {error}")
 
     dataset = load_dataset(args.dataset, as_bytes=True, size_limit=args.dataset_limit)
-    tokens = tokenize_dataset(dataset, resolve_tokens(args.tokens, "lines"))
+    tokens = tokenize_dataset(dataset, args.tokens)
     if not tokens:
         print("No tokens found in dataset")
         return 1

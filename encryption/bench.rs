@@ -754,7 +754,7 @@ fn main() {
     sodiumoxide::init().expect("Failed to initialize libsodium");
 
     // Load the dataset defined by the environment variables
-    let tape = load_dataset().unwrap_nice();
+    let tape = load_dataset("lines", "0", "data/xlsum/xlsum.csv").unwrap_nice();
 
     let budget = BenchBudget::from_env(5.0, 10.0);
 

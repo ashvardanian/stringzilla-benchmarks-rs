@@ -29,6 +29,7 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::hint::black_box;
+use std::io::Read;
 use std::ptr;
 use std::slice;
 
@@ -73,9 +74,17 @@ fn measure_mut_token<Work: FnMut(&mut [u8])>(
 /// mutable bytes and mutable token slices; the shared `utils::load_dataset` returns an
 /// immutable, leaked tape and cannot be used here.
 pub fn load_dataset_bytes() -> Result<Vec<u8>, Box<dyn Error>> {
-    let dataset_path = env::var("STRINGWARS_DATASET")
-        .map_err(|_| "STRINGWARS_DATASET environment variable not set")?;
-    let content = fs::read(&dataset_path)?;
+    let dataset_path =
+        env::var("STRINGWARS_DATASET").unwrap_or_else(|_| "data/xlsum/xlsum.csv".to_string());
+    let limit_bytes =
+        utils::parse_size(&utils::get_env_or_default("STRINGWARS_DATASET_LIMIT", "0"));
+    let mut file = fs::File::open(&dataset_path)?;
+    let mut content = Vec::new();
+    if limit_bytes == 0 {
+        file.read_to_end(&mut content)?;
+    } else {
+        file.take(limit_bytes as u64).read_to_end(&mut content)?;
+    }
     Ok(content)
 }
 

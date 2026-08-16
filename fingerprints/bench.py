@@ -49,7 +49,6 @@ from utils import (
     load_dataset,
     now_nanoseconds,
     report_stats,
-    resolve_tokens,
     should_run,
     tokenize_dataset,
 )
@@ -241,7 +240,7 @@ def main():
         epilog=_main_epilog,
     )
 
-    add_common_args(parser)
+    add_common_args(parser, default_dataset="data/xlsum/xlsum.csv", default_dataset_limit="64mb")
     parser.add_argument("-n", "--max-docs", type=int, help="Maximum number of docs to process")
     parser.add_argument(
         "-d",
@@ -270,7 +269,7 @@ def main():
 
     # Load and tokenize dataset
     dataset = load_dataset(args.dataset, size_limit=args.dataset_limit)
-    tokens = tokenize_dataset(dataset, resolve_tokens(args.tokens, "lines"))
+    tokens = tokenize_dataset(dataset, args.tokens)
 
     if not tokens:
         print("No tokens found in dataset")

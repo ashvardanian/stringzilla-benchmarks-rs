@@ -42,7 +42,7 @@ use unicode_normalization::UnicodeNormalization;
 mod utils;
 use utils::{
     install_panic_hook, load_dataset, log_stringzilla_metadata, measure_throughput, BenchBudget,
-    ReportAs, ResultExt, WorkUnits,
+    ReportAs, ResultExt, WorkUnits, COMPUTE_BOUND_SLICE,
 };
 
 fn log_pcre2_metadata() {
@@ -497,7 +497,7 @@ fn main() {
     log_pcre2_metadata();
 
     // Load the dataset defined by the environment variables
-    let tape = load_dataset().unwrap_nice();
+    let tape = load_dataset("lines", COMPUTE_BOUND_SLICE, "data/xlsum/xlsum.csv").unwrap_nice();
 
     // Get the parent data directly from the tape (zero-copy)
     let haystack = tape.parent();

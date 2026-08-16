@@ -390,10 +390,10 @@ def load_dataset(
         if dataset_path is None:
             raise ValueError("No dataset path provided and STRINGWARS_DATASET not set")
 
-    # Parse size limit if provided
-    max_bytes = None
-    if size_limit:
-        max_bytes = parse_size(size_limit)
+    # Parse size limit if provided; a "0" limit is truthy but means the whole file, not a zero-byte read.
+    max_bytes = parse_size(size_limit) if size_limit else None
+    if max_bytes == 0:
+        max_bytes = None
 
     if as_bytes:
         with open(dataset_path, "rb") as f:
@@ -451,27 +451,22 @@ def tokenize_dataset(
     return tokens
 
 
-def resolve_tokens(cli_value: str | None, default: str) -> str:
-    """Resolve the token granularity with precedence: an explicit --tokens flag wins, then the
-    STRINGWARS_TOKENS environment variable, then the bench's own default. Each bench passes the
-    granularity its kernel measures (e.g. "words" for similarity, "lines" for hashing,
-    normalization and fingerprinting), matching the Rust `load_dataset_with_default_mode`.
+def add_common_args(parser, default_dataset=None, default_tokens="lines", default_dataset_limit="0"):
+    """Add common dataset and tokenization arguments to an ArgumentParser.
+
+    Each family declares its dataset, tokens, and dataset-limit defaults together here; the flag wins,
+    then the matching STRINGWARS_* env variable, then the family default.
     """
-    if cli_value is not None:
-        return cli_value
-    return get_env_or_default("STRINGWARS_TOKENS", default)
-
-
-def add_common_args(parser):
-    """Add common dataset and tokenization arguments to an ArgumentParser."""
     parser.add_argument(
         "--dataset",
-        help="Path to input dataset file (overrides STRINGWARS_DATASET env var)",
+        default=get_env("STRINGWARS_DATASET") or default_dataset,
+        help="Path to input dataset file (or STRINGWARS_DATASET env var; falls back to the bench default)",
     )
     parser.add_argument(
         "--tokens",
         choices=["lines", "words", "file"],
-        help="Tokenization mode (overrides STRINGWARS_TOKENS env var)",
+        default=get_env_or_default("STRINGWARS_TOKENS", default_tokens),
+        help="Tokenization mode (or STRINGWARS_TOKENS env var; falls back to the bench default)",
     )
     parser.add_argument(
         "-k",
@@ -489,8 +484,8 @@ def add_common_args(parser):
     parser.add_argument(
         "--dataset-limit",
         type=str,
-        default="128mb",
-        help="Maximum dataset size (default: 128mb). Supports formats like '1gb', '500mb', '10kb'",
+        default=get_env_or_default("STRINGWARS_DATASET_LIMIT", default_dataset_limit),
+        help="Maximum dataset size ('0' reads all, or STRINGWARS_DATASET_LIMIT). Supports '1gb', '500mb', '10kb'",
     )
 
 

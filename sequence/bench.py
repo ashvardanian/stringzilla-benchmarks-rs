@@ -55,7 +55,6 @@ from utils import (
     load_dataset,
     now_nanoseconds,
     report_stats,
-    resolve_tokens,
     should_run,
     tokenize_dataset,
 )
@@ -136,7 +135,7 @@ def main():
         epilog=_main_epilog,
     )
 
-    add_common_args(parser)
+    add_common_args(parser, default_dataset="data/xlsum/xlsum.csv")
 
     args = parser.parse_args()
 
@@ -150,7 +149,7 @@ def main():
 
     # Load and tokenize dataset
     dataset = load_dataset(args.dataset, size_limit=args.dataset_limit)
-    tokens_mode = resolve_tokens(args.tokens, "lines")
+    tokens_mode = args.tokens
     tokens = tokenize_dataset(dataset, tokens_mode)
 
     if not tokens:

@@ -33,7 +33,7 @@ throughput is reported in CUPS (Cell Updates Per Second). This mirrors the Rust 
 Environment variables (identical to bench.rs / the C++ harness):
 - STRINGWARS_DATASET: Path to the input dataset file
 - STRINGWARS_TOKENS: Tokenization mode ('lines', 'words', 'file')
-- STRINGWARS_MAX_TOKENS: Limit on the number of tokens loaded
+- STRINGWARS_DATASET_LIMIT: Read at most this many bytes ('0' reads all)
 - STRINGWARS_BATCH_PER_CORE: Pairs processed per core (default: 256)
 - STRINGWARS_TIME: Wall-time budget per benchmark variant (seconds)
 - STRINGWARS_WARMUP: Uncounted warm-up budget per variant (seconds)
@@ -72,7 +72,6 @@ from utils import (
     load_dataset,
     now_nanoseconds,
     report_stats,
-    resolve_tokens,
     should_run,
     tokenize_dataset,
 )
@@ -820,7 +819,12 @@ def main() -> int:
         epilog=_main_epilog,
     )
 
-    add_common_args(parser)
+    add_common_args(
+        parser,
+        default_dataset="data/acgt/acgt_1k.txt",
+        default_tokens="words",
+        default_dataset_limit="64mb",
+    )
     parser.add_argument(
         "--bio",
         action="store_true",
@@ -853,12 +857,9 @@ def main() -> int:
     time_limit_seconds = get_env_parsed("STRINGWARS_TIME", args.time_limit, parser=float)
     warmup_seconds = get_env_parsed("STRINGWARS_WARMUP", 0.0, parser=float)
 
-    # Load and tokenize the dataset; STRINGWARS_MAX_TOKENS caps the token count.
+    # Load and tokenize the dataset; the read is already bounded by --dataset-limit / STRINGWARS_DATASET_LIMIT.
     dataset = load_dataset(args.dataset, size_limit=args.dataset_limit)
-    tokens = tokenize_dataset(dataset, tokens_mode=resolve_tokens(args.tokens, "words"))
-    max_tokens = get_env_parsed("STRINGWARS_MAX_TOKENS", None, parser=int)
-    if max_tokens is not None and max_tokens > 0:
-        tokens = tokens[:max_tokens]
+    tokens = tokenize_dataset(dataset, tokens_mode=args.tokens)
 
     if len(tokens) < 2:
         parser.error("Dataset must contain at least two tokens for the cross-product")

@@ -212,7 +212,7 @@ def main() -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=_main_epilog,
     )
-    add_common_args(parser)
+    add_common_args(parser, default_dataset="data/xlsum/xlsum.csv")
     args = parser.parse_args()
 
     # Dataset

@@ -44,7 +44,7 @@ use unicode_segmentation::UnicodeSegmentation;
 mod utils;
 use utils::{
     install_panic_hook, load_dataset, log_stringzilla_metadata, measure_throughput, should_run,
-    BenchBudget, ReportAs, ResultExt, WorkUnits,
+    BenchBudget, ReportAs, ResultExt, WorkUnits, COMPUTE_BOUND_SLICE,
 };
 
 /// File-local helper: cycles through `needles` byte slices, passes each to `count`, and reports
@@ -636,7 +636,7 @@ fn main() {
     log_stringzilla_metadata();
 
     // Load the dataset defined by the environment variables
-    let tape = load_dataset().unwrap_nice();
+    let tape = load_dataset("lines", COMPUTE_BOUND_SLICE, "data/xlsum/xlsum.csv").unwrap_nice();
 
     // Get the parent data directly from the tape (zero-copy)
     let haystack = tape.parent();

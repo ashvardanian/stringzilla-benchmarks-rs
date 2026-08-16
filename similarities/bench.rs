@@ -21,7 +21,7 @@ The benchmarks use environment variables to control the input dataset and mode:
   - `lines`: Process the dataset line by line.
   - `words`: Process the dataset word by word.
   - `file`: Process the entire file as a single token.
-- `STRINGWARS_MAX_TOKENS`: Optional cap on the number of tokens loaded.
+- `STRINGWARS_DATASET_LIMIT`: Read at most this many bytes of the dataset (`0` reads all).
 - `STRINGWARS_BATCH_PER_CORE`: Number of pairs processed per core (default: 256). A CPU core is one core and a GPU
   streaming multiprocessor (SM) is one core, so the actual batch is auto-derived as `STRINGWARS_BATCH_PER_CORE * cores`:
   `cores` is 1 for the single-core variant, the logical core count for the multi-core variant, and the device's SM count
@@ -84,8 +84,9 @@ use stringzilla::szs::{
 #[path = "../utils.rs"]
 mod utils;
 use utils::{
-    auto_batch_size, gpu_multiprocessor_count, install_panic_hook, load_dataset_with_default_mode,
+    auto_batch_size, gpu_multiprocessor_count, install_panic_hook, load_dataset,
     log_stringzilla_metadata, measure_throughput, BenchBudget, ReportAs, ResultExt, WorkUnits,
+    COMPUTE_BOUND_SLICE,
 };
 
 /// Per-core batch size for similarity benchmarks. 256 is the measured GPU saturation knee
@@ -268,7 +269,8 @@ fn chars_candidate_vec<'a>(full_view: &'a CharsTapeView<u64>, side: usize) -> Ve
 
 fn bench_similarities(budget: &BenchBudget) {
     // Load dataset using unified loader
-    let tape_bytes = load_dataset_with_default_mode("words").unwrap_nice();
+    let tape_bytes =
+        load_dataset("words", COMPUTE_BOUND_SLICE, "data/acgt/acgt_1k.txt").unwrap_nice();
     let tape = tape_bytes
         .as_chars()
         .expect("Dataset must be valid UTF-8 for similarities");
@@ -288,7 +290,7 @@ fn bench_similarities(budget: &BenchBudget) {
         DEFAULT_BATCH_PER_CORE,
     );
 
-    // Create BytesTape and populate it with all tokens (already limited by STRINGWARS_MAX_TOKENS in load_dataset)
+    // Create BytesTape and populate it with all tokens (the read is already bounded by STRINGWARS_DATASET_LIMIT)
     let mut units_tape: BytesTape<u64, UnifiedAlloc> = BytesTape::new_in(UnifiedAlloc);
     units_tape
         .extend(tape.iter().map(|string| string.as_bytes()))

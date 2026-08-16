@@ -86,8 +86,8 @@ use xxhash_rust::xxh3::xxh3_64;
 #[path = "../utils.rs"]
 mod utils;
 use utils::{
-    get_env_bool, install_panic_hook, load_dataset_with_default_mode, log_stringzilla_metadata,
-    measure_throughput, should_run, BenchBudget, ReportAs, ResultExt, WorkUnits,
+    get_env_bool, install_panic_hook, load_dataset, log_stringzilla_metadata, measure_throughput,
+    should_run, BenchBudget, ReportAs, ResultExt, WorkUnits,
 };
 
 /// Benchmarks one stateless hash that produces a `u64` result: runs `bench_each_token` for
@@ -588,7 +588,7 @@ fn main() {
     // Lines rather than words: a word is around five bytes, so every hash is one padding block and the
     // row measures call overhead instead of the compression function. Article-length lines from a corpus
     // like XLSum span several blocks, which is where the kernels differ.
-    let tape = load_dataset_with_default_mode("lines").unwrap_nice();
+    let tape = load_dataset("lines", "0", "data/xlsum/xlsum.csv").unwrap_nice();
 
     let budget = BenchBudget::from_env(2.0, 10.0);
 

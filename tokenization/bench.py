@@ -53,7 +53,6 @@ from utils import (
     now_nanoseconds,
     paced_items,
     report_stats,
-    resolve_tokens,
     should_run,
     tokenize_dataset,
 )
@@ -319,7 +318,7 @@ def main():
         epilog=_main_epilog,
     )
 
-    add_common_args(parser)
+    add_common_args(parser, default_dataset="data/xlsum/xlsum.csv", default_dataset_limit="64mb")
 
     args = parser.parse_args()
 
@@ -332,7 +331,7 @@ def main():
             parser.error(f"Invalid regex for --filter: {e}")
 
     # Load the dataset and tokenize it into document lines (the per-line splitter work items).
-    tokens_mode = resolve_tokens(args.tokens, "lines")
+    tokens_mode = args.tokens
     pythonic_str = load_dataset(args.dataset, as_bytes=False, size_limit=args.dataset_limit)
     lines = tokenize_dataset(pythonic_str, tokens_mode)
 

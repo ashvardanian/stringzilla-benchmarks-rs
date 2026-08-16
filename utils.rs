@@ -4,6 +4,7 @@ use std::env;
 use std::fmt;
 use std::fs;
 use std::hint::black_box;
+use std::io::Read;
 use std::panic;
 use std::path::Path;
 use std::str::FromStr;
@@ -30,13 +31,6 @@ pub fn get_env_parsed<T: FromStr>(name: &str, default: T) -> T {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(default)
-}
-
-/// Get an optional environment variable parsed to a type.
-/// Returns None if the variable is not set or cannot be parsed.
-#[allow(dead_code)]
-pub fn get_env_parsed_opt<T: FromStr>(name: &str) -> Option<T> {
-    env::var(name).ok().and_then(|value| value.parse().ok())
 }
 
 /// Get a boolean environment variable.
@@ -247,12 +241,43 @@ pub fn reclaim_memory() {
     // No-op on non-Linux platforms
 }
 
+/// The smallest read that still exercises a compute-bound bench's control-flow paths; memory-bound
+/// benches pass "0" and read the whole file.
+#[allow(dead_code)]
+pub const COMPUTE_BOUND_SLICE: &str = "64mb";
+
+/// Parses a human byte size like `64mb` or `1gb` into bytes; `kb`/`mb`/`gb` are powers of 1024,
+/// matching `utils.py::parse_size`. An empty string or `0` means the whole file.
+#[allow(dead_code)]
+pub fn parse_size(text: &str) -> usize {
+    let lowered = text.trim().to_lowercase();
+    if lowered.is_empty() {
+        return 0;
+    }
+    let split = lowered
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(lowered.len());
+    let (number_text, unit) = lowered.split_at(split);
+    let number: f64 = number_text.parse().unwrap_or(0.0);
+    let multiplier: f64 = match unit.trim() {
+        "" | "b" => 1.0,
+        "kb" => 1024.0,
+        "mb" => 1024.0 * 1024.0,
+        "gb" => 1024.0 * 1024.0 * 1024.0,
+        other => panic!("Invalid STRINGWARS_DATASET_LIMIT unit: {}", other),
+    };
+    (number * multiplier) as usize
+}
+
 /// Loads binary data from the file specified by the `STRINGWARS_DATASET` environment variable.
 /// Uses StringTape to avoid allocating separate byte vectors for each token.
 /// Returns BytesCowsAuto for memory-efficient byte slice storage.
 /// Can be cast to CharsCowsAuto for UTF-8 string benchmarks (StringTape 2.2+).
-/// Supports `STRINGWARS_MAX_TOKENS` to limit the number of tokens loaded.
 /// Logs dataset statistics to stderr.
+///
+/// Each benchmark declares its family defaults together: the token mode its kernel measures, the read
+/// limit (compute-bound benches slice, memory-bound benches read whole), and the dataset path used when
+/// `STRINGWARS_DATASET` is unset. The matching `STRINGWARS_*` variables override each one.
 ///
 /// # Errors
 /// Returns `DatasetError` if:
@@ -262,24 +287,28 @@ pub fn reclaim_memory() {
 /// - No tokens can be extracted from the dataset
 /// - Unknown tokenization mode is specified
 #[allow(dead_code)]
-pub fn load_dataset() -> Result<BytesCowsAuto<'static>, DatasetError> {
-    load_dataset_with_default_mode("lines")
-}
-
-/// Like [`load_dataset`], but with a caller-chosen default token mode used when `STRINGWARS_TOKENS`
-/// is unset. Each benchmark passes the granularity its kernel measures (e.g. `words` for hashing
-/// and similarity, `lines` for normalization and fingerprinting); the env variable still overrides.
-#[allow(dead_code)]
-pub fn load_dataset_with_default_mode(
+pub fn load_dataset(
     default_mode: &str,
+    default_limit: &str,
+    default_dataset: &str,
 ) -> Result<BytesCowsAuto<'static>, DatasetError> {
-    let dataset_path = get_env("STRINGWARS_DATASET").ok_or(DatasetError::EnvVarNotSet)?;
+    let dataset_path = match get_env("STRINGWARS_DATASET") {
+        Some(path) => path,
+        None if !default_dataset.is_empty() => default_dataset.to_string(),
+        None => return Err(DatasetError::EnvVarNotSet),
+    };
     let mode = get_env_or_default("STRINGWARS_TOKENS", default_mode);
-    let max_tokens: Option<usize> = get_env_parsed_opt("STRINGWARS_MAX_TOKENS");
+    let limit_bytes = parse_size(&get_env_or_default(
+        "STRINGWARS_DATASET_LIMIT",
+        default_limit,
+    ));
     let unique = get_env_bool("STRINGWARS_UNIQUE");
 
-    if let Some(max) = max_tokens {
-        eprintln!("STRINGWARS_MAX_TOKENS: limiting to {} tokens", max);
+    if limit_bytes != 0 {
+        eprintln!(
+            "STRINGWARS_DATASET_LIMIT: reading at most {} bytes",
+            limit_bytes
+        );
     }
     if unique {
         eprintln!("STRINGWARS_UNIQUE: deduplicating tokens");
@@ -290,8 +319,18 @@ pub fn load_dataset_with_default_mode(
         return Err(DatasetError::FileNotFound { path: dataset_path });
     }
 
-    // Read the file content
-    let content = fs::read(&dataset_path).map_err(|error| DatasetError::ReadError {
+    // Read the file content, bounded by STRINGWARS_DATASET_LIMIT so the tail is never touched.
+    let mut file = fs::File::open(&dataset_path).map_err(|error| DatasetError::ReadError {
+        path: dataset_path.clone(),
+        source: error,
+    })?;
+    let mut content = Vec::new();
+    let read_result = if limit_bytes == 0 {
+        file.read_to_end(&mut content)
+    } else {
+        file.take(limit_bytes as u64).read_to_end(&mut content)
+    };
+    read_result.map_err(|error| DatasetError::ReadError {
         path: dataset_path.clone(),
         source: error,
     })?;
@@ -303,15 +342,13 @@ pub fn load_dataset_with_default_mode(
 
     // Leak the content to get 'static lifetime
     let content_static: &'static [u8] = Box::leak(content.into_boxed_slice());
-    let limit = max_tokens.unwrap_or(usize::MAX);
 
     // Build BytesCowsAuto directly from iterator - it will own references to the leaked bytes
     let tape = match mode.as_str() {
         "lines" => {
             let iter = content_static
                 .split(|&byte| byte == b'\n')
-                .filter(|slice| !slice.is_empty())
-                .take(limit);
+                .filter(|slice| !slice.is_empty());
             if unique {
                 let mut seen: HashSet<&'static [u8]> = HashSet::new();
                 let unique_tokens: Vec<&'static [u8]> =
@@ -324,8 +361,7 @@ pub fn load_dataset_with_default_mode(
         "words" => {
             let iter = content_static
                 .split(|&byte| byte == b' ' || byte == b'\n')
-                .filter(|slice| !slice.is_empty())
-                .take(limit);
+                .filter(|slice| !slice.is_empty());
             if unique {
                 let mut seen: HashSet<&'static [u8]> = HashSet::new();
                 let unique_tokens: Vec<&'static [u8]> =
