@@ -4,6 +4,11 @@
 # https://github.com/rapidsai/cudf
 cudf-cu12==26.*; platform_system == "Linux" and (platform_machine == "x86_64" or platform_machine == "aarch64") and python_version >= "3.10" and python_version < "3.14"
 
+# RAPIDS cuML for CUDA 12, whose `TfidfVectorizer` is the GPU counterpart of the scikit-learn one.
+# No comparable GPU BM25 library exists, so the index rows carry a GPU cell for TF-IDF alone.
+# https://github.com/rapidsai/cuml
+cuml-cu12==26.*; platform_system == "Linux" and (platform_machine == "x86_64" or platform_machine == "aarch64") and python_version >= "3.10" and python_version < "3.14"
+
 # StringZillas GPU build — v5 wheels are not yet on PyPI; build from the neighboring source:
 #
 #     uv pip install ../StringZilla/python/stringzillas-cuda

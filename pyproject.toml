@@ -27,6 +27,8 @@ substrings = [
   "pyahocorasick",
   "ahocorasick-rs",
   "bm25s",
+  "rank-bm25",
+  "scikit-learn",
   "numpy",
 ]
 

@@ -51,6 +51,8 @@ Examples:
 """
 
 import argparse
+import contextlib
+import gc
 import os
 import random
 import re
@@ -318,12 +320,28 @@ def unary_class_costs(match_cost: int, mismatch_cost: int) -> tuple[np.ndarray, 
 
 
 class DeviceVariant:
-    """A named ``(label, scope, side)`` benchmark variant for one device configuration."""
+    """A named ``(label, arguments, side)`` benchmark variant for one device configuration.
 
-    def __init__(self, label: str, scope: Any, side: int):
+    The scope is opened per pass rather than held here: an idle ForkUnion pool spin-waits, so a
+    multi-core scope alive during a single-threaded baseline consumes the very cores that baseline is
+    being measured on.
+    """
+
+    def __init__(self, label: str, arguments: dict, side: int):
         self.label = label
-        self.scope = scope
+        self.arguments = arguments
         self.side = side
+
+
+@contextlib.contextmanager
+def device_scope(variant: DeviceVariant):
+    """Opens one pass's scope and drops it on exit, so no pool outlives the pass that uses it."""
+    scope = szs.DeviceScope(**variant.arguments)
+    try:
+        yield scope
+    finally:
+        del scope
+        gc.collect()
 
 
 def build_device_variants(num_tokens: int, batch_size_override: int | None) -> list[DeviceVariant]:
@@ -341,7 +359,7 @@ def build_device_variants(num_tokens: int, batch_size_override: int | None) -> l
     variants.append(
         DeviceVariant(
             "<1cpu>",
-            szs.DeviceScope(cpu_cores=1),
+            {"cpu_cores": 1},
             crossproduct_side(single_cpu_budget, num_tokens),
         )
     )
@@ -350,19 +368,15 @@ def build_device_variants(num_tokens: int, batch_size_override: int | None) -> l
     variants.append(
         DeviceVariant(
             f"<{cpu_cores}cpu>",
-            szs.DeviceScope(cpu_cores=cpu_cores),
+            {"cpu_cores": cpu_cores},
             crossproduct_side(all_cpu_budget, num_tokens),
         )
     )
 
-    try:
-        gpu_scope = szs.DeviceScope(gpu_device=0)
-    except Exception:
-        gpu_scope = None
-    if gpu_scope is not None:
+    if "cuda" in szs.__capabilities__:
         gpu_cores = gpu_multiprocessor_count(0) or 64
         gpu_budget = auto_batch_size(gpu_cores, base=batch_size_override, default_base=DEFAULT_BATCH_PER_CORE)
-        variants.append(DeviceVariant("<1gpu>", gpu_scope, crossproduct_side(gpu_budget, num_tokens)))
+        variants.append(DeviceVariant("<1gpu>", {"gpu_device": 0}, crossproduct_side(gpu_budget, num_tokens)))
 
     return variants
 
@@ -390,46 +404,47 @@ def benchmark_stringzillas_distances(
     bench.rs.
     """
     for variant in device_variants:
-        full_name = f"{engine_name}{variant.label}"
-        if not should_run(f"{category}/{full_name}", filter_pattern):
+        full_name = f"{category}/{engine_name}{variant.label}"
+        if not should_run(full_name, filter_pattern):
             continue
 
-        side = variant.side
-        queries = sz.Strs(list(tokens[0:side]))
-        candidates = sz.Strs(list(tokens[side : 2 * side]))
+        with device_scope(variant) as scope:
+            side = variant.side
+            queries = sz.Strs(list(tokens[0:side]))
+            candidates = sz.Strs(list(tokens[side : 2 * side]))
 
-        try:
-            engine = engine_class(capabilities=variant.scope)
-        except Exception as creation_error:
-            print(f"{full_name}: SKIPPED ({creation_error})")
-            continue
+            try:
+                engine = engine_class(capabilities=scope)
+            except Exception as creation_error:
+                print(f"{full_name}: SKIPPED ({creation_error})")
+                continue
 
-        if not _crossproduct_supported(engine, queries, candidates):
-            print(f"{full_name}: SKIPPED (installed stringzillas lacks the queries x candidates cross-product API)")
-            continue
+            if not _crossproduct_supported(engine, queries, candidates):
+                print(f"{full_name}: SKIPPED (installed stringzillas lacks the queries x candidates cross-product API)")
+                continue
 
-        total_cells, total_bytes = crossproduct_metrics(
-            metric_lengths,
-            metric_lengths[side:],
-            byte_lengths,
-            byte_lengths[side:],
-            side,
-        )
-        matrix = np.zeros((side, side), dtype=result_dtype)
+            total_cells, total_bytes = crossproduct_metrics(
+                metric_lengths,
+                metric_lengths[side:],
+                byte_lengths,
+                byte_lengths[side:],
+                side,
+            )
+            matrix = np.zeros((side, side), dtype=result_dtype)
 
-        def compute(engine=engine, queries=queries, candidates=candidates, scope=variant.scope, matrix=matrix):
-            engine(queries, candidates, scope, out=matrix)
+            def compute(engine=engine, queries=queries, candidates=candidates, scope=scope, matrix=matrix):
+                engine(queries, candidates, scope, out=matrix)
 
-        # Mirror bench.rs: attempt the kernel once; a backend that declines (e.g. no working GPU
-        # path in the installed wheel for these inputs) surfaces as an exception we SKIP on rather
-        # than aborting the whole suite.
-        try:
-            compute()
-        except Exception as compute_error:
-            print(f"{full_name}: SKIPPED ({compute_error})")
-            continue
+            # Mirror bench.rs: attempt the kernel once; a backend that declines (e.g. no working GPU
+            # path in the installed wheel for these inputs) surfaces as an exception we SKIP on rather
+            # than aborting the whole suite.
+            try:
+                compute()
+            except Exception as compute_error:
+                print(f"{full_name}: SKIPPED ({compute_error})")
+                continue
 
-        measure_crossproduct(full_name, compute, total_cells, total_bytes, warmup_seconds, time_limit_seconds)
+            measure_crossproduct(full_name, compute, total_cells, total_bytes, warmup_seconds, time_limit_seconds)
 
 
 def benchmark_stringzillas_scores(
@@ -454,52 +469,53 @@ def benchmark_stringzillas_scores(
     throughput denominator uses byte lengths (the binary cells), matching bench.rs.
     """
     for variant in device_variants:
-        full_name = f"{engine_name}{variant.label}"
-        if not should_run(f"{category}/{full_name}", filter_pattern):
+        full_name = f"{category}/{engine_name}{variant.label}"
+        if not should_run(full_name, filter_pattern):
             continue
 
-        side = variant.side
-        queries = sz.Strs(list(tokens[0:side]))
-        candidates = sz.Strs(list(tokens[side : 2 * side]))
+        with device_scope(variant) as scope:
+            side = variant.side
+            queries = sz.Strs(list(tokens[0:side]))
+            candidates = sz.Strs(list(tokens[side : 2 * side]))
 
-        try:
-            engine = engine_class(
-                byte_to_class,
-                class_substitution_costs,
-                open=gap_open,
-                extend=gap_extend,
-                capabilities=variant.scope,
+            try:
+                engine = engine_class(
+                    byte_to_class,
+                    class_substitution_costs,
+                    open=gap_open,
+                    extend=gap_extend,
+                    capabilities=scope,
+                )
+            except Exception as creation_error:
+                print(f"{full_name}: SKIPPED ({creation_error})")
+                continue
+
+            if not _crossproduct_supported(engine, queries, candidates):
+                print(f"{full_name}: SKIPPED (installed stringzillas lacks the queries x candidates cross-product API)")
+                continue
+
+            total_cells, total_bytes = crossproduct_metrics(
+                byte_lengths,
+                byte_lengths[side:],
+                byte_lengths,
+                byte_lengths[side:],
+                side,
             )
-        except Exception as creation_error:
-            print(f"{full_name}: SKIPPED ({creation_error})")
-            continue
+            matrix = np.zeros((side, side), dtype=np.int64)
 
-        if not _crossproduct_supported(engine, queries, candidates):
-            print(f"{full_name}: SKIPPED (installed stringzillas lacks the queries x candidates cross-product API)")
-            continue
+            def compute(engine=engine, queries=queries, candidates=candidates, scope=scope, matrix=matrix):
+                engine(queries, candidates, scope, out=matrix)
 
-        total_cells, total_bytes = crossproduct_metrics(
-            byte_lengths,
-            byte_lengths[side:],
-            byte_lengths,
-            byte_lengths[side:],
-            side,
-        )
-        matrix = np.zeros((side, side), dtype=np.int64)
+            # Mirror bench.rs: attempt the kernel once; a backend that declines (e.g. no working GPU
+            # path in the installed wheel for these inputs) surfaces as an exception we SKIP on rather
+            # than aborting the whole suite.
+            try:
+                compute()
+            except Exception as compute_error:
+                print(f"{full_name}: SKIPPED ({compute_error})")
+                continue
 
-        def compute(engine=engine, queries=queries, candidates=candidates, scope=variant.scope, matrix=matrix):
-            engine(queries, candidates, scope, out=matrix)
-
-        # Mirror bench.rs: attempt the kernel once; a backend that declines (e.g. no working GPU
-        # path in the installed wheel for these inputs) surfaces as an exception we SKIP on rather
-        # than aborting the whole suite.
-        try:
-            compute()
-        except Exception as compute_error:
-            print(f"{full_name}: SKIPPED ({compute_error})")
-            continue
-
-        measure_crossproduct(full_name, compute, total_cells, total_bytes, warmup_seconds, time_limit_seconds)
+            measure_crossproduct(full_name, compute, total_cells, total_bytes, warmup_seconds, time_limit_seconds)
 
 
 def benchmark_edit_distance_baselines(
@@ -524,19 +540,25 @@ def benchmark_edit_distance_baselines(
     def run(name: str, scalar_function: Callable[[Any, Any], int], length_metric: tuple[np.ndarray, np.ndarray]):
         if not should_run(f"levenshtein/{name}", filter_pattern):
             return
-        measure_pairwise_baseline(
-            name,
-            scalar_function,
-            queries,
-            candidates,
-            baseline_side,
-            length_metric[0],
-            length_metric[1],
-            query_bytes,
-            candidate_bytes,
-            warmup_seconds,
-            time_limit_seconds,
-        )
+        # A baseline that declines these inputs is skipped rather than allowed to abort the suite, the
+        # same policy the engine variants follow: `edlib` rejects any pair whose combined alphabet
+        # exceeds 256 symbols, which every multilingual corpus does.
+        try:
+            measure_pairwise_baseline(
+                name,
+                scalar_function,
+                queries,
+                candidates,
+                baseline_side,
+                length_metric[0],
+                length_metric[1],
+                query_bytes,
+                candidate_bytes,
+                warmup_seconds,
+                time_limit_seconds,
+            )
+        except Exception as baseline_error:
+            print(f"{name}: SKIPPED ({baseline_error})")
 
     codepoint_metric = (query_codepoints, candidate_codepoints)
     byte_metric = (query_bytes, candidate_bytes)

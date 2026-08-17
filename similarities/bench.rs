@@ -77,16 +77,16 @@ fn resolve_core_count(topology: &fu::Topology) -> usize {
 use bio::alignment::{distance as bio_distance, pairwise::Aligner};
 use rapidfuzz::distance::levenshtein;
 use stringzilla::szs::{
-    AnyBytesTape, AnyCharsTape, DeviceScope, LevenshteinDistances, LevenshteinDistancesUtf8,
+    AnyBytesTape, AnyCharsTape, LevenshteinDistances, LevenshteinDistancesUtf8,
     NeedlemanWunschScores, SmithWatermanScores, UnifiedAlloc, UnifiedMat,
 };
 
 #[path = "../utils.rs"]
 mod utils;
 use utils::{
-    auto_batch_size, gpu_multiprocessor_count, install_panic_hook, load_dataset,
-    log_stringzilla_metadata, measure_throughput, BenchBudget, ReportAs, ResultExt, WorkUnits,
-    COMPUTE_BOUND_SLICE,
+    auto_batch_size, for_each_device_pass, gpu_multiprocessor_count, install_panic_hook,
+    load_dataset, log_stringzilla_metadata, measure_throughput, report_skipped, BenchBudget,
+    DeviceChoice, ReportAs, ResultExt, WorkUnits, COMPUTE_BOUND_SLICE,
 };
 
 /// Per-core batch size for similarity benchmarks. 256 is the measured GPU saturation knee
@@ -307,6 +307,8 @@ fn bench_similarities(budget: &BenchBudget) {
         .try_into()
         .expect("Failed to convert to CharsTapeView");
 
+    // Each pass derives its own cross-product side from its core count; these three are the same
+    // arithmetic, reported up front so the configuration block still names what every pass will run.
     let tape_len = units_tape.len();
     let side_single_cpu = crossproduct_side(batch_single_cpu, tape_len);
     let side_multi_cpu = crossproduct_side(batch_multi_cpu, tape_len);
@@ -331,36 +333,30 @@ fn bench_similarities(budget: &BenchBudget) {
 
     // Uniform cost benchmarks (classic Levenshtein: match=0, mismatch=1, open=1, extend=1)
     println!("# uniform");
-    perform_uniform_benchmarks(
-        budget,
-        &tape_bytes_view,
-        &chars_view,
-        num_cores,
-        side_single_cpu,
-        side_multi_cpu,
-        side_gpu,
-    );
+    perform_uniform_benchmarks(budget, &tape_bytes_view, &chars_view, num_cores, tape_len);
 
     // Linear gap cost benchmarks (NW/SW: match=2, mismatch=-1, open=-2, extend=-2)
     println!("# linear");
-    perform_linear_benchmarks(
+    perform_score_benchmarks(
+        "linear",
         budget,
         &tape_bytes_view,
         num_cores,
-        side_single_cpu,
-        side_multi_cpu,
-        side_gpu,
+        tape_len,
+        -2,
+        -2,
     );
 
     // Affine gap cost benchmarks (NW/SW: match=2, mismatch=-1, open=-5, extend=-1)
     println!("# affine");
-    perform_affine_benchmarks(
+    perform_score_benchmarks(
+        "affine",
         budget,
         &tape_bytes_view,
         num_cores,
-        side_single_cpu,
-        side_multi_cpu,
-        side_gpu,
+        tape_len,
+        -5,
+        -1,
     );
 }
 
@@ -370,39 +366,87 @@ fn perform_uniform_benchmarks(
     tape_bytes_view: &BytesTapeView<u64>,
     chars_view: &CharsTapeView<u64>,
     num_cores: usize,
-    side_single_cpu: usize,
-    side_multi_cpu: usize,
-    side_gpu: usize,
+    tape_len: usize,
 ) {
-    // Create device scopes
-    let cpu_single = DeviceScope::cpu_cores(1).expect("Failed to create single-core device scope");
-    let cpu_parallel =
-        DeviceScope::cpu_cores(num_cores).expect("Failed to create multi-core device scope");
-    let maybe_gpu = DeviceScope::gpu_device(0);
+    for_each_device_pass(num_cores, |pass, scope_name, device, cores| {
+        let side = crossproduct_side(auto_batch_size(cores, DEFAULT_BATCH_PER_CORE), tape_len);
 
-    // Create engines once
-    let lev_single = LevenshteinDistances::new(&cpu_single, 0, 1, 1, 1)
-        .expect("Failed to create LevenshteinDistances single");
-    let lev_parallel = LevenshteinDistances::new(&cpu_parallel, 0, 1, 1, 1)
-        .expect("Failed to create LevenshteinDistances parallel");
-    let lev_utf8_single = LevenshteinDistancesUtf8::new(&cpu_single, 0, 1, 1, 1)
-        .expect("Failed to create LevenshteinDistancesUtf8 single");
-    let lev_utf8_parallel = LevenshteinDistancesUtf8::new(&cpu_parallel, 0, 1, 1, 1)
-        .expect("Failed to create LevenshteinDistancesUtf8 parallel");
-    let maybe_lev_gpu = maybe_gpu
-        .as_ref()
-        .ok()
-        .and_then(|gpu| LevenshteinDistances::new(gpu, 0, 1, 1, 1).ok());
-    // GPU UTF-8 Levenshtein: the engine may decline inputs beyond its supported length, returning an error we skip
-    // on rather than aborting the suite.
-    let maybe_lev_utf8_gpu = maybe_gpu
-        .as_ref()
-        .ok()
-        .and_then(|gpu| LevenshteinDistancesUtf8::new(gpu, 0, 1, 1, 1).ok());
+        // Every rival is single-threaded, so it is measured in the pass that has no thread pool alive.
+        if matches!(pass, DeviceChoice::OneCore) {
+            uniform_baselines(budget, tape_bytes_view, chars_view, side);
+        }
 
-    // RapidFuzz baselines (no batching; scan one-by-one). One pair per call across the
-    // query/candidate diagonal of the single-core cross-product.
-    let baseline_side = side_single_cpu;
+        // StringZilla byte-level Levenshtein distance (uniform costs: 0,1,1,1)
+        let name = format!("uniform/stringzillas::LevenshteinDistances<{scope_name}>");
+        match LevenshteinDistances::new(device, 0, 1, 1, 1) {
+            Ok(engine) => {
+                let (cells, bytes) = crossproduct_metrics_bytes(tape_bytes_view, side);
+                let queries = bytes_query_vec(tape_bytes_view, side);
+                let candidates = bytes_candidate_vec(tape_bytes_view, side);
+                match engine.compute(device, &queries, &candidates) {
+                    Ok(mut matrix) => measure_crossproduct_bytes_usize(
+                        &name,
+                        budget,
+                        tape_bytes_view,
+                        side,
+                        cells,
+                        bytes,
+                        &mut matrix,
+                        |queries, candidates, matrix| {
+                            engine
+                                .compute_into(device, queries, candidates, matrix)
+                                .unwrap_or_else(|error| {
+                                    panic!("{name}: {error}");
+                                });
+                        },
+                    ),
+                    Err(error) => report_skipped(&name, error),
+                }
+            }
+            Err(error) => report_skipped(&name, error),
+        }
+
+        // StringZilla UTF-8 Levenshtein distance. The engine may decline inputs beyond its supported
+        // length, returning an error we skip on rather than aborting the suite.
+        let name = format!("uniform/stringzillas::LevenshteinDistancesUtf8<{scope_name}>");
+        match LevenshteinDistancesUtf8::new(device, 0, 1, 1, 1) {
+            Ok(engine) => {
+                let (cells, bytes) = crossproduct_metrics_chars(chars_view, side);
+                let queries = chars_query_vec(chars_view, side);
+                let candidates = chars_candidate_vec(chars_view, side);
+                match engine.compute(device, &queries, &candidates) {
+                    Ok(mut matrix) => measure_crossproduct_chars_usize(
+                        &name,
+                        budget,
+                        chars_view,
+                        side,
+                        cells,
+                        bytes,
+                        &mut matrix,
+                        |queries, candidates, matrix| {
+                            engine
+                                .compute_into(device, queries, candidates, matrix)
+                                .unwrap_or_else(|error| {
+                                    panic!("{name}: {error}");
+                                });
+                        },
+                    ),
+                    Err(error) => report_skipped(&name, error),
+                }
+            }
+            Err(error) => report_skipped(&name, error),
+        }
+    });
+}
+
+/// The single-threaded uniform-cost rivals, run only in the single-core pass. They take no batch, so
+/// each call scans one pair across the query/candidate diagonal of that pass's cross-product.
+fn uniform_baselines(
+    budget: &BenchBudget,
+    tape_bytes_view: &BytesTapeView<u64>,
+    chars_view: &CharsTapeView<u64>,
+    baseline_side: usize,
+) {
     {
         let mut pair_index = 0;
         measure_throughput(
@@ -459,258 +503,13 @@ fn perform_uniform_benchmarks(
             },
         );
     }
-
-    // StringZilla byte-level Levenshtein distance (uniform costs: 0,1,1,1)
-    {
-        let (cells, bytes) = crossproduct_metrics_bytes(tape_bytes_view, side_single_cpu);
-        let queries = bytes_query_vec(tape_bytes_view, side_single_cpu);
-        let candidates = bytes_candidate_vec(tape_bytes_view, side_single_cpu);
-        let mut matrix = lev_single
-            .compute(&cpu_single, &queries, &candidates)
-            .expect("Failed to allocate LevenshteinDistances matrix (single)");
-        measure_crossproduct_bytes_usize(
-            "uniform/stringzillas::LevenshteinDistances<1cpu>",
-            budget,
-            tape_bytes_view,
-            side_single_cpu,
-            cells,
-            bytes,
-            &mut matrix,
-            |queries, candidates, matrix| {
-                lev_single
-                    .compute_into(&cpu_single, queries, candidates, matrix)
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "Failed to compute LevenshteinDistances on CPU (single-threaded): {}",
-                            error
-                        );
-                    });
-            },
-        );
-    }
-
-    {
-        let (cells, bytes) = crossproduct_metrics_bytes(tape_bytes_view, side_multi_cpu);
-        let queries = bytes_query_vec(tape_bytes_view, side_multi_cpu);
-        let candidates = bytes_candidate_vec(tape_bytes_view, side_multi_cpu);
-        let mut matrix = lev_parallel
-            .compute(&cpu_parallel, &queries, &candidates)
-            .expect("Failed to allocate LevenshteinDistances matrix (parallel)");
-        measure_crossproduct_bytes_usize(
-            &format!(
-                "uniform/stringzillas::LevenshteinDistances<{}cpu>",
-                num_cores
-            ),
-            budget,
-            tape_bytes_view,
-            side_multi_cpu,
-            cells,
-            bytes,
-            &mut matrix,
-            |queries, candidates, matrix| {
-                lev_parallel
-                    .compute_into(&cpu_parallel, queries, candidates, matrix)
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "Failed to compute LevenshteinDistances on CPU (multi-threaded): {}",
-                            error
-                        );
-                    });
-            },
-        );
-    }
-
-    // StringZilla UTF-8 Levenshtein Distance (uniform costs: 0,1,1,1)
-    {
-        let (cells, bytes) = crossproduct_metrics_chars(chars_view, side_single_cpu);
-        let queries = chars_query_vec(chars_view, side_single_cpu);
-        let candidates = chars_candidate_vec(chars_view, side_single_cpu);
-        let mut matrix = lev_utf8_single
-            .compute(&cpu_single, &queries, &candidates)
-            .expect("Failed to allocate LevenshteinDistancesUtf8 matrix (single)");
-        measure_crossproduct_chars_usize(
-            "uniform/stringzillas::LevenshteinDistancesUtf8<1cpu>",
-            budget,
-            chars_view,
-            side_single_cpu,
-            cells,
-            bytes,
-            &mut matrix,
-            |queries, candidates, matrix| {
-                lev_utf8_single
-                    .compute_into(&cpu_single, queries, candidates, matrix)
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "Failed to compute LevenshteinDistancesUtf8 on CPU (single-threaded): {}",
-                            error
-                        );
-                    });
-            },
-        );
-    }
-
-    {
-        let (cells, bytes) = crossproduct_metrics_chars(chars_view, side_multi_cpu);
-        let queries = chars_query_vec(chars_view, side_multi_cpu);
-        let candidates = chars_candidate_vec(chars_view, side_multi_cpu);
-        let mut matrix = lev_utf8_parallel
-            .compute(&cpu_parallel, &queries, &candidates)
-            .expect("Failed to allocate LevenshteinDistancesUtf8 matrix (parallel)");
-        measure_crossproduct_chars_usize(
-            &format!(
-                "uniform/stringzillas::LevenshteinDistancesUtf8<{}cpu>",
-                num_cores
-            ),
-            budget,
-            chars_view,
-            side_multi_cpu,
-            cells,
-            bytes,
-            &mut matrix,
-            |queries, candidates, matrix| {
-                lev_utf8_parallel
-                    .compute_into(&cpu_parallel, queries, candidates, matrix)
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "Failed to compute LevenshteinDistancesUtf8 on CPU (multi-threaded): {}",
-                            error
-                        );
-                    });
-            },
-        );
-    }
-
-    if maybe_gpu.is_ok() && maybe_lev_gpu.is_some() {
-        let gpu = maybe_gpu.as_ref().ok().unwrap();
-        let engine = maybe_lev_gpu.as_ref().unwrap();
-        let (cells, bytes) = crossproduct_metrics_bytes(tape_bytes_view, side_gpu);
-        let queries = bytes_query_vec(tape_bytes_view, side_gpu);
-        let candidates = bytes_candidate_vec(tape_bytes_view, side_gpu);
-        let mut matrix = engine
-            .compute(gpu, &queries, &candidates)
-            .expect("Failed to allocate LevenshteinDistances matrix (GPU)");
-        measure_crossproduct_bytes_usize(
-            "uniform/stringzillas::LevenshteinDistances<1gpu>",
-            budget,
-            tape_bytes_view,
-            side_gpu,
-            cells,
-            bytes,
-            &mut matrix,
-            |queries, candidates, matrix| {
-                engine
-                    .compute_into(gpu, queries, candidates, matrix)
-                    .unwrap_or_else(|error| {
-                        panic!("Failed to compute on GPU: {}. This may indicate GPU memory allocation issues with BytesTapeView.", error);
-                    });
-            },
-        );
-    }
-
-    // GPU UTF-8 Levenshtein: the engine may decline inputs beyond its supported length, returning an error we skip on.
-    if maybe_gpu.is_ok() && maybe_lev_utf8_gpu.is_some() {
-        let gpu = maybe_gpu.as_ref().ok().unwrap();
-        let engine = maybe_lev_utf8_gpu.as_ref().unwrap();
-        let (cells, bytes) = crossproduct_metrics_chars(chars_view, side_gpu);
-        let queries = chars_query_vec(chars_view, side_gpu);
-        let candidates = chars_candidate_vec(chars_view, side_gpu);
-        match engine.compute(gpu, &queries, &candidates) {
-            Ok(mut matrix) => measure_crossproduct_chars_usize(
-                "uniform/stringzillas::LevenshteinDistancesUtf8<1gpu>",
-                budget,
-                chars_view,
-                side_gpu,
-                cells,
-                bytes,
-                &mut matrix,
-                |queries, candidates, matrix| {
-                    engine
-                        .compute_into(gpu, queries, candidates, matrix)
-                        .unwrap_or_else(|error| {
-                            panic!("Failed to compute UTF-8 Levenshtein on GPU: {}", error)
-                        });
-                },
-            ),
-            Err(error) => eprintln!(
-                "uniform/stringzillas::LevenshteinDistancesUtf8<1gpu>: SKIPPED ({})",
-                error
-            ),
-        }
-    }
 }
 
-/// Linear gap cost benchmarks: NW/SW with linear penalties (match=2, mismatch=-1, open=-2, extend=-2)
-fn perform_linear_benchmarks(
-    budget: &BenchBudget,
-    tape_bytes_view: &BytesTapeView<u64>,
-    num_cores: usize,
-    side_single_cpu: usize,
-    side_multi_cpu: usize,
-    side_gpu: usize,
-) {
-    let cpu_single = DeviceScope::cpu_cores(1).expect("Failed to create single-core device scope");
-    let cpu_parallel =
-        DeviceScope::cpu_cores(num_cores).expect("Failed to create multi-core device scope");
-    let maybe_gpu = DeviceScope::gpu_device(0);
-
-    // Unary scoring (match=2, mismatch=-1) folded into the 32-class table.
-    let (byte_to_class, class_costs) = unary_class_costs(2, -1);
-
-    // Create engines once (linear gap costs: open=-2, extend=-2)
-    let nw_single = NeedlemanWunschScores::new(&cpu_single, &byte_to_class, &class_costs, -2, -2)
-        .expect("Failed to create NW single");
-    let nw_parallel =
-        NeedlemanWunschScores::new(&cpu_parallel, &byte_to_class, &class_costs, -2, -2)
-            .expect("Failed to create NW parallel");
-    let sw_single = SmithWatermanScores::new(&cpu_single, &byte_to_class, &class_costs, -2, -2)
-        .expect("Failed to create SW single");
-    let sw_parallel = SmithWatermanScores::new(&cpu_parallel, &byte_to_class, &class_costs, -2, -2)
-        .expect("Failed to create SW parallel");
-    let maybe_nw_gpu = maybe_gpu
-        .as_ref()
-        .ok()
-        .and_then(|gpu| NeedlemanWunschScores::new(gpu, &byte_to_class, &class_costs, -2, -2).ok());
-    let maybe_sw_gpu = maybe_gpu
-        .as_ref()
-        .ok()
-        .and_then(|gpu| SmithWatermanScores::new(gpu, &byte_to_class, &class_costs, -2, -2).ok());
-
-    let max_len = max_token_len(tape_bytes_view, side_single_cpu, side_multi_cpu, side_gpu);
-
-    align_score_benchmarks(
-        "linear",
-        budget,
-        tape_bytes_view,
-        &cpu_single,
-        &cpu_parallel,
-        &maybe_gpu,
-        &nw_single,
-        &nw_parallel,
-        &maybe_nw_gpu,
-        &sw_single,
-        &sw_parallel,
-        &maybe_sw_gpu,
-        max_len,
-        -2,
-        -2,
-        side_single_cpu,
-        side_multi_cpu,
-        side_gpu,
-        num_cores,
-    );
-}
-
-/// Largest token byte length across the union of the query/candidate slices of every variant,
-/// used to pre-size the `bio` aligner capacity.
-fn max_token_len(
-    tape_bytes_view: &BytesTapeView<u64>,
-    side_single_cpu: usize,
-    side_multi_cpu: usize,
-    side_gpu: usize,
-) -> usize {
-    let widest_side = side_single_cpu.max(side_multi_cpu).max(side_gpu);
+/// Largest token byte length across the query/candidate slices of one pass, used to pre-size the
+/// `bio` aligner capacity.
+fn max_token_len(tape_bytes_view: &BytesTapeView<u64>, side: usize) -> usize {
     let mut max_len = 0usize;
-    for index in 0..(2 * widest_side) {
+    for index in 0..(2 * side) {
         let token_len = tape_bytes_view[index].len();
         if token_len > max_len {
             max_len = token_len;
@@ -719,40 +518,129 @@ fn max_token_len(
     std::cmp::max(1, max_len)
 }
 
-/// Shared NW/SW score-benchmark body for the `linear` and `affine` gap-cost groups. The bio
-/// baselines and the StringZilla CPU/GPU variants are identical between the two; only the gap
-/// open/extend penalties and the group label differ.
-fn align_score_benchmarks<GpuError>(
+/// NW/SW score benchmarks for one gap-cost group. The bio baselines and the StringZilla variants are
+/// identical between the `linear` and `affine` groups; only the gap penalties and the label differ.
+fn perform_score_benchmarks(
     group_name: &str,
     budget: &BenchBudget,
     tape_bytes_view: &BytesTapeView<u64>,
-    cpu_single: &DeviceScope,
-    cpu_parallel: &DeviceScope,
-    maybe_gpu: &Result<DeviceScope, GpuError>,
-    nw_single: &NeedlemanWunschScores,
-    nw_parallel: &NeedlemanWunschScores,
-    maybe_nw_gpu: &Option<NeedlemanWunschScores>,
-    sw_single: &SmithWatermanScores,
-    sw_parallel: &SmithWatermanScores,
-    maybe_sw_gpu: &Option<SmithWatermanScores>,
-    max_len: usize,
-    open_cost: i32,
-    extend_cost: i32,
-    side_single_cpu: usize,
-    side_multi_cpu: usize,
-    side_gpu: usize,
     num_cores: usize,
+    tape_len: usize,
+    open_cost: i8,
+    extend_cost: i8,
 ) {
-    let baseline_side = side_single_cpu;
+    // Unary scoring (match=2, mismatch=-1) folded into the 32-class table.
+    let (byte_to_class, class_costs) = unary_class_costs(2, -1);
+
+    for_each_device_pass(num_cores, |pass, scope_name, device, cores| {
+        let side = crossproduct_side(auto_batch_size(cores, DEFAULT_BATCH_PER_CORE), tape_len);
+
+        // Every rival is single-threaded, so it is measured in the pass that has no thread pool alive.
+        if matches!(pass, DeviceChoice::OneCore) {
+            bio_align_baselines(
+                group_name,
+                budget,
+                tape_bytes_view,
+                side,
+                max_token_len(tape_bytes_view, side),
+                open_cost,
+                extend_cost,
+            );
+        }
+
+        // Needleman-Wunsch (Global alignment)
+        let name = format!("{group_name}/stringzillas::NeedlemanWunschScores<{scope_name}>");
+        match NeedlemanWunschScores::new(
+            device,
+            &byte_to_class,
+            &class_costs,
+            open_cost,
+            extend_cost,
+        ) {
+            Ok(engine) => {
+                let (cells, bytes) = crossproduct_metrics_bytes(tape_bytes_view, side);
+                let queries = bytes_query_vec(tape_bytes_view, side);
+                let candidates = bytes_candidate_vec(tape_bytes_view, side);
+                match engine.compute(device, &queries, &candidates) {
+                    Ok(mut matrix) => measure_crossproduct_bytes_isize(
+                        &name,
+                        budget,
+                        tape_bytes_view,
+                        side,
+                        cells,
+                        bytes,
+                        &mut matrix,
+                        |queries, candidates, matrix| {
+                            engine
+                                .compute_into(device, queries, candidates, matrix)
+                                .unwrap_or_else(|error| {
+                                    panic!("{name}: {error}");
+                                });
+                        },
+                    ),
+                    Err(error) => report_skipped(&name, error),
+                }
+            }
+            Err(error) => report_skipped(&name, error),
+        }
+
+        // Smith-Waterman (Local alignment)
+        let name = format!("{group_name}/stringzillas::SmithWatermanScores<{scope_name}>");
+        match SmithWatermanScores::new(device, &byte_to_class, &class_costs, open_cost, extend_cost)
+        {
+            Ok(engine) => {
+                let (cells, bytes) = crossproduct_metrics_bytes(tape_bytes_view, side);
+                let queries = bytes_query_vec(tape_bytes_view, side);
+                let candidates = bytes_candidate_vec(tape_bytes_view, side);
+                match engine.compute(device, &queries, &candidates) {
+                    Ok(mut matrix) => measure_crossproduct_bytes_isize(
+                        &name,
+                        budget,
+                        tape_bytes_view,
+                        side,
+                        cells,
+                        bytes,
+                        &mut matrix,
+                        |queries, candidates, matrix| {
+                            engine
+                                .compute_into(device, queries, candidates, matrix)
+                                .unwrap_or_else(|error| {
+                                    panic!("{name}: {error}");
+                                });
+                        },
+                    ),
+                    Err(error) => report_skipped(&name, error),
+                }
+            }
+            Err(error) => report_skipped(&name, error),
+        }
+    });
+}
+
+/// The single-threaded `bio` alignment rivals, run only in the single-core pass.
+fn bio_align_baselines(
+    group_name: &str,
+    budget: &BenchBudget,
+    tape_bytes_view: &BytesTapeView<u64>,
+    baseline_side: usize,
+    max_len: usize,
+    open_cost: i8,
+    extend_cost: i8,
+) {
     {
-        let mut aligner =
-            Aligner::with_capacity(max_len, max_len, open_cost, extend_cost, |a: u8, b: u8| {
+        let mut aligner = Aligner::with_capacity(
+            max_len,
+            max_len,
+            open_cost as i32,
+            extend_cost as i32,
+            |a: u8, b: u8| {
                 if a == b {
                     2
                 } else {
                     -1
                 }
-            });
+            },
+        );
         let mut pair_index = 0;
         measure_throughput(
             &format!("{group_name}/bio::pairwise::global<1cpu>"),
@@ -771,14 +659,19 @@ fn align_score_benchmarks<GpuError>(
     }
 
     {
-        let mut aligner =
-            Aligner::with_capacity(max_len, max_len, open_cost, extend_cost, |a: u8, b: u8| {
+        let mut aligner = Aligner::with_capacity(
+            max_len,
+            max_len,
+            open_cost as i32,
+            extend_cost as i32,
+            |a: u8, b: u8| {
                 if a == b {
                     2
                 } else {
                     -1
                 }
-            });
+            },
+        );
         let mut pair_index = 0;
         measure_throughput(
             &format!("{group_name}/bio::pairwise::local<1cpu>"),
@@ -795,236 +688,6 @@ fn align_score_benchmarks<GpuError>(
             },
         );
     }
-
-    // Needleman-Wunsch (Global alignment)
-    {
-        let (cells, bytes) = crossproduct_metrics_bytes(tape_bytes_view, side_single_cpu);
-        let queries = bytes_query_vec(tape_bytes_view, side_single_cpu);
-        let candidates = bytes_candidate_vec(tape_bytes_view, side_single_cpu);
-        let mut matrix = nw_single
-            .compute(cpu_single, &queries, &candidates)
-            .expect("Failed to allocate NeedlemanWunschScores matrix (single)");
-        measure_crossproduct_bytes_isize(
-            "stringzillas::NeedlemanWunschScores<1cpu>",
-            budget,
-            tape_bytes_view,
-            side_single_cpu,
-            cells,
-            bytes,
-            &mut matrix,
-            |queries, candidates, matrix| {
-                nw_single
-                    .compute_into(cpu_single, queries, candidates, matrix)
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "Failed to compute NeedlemanWunschScores on CPU (single-threaded): {}",
-                            error
-                        );
-                    });
-            },
-        );
-    }
-
-    {
-        let (cells, bytes) = crossproduct_metrics_bytes(tape_bytes_view, side_multi_cpu);
-        let queries = bytes_query_vec(tape_bytes_view, side_multi_cpu);
-        let candidates = bytes_candidate_vec(tape_bytes_view, side_multi_cpu);
-        let mut matrix = nw_parallel
-            .compute(cpu_parallel, &queries, &candidates)
-            .expect("Failed to allocate NeedlemanWunschScores matrix (parallel)");
-        measure_crossproduct_bytes_isize(
-            &format!("stringzillas::NeedlemanWunschScores<{}cpu>", num_cores),
-            budget,
-            tape_bytes_view,
-            side_multi_cpu,
-            cells,
-            bytes,
-            &mut matrix,
-            |queries, candidates, matrix| {
-                nw_parallel
-                    .compute_into(cpu_parallel, queries, candidates, matrix)
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "Failed to compute NeedlemanWunschScores on CPU (multi-threaded): {}",
-                            error
-                        );
-                    });
-            },
-        );
-    }
-
-    if maybe_gpu.is_ok() && maybe_nw_gpu.is_some() {
-        let gpu = maybe_gpu.as_ref().ok().unwrap();
-        let engine = maybe_nw_gpu.as_ref().unwrap();
-        let (cells, bytes) = crossproduct_metrics_bytes(tape_bytes_view, side_gpu);
-        let queries = bytes_query_vec(tape_bytes_view, side_gpu);
-        let candidates = bytes_candidate_vec(tape_bytes_view, side_gpu);
-        let mut matrix = engine
-            .compute(gpu, &queries, &candidates)
-            .expect("Failed to allocate NeedlemanWunschScores matrix (GPU)");
-        measure_crossproduct_bytes_isize(
-            "stringzillas::NeedlemanWunschScores<1gpu>",
-            budget,
-            tape_bytes_view,
-            side_gpu,
-            cells,
-            bytes,
-            &mut matrix,
-            |queries, candidates, matrix| {
-                engine
-                    .compute_into(gpu, queries, candidates, matrix)
-                    .unwrap_or_else(|error| {
-                        panic!("Failed to compute on GPU: {}. This may indicate GPU memory allocation issues with BytesTapeView.", error);
-                    });
-            },
-        );
-    }
-
-    // Smith-Waterman (Local alignment)
-    {
-        let (cells, bytes) = crossproduct_metrics_bytes(tape_bytes_view, side_single_cpu);
-        let queries = bytes_query_vec(tape_bytes_view, side_single_cpu);
-        let candidates = bytes_candidate_vec(tape_bytes_view, side_single_cpu);
-        let mut matrix = sw_single
-            .compute(cpu_single, &queries, &candidates)
-            .expect("Failed to allocate SmithWatermanScores matrix (single)");
-        measure_crossproduct_bytes_isize(
-            "stringzillas::SmithWatermanScores<1cpu>",
-            budget,
-            tape_bytes_view,
-            side_single_cpu,
-            cells,
-            bytes,
-            &mut matrix,
-            |queries, candidates, matrix| {
-                sw_single
-                    .compute_into(cpu_single, queries, candidates, matrix)
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "Failed to compute SmithWatermanScores on CPU (single-threaded): {}",
-                            error
-                        );
-                    });
-            },
-        );
-    }
-
-    {
-        let (cells, bytes) = crossproduct_metrics_bytes(tape_bytes_view, side_multi_cpu);
-        let queries = bytes_query_vec(tape_bytes_view, side_multi_cpu);
-        let candidates = bytes_candidate_vec(tape_bytes_view, side_multi_cpu);
-        let mut matrix = sw_parallel
-            .compute(cpu_parallel, &queries, &candidates)
-            .expect("Failed to allocate SmithWatermanScores matrix (parallel)");
-        measure_crossproduct_bytes_isize(
-            &format!("stringzillas::SmithWatermanScores<{}cpu>", num_cores),
-            budget,
-            tape_bytes_view,
-            side_multi_cpu,
-            cells,
-            bytes,
-            &mut matrix,
-            |queries, candidates, matrix| {
-                sw_parallel
-                    .compute_into(cpu_parallel, queries, candidates, matrix)
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "Failed to compute SmithWatermanScores on CPU (multi-threaded): {}",
-                            error
-                        );
-                    });
-            },
-        );
-    }
-
-    if maybe_gpu.is_ok() && maybe_sw_gpu.is_some() {
-        let gpu = maybe_gpu.as_ref().ok().unwrap();
-        let engine = maybe_sw_gpu.as_ref().unwrap();
-        let (cells, bytes) = crossproduct_metrics_bytes(tape_bytes_view, side_gpu);
-        let queries = bytes_query_vec(tape_bytes_view, side_gpu);
-        let candidates = bytes_candidate_vec(tape_bytes_view, side_gpu);
-        let mut matrix = engine
-            .compute(gpu, &queries, &candidates)
-            .expect("Failed to allocate SmithWatermanScores matrix (GPU)");
-        measure_crossproduct_bytes_isize(
-            "stringzillas::SmithWatermanScores<1gpu>",
-            budget,
-            tape_bytes_view,
-            side_gpu,
-            cells,
-            bytes,
-            &mut matrix,
-            |queries, candidates, matrix| {
-                engine
-                    .compute_into(gpu, queries, candidates, matrix)
-                    .unwrap_or_else(|error| {
-                        panic!("Failed to compute on GPU: {}. This may indicate GPU memory allocation issues with BytesTapeView.", error);
-                    });
-            },
-        );
-    }
-}
-
-/// Affine gap cost benchmarks: NW/SW with affine penalties (match=2, mismatch=-1, open=-5, extend=-1)
-fn perform_affine_benchmarks(
-    budget: &BenchBudget,
-    tape_bytes_view: &BytesTapeView<u64>,
-    num_cores: usize,
-    side_single_cpu: usize,
-    side_multi_cpu: usize,
-    side_gpu: usize,
-) {
-    let cpu_single = DeviceScope::cpu_cores(1).expect("Failed to create single-core device scope");
-    let cpu_parallel =
-        DeviceScope::cpu_cores(num_cores).expect("Failed to create multi-core device scope");
-    let maybe_gpu = DeviceScope::gpu_device(0);
-
-    // Create scoring matrix for affine gap costs (match=2, mismatch=-1)
-    // Unary scoring (match=2, mismatch=-1) folded into the 32-class table.
-    let (byte_to_class, class_costs) = unary_class_costs(2, -1);
-
-    // Create engines once (affine gap costs: open=-5, extend=-1)
-    let nw_single = NeedlemanWunschScores::new(&cpu_single, &byte_to_class, &class_costs, -5, -1)
-        .expect("Failed to create NW single");
-    let nw_parallel =
-        NeedlemanWunschScores::new(&cpu_parallel, &byte_to_class, &class_costs, -5, -1)
-            .expect("Failed to create NW parallel");
-    let sw_single = SmithWatermanScores::new(&cpu_single, &byte_to_class, &class_costs, -5, -1)
-        .expect("Failed to create SW single");
-    let sw_parallel = SmithWatermanScores::new(&cpu_parallel, &byte_to_class, &class_costs, -5, -1)
-        .expect("Failed to create SW parallel");
-    let maybe_nw_gpu = maybe_gpu
-        .as_ref()
-        .ok()
-        .and_then(|gpu| NeedlemanWunschScores::new(gpu, &byte_to_class, &class_costs, -5, -1).ok());
-    let maybe_sw_gpu = maybe_gpu
-        .as_ref()
-        .ok()
-        .and_then(|gpu| SmithWatermanScores::new(gpu, &byte_to_class, &class_costs, -5, -1).ok());
-
-    let max_len = max_token_len(tape_bytes_view, side_single_cpu, side_multi_cpu, side_gpu);
-
-    align_score_benchmarks(
-        "affine",
-        budget,
-        tape_bytes_view,
-        &cpu_single,
-        &cpu_parallel,
-        &maybe_gpu,
-        &nw_single,
-        &nw_parallel,
-        &maybe_nw_gpu,
-        &sw_single,
-        &sw_parallel,
-        &maybe_sw_gpu,
-        max_len,
-        -5,
-        -1,
-        side_single_cpu,
-        side_multi_cpu,
-        side_gpu,
-        num_cores,
-    );
 }
 
 fn main() {

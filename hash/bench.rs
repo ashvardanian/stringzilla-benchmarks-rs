@@ -255,10 +255,11 @@ fn bench_stateless(budget: &BenchBudget, tokens: &BytesCowsAuto) {
     // Benchmark: CRC32 — left inline because `crc32fast::hash` returns `u32`, so the
     // bench closure black-boxes a `u32` while the collision closure casts to `u64`;
     // the two-closure shapes differ from `bench_stateless_hash`.
-    bench_each_token("stateless/crc32fast::hash", budget, &slices, |token| {
+    let name = "stateless/crc32fast::hash";
+    bench_each_token(name, budget, &slices, |token| {
         let _ = black_box(crc32fast::hash(token));
     });
-    if !unique_tokens.is_empty() && should_run("stateless/crc32fast::hash") {
+    if !unique_tokens.is_empty() && should_run(name) {
         print_collision_rate(&unique_tokens, |token_bytes| {
             crc32fast::hash(token_bytes) as u64
         });
@@ -277,15 +278,11 @@ fn bench_stateless(budget: &BenchBudget, tokens: &BytesCowsAuto) {
     // the cfg gate cannot be placed on a single function call expression without a block.
     #[cfg(target_arch = "x86_64")]
     {
-        bench_each_token(
-            "stateless/cityhash::city_hash_64",
-            budget,
-            &slices,
-            |token| {
-                let _ = black_box(cityhash::city_hash_64(token));
-            },
-        );
-        if !unique_tokens.is_empty() && should_run("stateless/cityhash::city_hash_64") {
+        let name = "stateless/cityhash::city_hash_64";
+        bench_each_token(name, budget, &slices, |token| {
+            let _ = black_box(cityhash::city_hash_64(token));
+        });
+        if !unique_tokens.is_empty() && should_run(name) {
             print_collision_rate(&unique_tokens, |token_bytes| {
                 cityhash::city_hash_64(token_bytes)
             });
@@ -421,10 +418,11 @@ fn bench_crypto(budget: &BenchBudget, tokens: &BytesCowsAuto) {
     });
 
     // Benchmark: Blake3, a different construction with its own security argument
-    bench_each_token("reference/blake3::hash", budget, &slices, |token| {
+    let name = "reference/blake3::hash";
+    bench_each_token(name, budget, &slices, |token| {
         let _ = black_box(blake3::hash(token));
     });
-    if !unique_tokens.is_empty() && should_run("reference/blake3::hash") {
+    if !unique_tokens.is_empty() && should_run(name) {
         print_collision_rate(&unique_tokens, |token_bytes| {
             let hash = blake3::hash(token_bytes);
             let bytes = hash.as_bytes();
@@ -435,12 +433,13 @@ fn bench_crypto(budget: &BenchBudget, tokens: &BytesCowsAuto) {
     }
 
     // Benchmark: SHA256 via sha2
-    bench_each_token("crypto/sha2::Sha256", budget, &slices, |token| {
+    let name = "crypto/sha2::Sha256";
+    bench_each_token(name, budget, &slices, |token| {
         let mut hasher = Sha256::new();
         hasher.update(token);
         let _ = black_box(hasher.finalize());
     });
-    if !unique_tokens.is_empty() && should_run("crypto/sha2::Sha256") {
+    if !unique_tokens.is_empty() && should_run(name) {
         print_collision_rate(&unique_tokens, |token_bytes| {
             let mut hasher = Sha256::new();
             hasher.update(token_bytes);
@@ -453,10 +452,11 @@ fn bench_crypto(budget: &BenchBudget, tokens: &BytesCowsAuto) {
     }
 
     // Benchmark: SHA256 via ring
-    bench_each_token("crypto/ring::SHA256", budget, &slices, |token| {
+    let name = "crypto/ring::SHA256";
+    bench_each_token(name, budget, &slices, |token| {
         let _ = black_box(ring_digest::digest(&ring_digest::SHA256, token));
     });
-    if !unique_tokens.is_empty() && should_run("crypto/ring::SHA256") {
+    if !unique_tokens.is_empty() && should_run(name) {
         print_collision_rate(&unique_tokens, |token_bytes| {
             let digest = ring_digest::digest(&ring_digest::SHA256, token_bytes);
             let bytes = digest.as_ref();
@@ -467,10 +467,11 @@ fn bench_crypto(budget: &BenchBudget, tokens: &BytesCowsAuto) {
     }
 
     // Benchmark: SHA256 via stringzilla
-    bench_each_token("crypto/stringzilla::Sha256", budget, &slices, |token| {
+    let name = "crypto/stringzilla::Sha256";
+    bench_each_token(name, budget, &slices, |token| {
         let _ = black_box(sz::Sha256::hash(token));
     });
-    if !unique_tokens.is_empty() && should_run("crypto/stringzilla::Sha256") {
+    if !unique_tokens.is_empty() && should_run(name) {
         print_collision_rate(&unique_tokens, |token_bytes| {
             let digest = sz::Sha256::hash(token_bytes);
             u64::from_le_bytes([

@@ -112,12 +112,6 @@ def document_byte_lengths(documents):
 def benchmark_stringzillas(documents, dimensions, batch_size, time_limit_seconds, filter_pattern):
     """StringZilla Fingerprints on 1 core, all cores, and the GPU (if present)."""
     cpu_cores = os.cpu_count()
-    default_scope = szs.DeviceScope()
-    cpu_scope = szs.DeviceScope(cpu_cores=cpu_cores)
-    try:
-        gpu_scope = szs.DeviceScope(gpu_device=0)
-    except Exception:
-        gpu_scope = None
 
     moved = sz.Strs(documents)
     doc_bytes = document_byte_lengths(documents)
@@ -127,7 +121,11 @@ def benchmark_stringzillas(documents, dimensions, batch_size, time_limit_seconds
         gpu_multiprocessor_count(0) or 64, base=batch_size, default_base=DEFAULT_BATCH_PER_CORE
     )
 
-    def run_variant(suffix, scope, variant_batch_size):
+    def run_variant(suffix, scope_arguments, variant_batch_size):
+        """Opens this variant's scope, measures it, and drops the scope on return: an idle ForkUnion
+        pool spin-waits, so a multi-core scope held across the single-core variant would consume the
+        very cores that variant is being measured on."""
+        scope = szs.DeviceScope(**scope_arguments)
         engine = szs.Fingerprints(ndim=dimensions, window_widths=NGRAM_WIDTHS_ARRAY, capabilities=scope)
 
         def kernel(strs_slice):
@@ -142,15 +140,16 @@ def benchmark_stringzillas(documents, dimensions, batch_size, time_limit_seconds
             time_limit_seconds,
             variant_batch_size,
         )
+        # Scope and engine die with this call, so the next variant starts on a quiet machine.
 
     if should_run("minhash/stringzillas.Fingerprints<1cpu>", filter_pattern):
-        run_variant("<1cpu>", default_scope, 1)
+        run_variant("<1cpu>", {}, 1)
     if should_run(f"minhash/stringzillas.Fingerprints<{cpu_cores}cpu,batch={all_cpu_batch_size}>", filter_pattern):
-        run_variant(f"<{cpu_cores}cpu,batch={all_cpu_batch_size}>", cpu_scope, all_cpu_batch_size)
-    if gpu_scope is not None and should_run(
+        run_variant(f"<{cpu_cores}cpu,batch={all_cpu_batch_size}>", {"cpu_cores": cpu_cores}, all_cpu_batch_size)
+    if "cuda" in szs.__capabilities__ and should_run(
         f"minhash/stringzillas.Fingerprints<1gpu,batch={gpu_batch_size}>", filter_pattern
     ):
-        run_variant(f"<1gpu,batch={gpu_batch_size}>", gpu_scope, gpu_batch_size)
+        run_variant(f"<1gpu,batch={gpu_batch_size}>", {"gpu_device": 0}, gpu_batch_size)
 
 
 def benchmark_datasketch(documents, dimensions, batch_size, time_limit_seconds, filter_pattern):

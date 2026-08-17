@@ -14,6 +14,8 @@ pyahocorasick==2.3.1
 # For multi-pattern search and BM25 scoring:
 ahocorasick-rs==1.0.3 # https://github.com/G-Research/ahocorasick_rs, binds the `aho-corasick` crate
 bm25s==0.3.10 # https://github.com/xhluca/bm25s, index-then-query scorer over scipy sparse matrices
+rank-bm25==0.2.2 # https://github.com/dorianbrown/rank_bm25, the most installed BM25, pure Python
+scikit-learn==1.9.0 # https://github.com/scikit-learn/scikit-learn, TfidfVectorizer as the TF-IDF reference
 
 # For hashing:
 xxhash==3.8.1 # https://github.com/ifduyue/python-xxhash, https://github.com/Cyan4973/xxHash

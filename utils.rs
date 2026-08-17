@@ -10,6 +10,7 @@ use std::path::Path;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 use stringtape::BytesCowsAuto;
+use stringzilla::szs::DeviceScope;
 
 /// Get an optional environment variable, returning None if not set.
 #[allow(dead_code)]
@@ -334,6 +335,18 @@ pub fn load_dataset(
         path: dataset_path.clone(),
         source: error,
     })?;
+
+    // A bounded read stops at a byte offset, which lands inside a multi-byte codepoint often enough on a
+    // multilingual corpus. Byte benches never notice; every `as_chars` consumer would fail on the final
+    // token, so the incomplete tail is dropped here. A malformed sequence mid-file is left alone, since
+    // that is the corpus being wrong rather than the limit cutting it.
+    if limit_bytes != 0 {
+        if let Err(error) = std::str::from_utf8(&content) {
+            if error.error_len().is_none() {
+                content.truncate(error.valid_up_to());
+            }
+        }
+    }
 
     // Check for empty file
     if content.is_empty() {
@@ -870,6 +883,86 @@ pub fn gpu_multiprocessor_count(device_index: i32) -> Option<usize> {
 #[cfg(not(feature = "cuda"))]
 pub fn gpu_multiprocessor_count(_device_index: i32) -> Option<usize> {
     None
+}
+
+/// Streaming multiprocessor count assumed when the CUDA runtime declines to report one.
+const FALLBACK_MULTIPROCESSOR_COUNT: usize = 64;
+
+/// Which device one pass of a sweep runs on. Passes run single core first and GPU last, and each scope
+/// is dropped with its pass: an idle ForkUnion pool spin-waits, so a multi-core scope alive during a
+/// single-threaded cell consumes the very cores that cell is being measured on.
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub enum DeviceChoice {
+    OneCore,
+    AllCores,
+    OneGpu,
+}
+
+impl DeviceChoice {
+    /// Display name for benchmark titles, matching the `<1cpu>` / `<16cpu>` / `<1gpu>` flag grammar.
+    #[allow(dead_code)]
+    pub fn name(self, core_count: usize) -> String {
+        match self {
+            Self::OneCore => "1cpu".to_string(),
+            Self::AllCores => format!("{}cpu", core_count),
+            Self::OneGpu => "1gpu".to_string(),
+        }
+    }
+
+    /// Parallel cores this pass has, counting one GPU streaming multiprocessor as one core.
+    #[allow(dead_code)]
+    pub fn cores(self, core_count: usize) -> usize {
+        match self {
+            Self::OneCore => 1,
+            Self::AllCores => core_count,
+            Self::OneGpu => gpu_multiprocessor_count(0).unwrap_or(FALLBACK_MULTIPROCESSOR_COUNT),
+        }
+    }
+
+    /// Opens the scope, or `None` where the device is unavailable, so a box without a GPU simply runs
+    /// two passes rather than failing. Public so a bench can open a short-lived single-core scope for
+    /// the sizing probes that run before its passes.
+    #[allow(dead_code)]
+    pub fn open_scope(self, core_count: usize) -> Option<DeviceScope> {
+        match self {
+            Self::OneCore => DeviceScope::cpu_cores(1).ok(),
+            Self::AllCores => DeviceScope::cpu_cores(core_count).ok(),
+            Self::OneGpu => DeviceScope::gpu_device(0).ok(),
+        }
+    }
+}
+
+/// Reports a cell whose engine declined these inputs, so a backend that cannot serve them leaves a
+/// named line in the log rather than a silent gap in the table.
+#[allow(dead_code)]
+pub fn report_skipped(name: &str, error: impl fmt::Display) {
+    eprintln!("{name}: SKIPPED ({error})");
+}
+
+/// Runs `body` once per available device, holding each scope only for that pass. `body` receives the
+/// pass identity, its display name, the scope, and that device's parallel core count, so a family
+/// writes each cell once and the sweep is parameterized by hardware rather than duplicated per device.
+/// A family that batches turns the core count into a batch with [`auto_batch_size`] and its own base.
+///
+/// Single-threaded cells belong in the [`DeviceChoice::OneCore`] arm, which runs before any pool exists.
+#[allow(dead_code)]
+pub fn for_each_device_pass(
+    core_count: usize,
+    mut body: impl FnMut(DeviceChoice, &str, &DeviceScope, usize),
+) {
+    for choice in [
+        DeviceChoice::OneCore,
+        DeviceChoice::AllCores,
+        DeviceChoice::OneGpu,
+    ] {
+        let Some(device) = choice.open_scope(core_count) else {
+            continue;
+        };
+        let name = choice.name(core_count);
+        body(choice, &name, &device, choice.cores(core_count));
+        // `device` drops here, so the next pass starts on a quiet machine.
+    }
 }
 
 /// RAII guard that profiles a code section using perf events on Linux.

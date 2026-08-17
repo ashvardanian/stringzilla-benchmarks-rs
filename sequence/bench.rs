@@ -166,28 +166,24 @@ fn bench_argsort(budget: &BenchBudget, unsorted: &CharsCowsAuto<'static>) {
 
     // Benchmark: Apache Arrow's `lexsort_to_indices`. Uses `LargeStringArray` because the
     // dataset's tape can exceed the 32-bit offset of the standard `StringArray` and would panic.
-    if should_run("argsort/arrow::lexsort_to_indices") {
+    let name = "argsort/arrow::lexsort_to_indices";
+    if should_run(name) {
         let array = Arc::new(LargeStringArray::from_iter_values(unsorted.iter())) as ArrayRef;
 
-        measure_throughput(
-            "argsort/arrow::lexsort_to_indices",
-            ReportAs::Comparisons,
-            budget,
-            || {
-                let column_to_sort = SortColumn {
-                    values: array.clone(),
-                    options: Some(arrow::compute::SortOptions {
-                        descending: false,
-                        nulls_first: true,
-                    }),
-                };
-                match lexsort_to_indices(&[column_to_sort], None) {
-                    Ok(indices) => black_box(indices),
-                    Err(error) => panic!("Arrow lexsort failed: {:?}", error),
-                };
-                WorkUnits::new(comparisons_estimate, total_bytes)
-            },
-        );
+        measure_throughput(name, ReportAs::Comparisons, budget, || {
+            let column_to_sort = SortColumn {
+                values: array.clone(),
+                options: Some(arrow::compute::SortOptions {
+                    descending: false,
+                    nulls_first: true,
+                }),
+            };
+            match lexsort_to_indices(&[column_to_sort], None) {
+                Ok(indices) => black_box(indices),
+                Err(error) => panic!("Arrow lexsort failed: {:?}", error),
+            };
+            WorkUnits::new(comparisons_estimate, total_bytes)
+        });
 
         // Explicitly drop and reclaim memory (~4.7 GB)
         drop(array);
@@ -195,42 +191,35 @@ fn bench_argsort(budget: &BenchBudget, unsorted: &CharsCowsAuto<'static>) {
     }
 
     // Benchmark: Polars Series sort
-    if should_run("argsort/polars::Series::sort") {
+    let name = "argsort/polars::Series::sort";
+    if should_run(name) {
         // Polars can create Series from an iterator of &str
         let polars_series = Series::new(COLUMN_NAME.into(), unsorted.iter().collect::<Vec<&str>>());
-        measure_throughput(
-            "argsort/polars::Series::sort",
-            ReportAs::Comparisons,
-            budget,
-            || {
-                let sorted = polars_series.sort(POLARS_SORT_OPTIONS).unwrap();
-                let _ = black_box(sorted);
-                WorkUnits::new(comparisons_estimate, total_bytes)
-            },
-        );
+        measure_throughput(name, ReportAs::Comparisons, budget, || {
+            let sorted = polars_series.sort(POLARS_SORT_OPTIONS).unwrap();
+            let _ = black_box(sorted);
+            WorkUnits::new(comparisons_estimate, total_bytes)
+        });
         drop(polars_series);
         reclaim_memory();
     }
 
     // Benchmark: Polars Series argsort (returning indices)
-    if should_run("argsort/polars::Series::arg_sort") {
+    let name = "argsort/polars::Series::arg_sort";
+    if should_run(name) {
         let polars_series = Series::new(COLUMN_NAME.into(), unsorted.iter().collect::<Vec<&str>>());
-        measure_throughput(
-            "argsort/polars::Series::arg_sort",
-            ReportAs::Comparisons,
-            budget,
-            || {
-                let indices = polars_series.arg_sort(POLARS_SORT_OPTIONS);
-                black_box(indices);
-                WorkUnits::new(comparisons_estimate, total_bytes)
-            },
-        );
+        measure_throughput(name, ReportAs::Comparisons, budget, || {
+            let indices = polars_series.arg_sort(POLARS_SORT_OPTIONS);
+            black_box(indices);
+            WorkUnits::new(comparisons_estimate, total_bytes)
+        });
         drop(polars_series);
         reclaim_memory();
     }
 
     // Benchmark: Polars DataFrame sort
-    if should_run("argsort/polars::DataFrame::sort") {
+    let name = "argsort/polars::DataFrame::sort";
+    if should_run(name) {
         // Lazy initialization: only create DataFrame when needed
         // No unnecessary clone - DataFrame takes ownership directly
         let polars_dataframe = DataFrame::new(
@@ -239,18 +228,13 @@ fn bench_argsort(budget: &BenchBudget, unsorted: &CharsCowsAuto<'static>) {
         )
         .unwrap();
 
-        measure_throughput(
-            "argsort/polars::DataFrame::sort",
-            ReportAs::Comparisons,
-            budget,
-            || {
-                let sorted = polars_dataframe
-                    .sort([COLUMN_NAME], polars_sort_multiple_options.clone())
-                    .unwrap();
-                black_box(sorted);
-                WorkUnits::new(comparisons_estimate, total_bytes)
-            },
-        );
+        measure_throughput(name, ReportAs::Comparisons, budget, || {
+            let sorted = polars_dataframe
+                .sort([COLUMN_NAME], polars_sort_multiple_options.clone())
+                .unwrap();
+            black_box(sorted);
+            WorkUnits::new(comparisons_estimate, total_bytes)
+        });
 
         // Explicitly drop and reclaim memory (~4.7 GB)
         drop(polars_dataframe);

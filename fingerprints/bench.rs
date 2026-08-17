@@ -71,14 +71,14 @@ fn resolve_core_count(topology: &fu::Topology) -> usize {
 }
 
 use probabilistic_collections::similarity::{ByteGrams, MinHash};
-use stringzilla::szs::{AnyBytesTape, DeviceScope, Fingerprints, UnifiedAlloc, UnifiedVec};
+use stringzilla::szs::{AnyBytesTape, Fingerprints, UnifiedAlloc, UnifiedVec};
 
 #[path = "../utils.rs"]
 mod utils;
 use utils::{
-    auto_batch_size, get_env, get_env_or_default, gpu_multiprocessor_count, install_panic_hook,
-    load_dataset, log_stringzilla_metadata, measure_throughput, BenchBudget, ReportAs, ResultExt,
-    WorkUnits, COMPUTE_BOUND_SLICE,
+    auto_batch_size, for_each_device_pass, get_env, get_env_or_default, gpu_multiprocessor_count,
+    install_panic_hook, load_dataset, log_stringzilla_metadata, measure_throughput, report_skipped,
+    BenchBudget, DeviceChoice, ReportAs, ResultExt, WorkUnits, COMPUTE_BOUND_SLICE,
 };
 
 // Fixed n-gram widths for multi-scale fingerprinting
@@ -325,136 +325,32 @@ fn bench_fingerprints(budget: &BenchBudget) {
 
         println!("# minhash/ndim_{}", dimensions);
 
-        // StringZilla engines and device scopes (1cpu, Ncpu, GPU?)
-        let cpu_single = DeviceScope::cpu_cores(1).unwrap_or_else(|error| {
-            panic!(
-                "Failed to create single-core CPU device scope for fingerprinting: {}",
-                error
-            )
-        });
-        let cpu_parallel = DeviceScope::cpu_cores(num_cores).unwrap_or_else(|error| {
-            panic!(
-                "Failed to create {}-core CPU device scope for fingerprinting: {}",
-                num_cores, error
-            )
-        });
-        let maybe_gpu = DeviceScope::gpu_device(0);
-
-        let sz_single = Fingerprints::builder()
-            .ascii()
-            .window_widths(&NGRAM_WIDTHS)
-            .dimensions(dimensions)
-            .build(&cpu_single)
-            .unwrap_or_else(|error| {
-                panic!(
-                    "Failed to create single-core StringZilla fingerprinting engine: {}",
-                    error
-                )
-            });
-        let sz_parallel = Fingerprints::builder()
-            .ascii()
-            .window_widths(&NGRAM_WIDTHS)
-            .dimensions(dimensions)
-            .build(&cpu_parallel)
-            .unwrap_or_else(|error| {
-                panic!(
-                    "Failed to create {}-core StringZilla fingerprinting engine: {}",
-                    num_cores, error
-                )
-            });
-        let maybe_sz_gpu = maybe_gpu.as_ref().ok().and_then(|gpu| {
-            Fingerprints::builder()
+        // Each pass opens its own scope and engine and drops both with the pass: an idle ForkUnion
+        // pool spin-waits, so a multi-core scope alive during the single-threaded MinHash baselines
+        // would consume the very cores those baselines are being measured on.
+        let tokens_count = total_documents;
+        for_each_device_pass(num_cores, |pass, scope_name, device, cores| {
+            let batch = auto_batch_size(cores, DEFAULT_BATCH_PER_CORE);
+            let name = format!("minhash/stringzillas::Fingerprints<{scope_name}>");
+            let engine = match Fingerprints::builder()
                 .ascii()
                 .window_widths(&NGRAM_WIDTHS)
                 .dimensions(dimensions)
-                .build(gpu)
-                .ok()
-        });
+                .build(device)
+            {
+                Ok(engine) => engine,
+                Err(error) => return report_skipped(&name, error),
+            };
 
-        let tokens_count = total_documents;
-
-        // StringZilla: 1x CPU. Result buffers sized to this variant's single-core batch.
-        measure_fingerprints(
-            "minhash/stringzillas::Fingerprints<1cpu>",
-            budget,
-            &bytes_view,
-            &chars_view,
-            batch_single_cpu,
-            dimensions,
-            tokens_count,
-            hash_ops_per_token,
-            avg_token_bytes,
-            |batch_bytes_view, dimensions, min_hashes_slice, min_counts_slice| {
-                sz_single
-                    .compute_into(
-                        &cpu_single,
-                        AnyBytesTape::View64(batch_bytes_view),
-                        dimensions,
-                        min_hashes_slice,
-                        min_counts_slice,
-                    )
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "Failed to compute StringZilla fingerprints on single CPU core: {}",
-                            error
-                        )
-                    });
-            },
-            |_actual, _min_hashes_slice| {},
-        );
-
-        // StringZilla: Nx CPU. Result buffers sized to this variant's multi-core batch.
-        measure_fingerprints(
-            &format!("minhash/stringzillas::Fingerprints<{}cpu>", num_cores),
-            budget,
-            &bytes_view,
-            &chars_view,
-            batch_multi_cpu,
-            dimensions,
-            tokens_count,
-            hash_ops_per_token,
-            avg_token_bytes,
-            |batch_bytes_view, dimensions, min_hashes_slice, min_counts_slice| {
-                sz_parallel
-                    .compute_into(
-                        &cpu_parallel,
-                        AnyBytesTape::View64(batch_bytes_view),
-                        dimensions,
-                        min_hashes_slice,
-                        min_counts_slice,
-                    )
-                    .unwrap_or_else(|error| {
-                        panic!(
-                            "Failed to compute StringZilla fingerprints on {} CPU cores: {}",
-                            num_cores, error
-                        )
-                    });
-            },
-            |actual, min_hashes_slice| {
-                // Fill quality matrix - direct copy for StringZilla (u32 values)
-                for document_index in 0..actual {
-                    if sz_document_index < total_documents {
-                        let start = document_index * dimensions;
-                        let end = start + dimensions;
-                        for (dimension_index, &hash_value) in
-                            min_hashes_slice[start..end].iter().enumerate()
-                        {
-                            sz_matrix[sz_document_index][dimension_index] = hash_value;
-                        }
-                        sz_document_index += 1;
-                    }
-                }
-            },
-        );
-
-        // StringZilla: 1x GPU (if available). Result buffers sized to the GPU batch.
-        if let (Ok(gpu), Some(engine)) = (maybe_gpu.as_ref(), maybe_sz_gpu.as_ref()) {
+            // The quality matrices are filled from the multi-core pass alone, so one pass owns each
+            // document rather than every pass re-reporting the same corpus.
+            let fills_quality_matrix = matches!(pass, DeviceChoice::AllCores);
             measure_fingerprints(
-                "minhash/stringzillas::Fingerprints<1gpu>",
+                &name,
                 budget,
                 &bytes_view,
                 &chars_view,
-                batch_gpu,
+                batch,
                 dimensions,
                 tokens_count,
                 hash_ops_per_token,
@@ -462,171 +358,188 @@ fn bench_fingerprints(budget: &BenchBudget) {
                 |batch_bytes_view, dimensions, min_hashes_slice, min_counts_slice| {
                     engine
                         .compute_into(
-                            gpu,
+                            device,
                             AnyBytesTape::View64(batch_bytes_view),
                             dimensions,
                             min_hashes_slice,
                             min_counts_slice,
                         )
-                        .unwrap_or_else(|error| {
-                            panic!(
-                                "Failed to compute StringZilla fingerprints on GPU: {}",
-                                error
-                            )
-                        });
+                        .unwrap_or_else(|error| panic!("{name}: {error}"));
                 },
-                |_actual, _min_hashes_slice| {},
-            );
-        }
-
-        // Create separate MinHash instances for each n-gram width
-        let hashes_per_width = dimensions / NGRAM_WIDTHS.len();
-        // One MinHash per n-gram width, on the stack (no heap Vec).
-        let minhashers: [MinHash<ByteGrams, _>; NGRAM_WIDTHS.len()] =
-            core::array::from_fn(|_| MinHash::new(hashes_per_width));
-
-        // pc::MinHash baseline (single-threaded scalar; uses the single-core batch).
-        {
-            // Pre-allocate output buffers outside the loop (reused across iterations)
-            let mut out = Vec::with_capacity(batch_single_cpu);
-            let mut combined_signature = Vec::with_capacity(dimensions);
-            let mut start_index = 0usize;
-            measure_throughput(
-                "minhash/pc::MinHash<ByteGrams>",
-                ReportAs::Hashes,
-                budget,
-                || {
-                    let (batch_bytes_view, _batch_chars_view, actual) = tokens_tape_slice(
-                        &bytes_view,
-                        &chars_view,
-                        &mut start_index,
-                        batch_single_cpu,
-                        tokens_count,
-                    );
-
-                    // Reuse output buffer (clear and reserve)
-                    out.clear();
-                    out.reserve(actual);
-
-                    // Process each line with separate MinHash per width
-                    for line_index in 0..batch_bytes_view.len() {
-                        let line_bytes: &[u8] = &batch_bytes_view[line_index];
-                        if !line_bytes.is_empty() {
-                            // Clear and reuse combined signature buffer
-                            combined_signature.clear();
-                            combined_signature.reserve(dimensions);
-
-                            // Process each n-gram width separately and concatenate results
-                            for (width_index, &width) in NGRAM_WIDTHS.iter().enumerate() {
-                                let iter = ByteGrams::new(line_bytes, width);
-                                let partial_sig = minhashers[width_index].get_min_hashes(iter);
-                                combined_signature.extend(partial_sig);
-                            }
-
-                            out.push(combined_signature.clone());
-
-                            // Fill quality matrix - direct memcpy
-                            if pc_document_index < total_documents
-                                && combined_signature.len() == dimensions
+                |actual, min_hashes_slice| {
+                    if !fills_quality_matrix {
+                        return;
+                    }
+                    for document_index in 0..actual {
+                        if sz_document_index < total_documents {
+                            let start = document_index * dimensions;
+                            let end = start + dimensions;
+                            for (dimension_index, &hash_value) in
+                                min_hashes_slice[start..end].iter().enumerate()
                             {
-                                pc_matrix[pc_document_index].copy_from_slice(&combined_signature);
-                                pc_document_index += 1;
+                                sz_matrix[sz_document_index][dimension_index] = hash_value;
                             }
+                            sz_document_index += 1;
                         }
                     }
-
-                    std::hint::black_box(&out);
-                    WorkUnits::new(
-                        actual as u64 * hash_ops_per_token,
-                        actual as u64 * avg_token_bytes,
-                    )
                 },
             );
-        }
 
-        // Serial MinHash baseline with independent universal hash functions per dimension.
-        {
-            // Pre-construct hash parameters for independent universal hash functions
-            // Each hash function uses: hash_i(x) = (a_i * hash(x) + b_i) mod mersenne_prime
-            const MERSENNE_PRIME: u64 = (1u64 << 61) - 1; // Large prime for universal hashing
+            // Every rival is single-threaded, so it is measured in the pass that has no pool alive.
+            if !matches!(pass, DeviceChoice::OneCore) {
+                return;
+            }
+            // Create separate MinHash instances for each n-gram width
+            let hashes_per_width = dimensions / NGRAM_WIDTHS.len();
+            // One MinHash per n-gram width, on the stack (no heap Vec).
+            let minhashers: [MinHash<ByteGrams, _>; NGRAM_WIDTHS.len()] =
+                core::array::from_fn(|_| MinHash::new(hashes_per_width));
 
-            // Generate independent hash function parameters
-            let hash_params: Vec<(u64, u64)> = (0..dimensions)
-                .map(|dimension_index| {
-                    let multiplier = 2 * dimension_index as u64 + 1; // Odd for universal hashing
-                    let offset = dimension_index as u64;
-                    (multiplier, offset)
-                })
-                .collect();
+            // pc::MinHash baseline (single-threaded scalar; uses the single-core batch).
+            {
+                // Pre-allocate output buffers outside the loop (reused across iterations)
+                let mut out = Vec::with_capacity(batch_single_cpu);
+                let mut combined_signature = Vec::with_capacity(dimensions);
+                let mut start_index = 0usize;
+                measure_throughput(
+                    "minhash/pc::MinHash<ByteGrams>",
+                    ReportAs::Hashes,
+                    budget,
+                    || {
+                        let (batch_bytes_view, _batch_chars_view, actual) = tokens_tape_slice(
+                            &bytes_view,
+                            &chars_view,
+                            &mut start_index,
+                            batch_single_cpu,
+                            tokens_count,
+                        );
 
-            let mut start_index = 0usize;
-            measure_throughput(
-                "minhash/serial::MinHash<ByteGrams>",
-                ReportAs::Hashes,
-                budget,
-                || {
-                    let (batch_bytes_view, _batch_chars_view, actual) = tokens_tape_slice(
-                        &bytes_view,
-                        &chars_view,
-                        &mut start_index,
-                        batch_single_cpu,
-                        tokens_count,
-                    );
+                        // Reuse output buffer (clear and reserve)
+                        out.clear();
+                        out.reserve(actual);
 
-                    let mut out = Vec::with_capacity(actual);
+                        // Process each line with separate MinHash per width
+                        for line_index in 0..batch_bytes_view.len() {
+                            let line_bytes: &[u8] = &batch_bytes_view[line_index];
+                            if !line_bytes.is_empty() {
+                                // Clear and reuse combined signature buffer
+                                combined_signature.clear();
+                                combined_signature.reserve(dimensions);
 
-                    // Process each line with serial MinHash
-                    for line_index in 0..batch_bytes_view.len() {
-                        let line_bytes: &[u8] = &batch_bytes_view[line_index];
-                        if !line_bytes.is_empty() {
-                            // Initialize minimum hash values for each hash function
-                            let mut min_hashes = vec![u64::MAX; dimensions];
+                                // Process each n-gram width separately and concatenate results
+                                for (width_index, &width) in NGRAM_WIDTHS.iter().enumerate() {
+                                    let iter = ByteGrams::new(line_bytes, width);
+                                    let partial_sig = minhashers[width_index].get_min_hashes(iter);
+                                    combined_signature.extend(partial_sig);
+                                }
 
-                            // Process all n-gram widths
-                            for &width in &NGRAM_WIDTHS {
-                                if line_bytes.len() >= width {
-                                    // Generate n-grams of this width
-                                    for window in line_bytes.windows(width) {
-                                        // Compute base hash of the n-gram
-                                        let mut hasher = DefaultHasher::new();
-                                        window.hash(&mut hasher);
-                                        let base_hash = hasher.finish();
+                                out.push(combined_signature.clone());
 
-                                        // Apply each independent hash function
-                                        for (hash_index, &(multiplier, offset)) in
-                                            hash_params.iter().enumerate()
-                                        {
-                                            let independent_hash = (multiplier
-                                                .wrapping_mul(base_hash)
-                                                .wrapping_add(offset))
-                                                % MERSENNE_PRIME;
-                                            min_hashes[hash_index] =
-                                                min_hashes[hash_index].min(independent_hash);
+                                // Fill quality matrix - direct memcpy
+                                if pc_document_index < total_documents
+                                    && combined_signature.len() == dimensions
+                                {
+                                    pc_matrix[pc_document_index]
+                                        .copy_from_slice(&combined_signature);
+                                    pc_document_index += 1;
+                                }
+                            }
+                        }
+
+                        std::hint::black_box(&out);
+                        WorkUnits::new(
+                            actual as u64 * hash_ops_per_token,
+                            actual as u64 * avg_token_bytes,
+                        )
+                    },
+                );
+            }
+
+            // Serial MinHash baseline with independent universal hash functions per dimension.
+            {
+                // Pre-construct hash parameters for independent universal hash functions
+                // Each hash function uses: hash_i(x) = (a_i * hash(x) + b_i) mod mersenne_prime
+                const MERSENNE_PRIME: u64 = (1u64 << 61) - 1; // Large prime for universal hashing
+
+                // Generate independent hash function parameters
+                let hash_params: Vec<(u64, u64)> = (0..dimensions)
+                    .map(|dimension_index| {
+                        let multiplier = 2 * dimension_index as u64 + 1; // Odd for universal hashing
+                        let offset = dimension_index as u64;
+                        (multiplier, offset)
+                    })
+                    .collect();
+
+                let mut start_index = 0usize;
+                measure_throughput(
+                    "minhash/serial::MinHash<ByteGrams>",
+                    ReportAs::Hashes,
+                    budget,
+                    || {
+                        let (batch_bytes_view, _batch_chars_view, actual) = tokens_tape_slice(
+                            &bytes_view,
+                            &chars_view,
+                            &mut start_index,
+                            batch_single_cpu,
+                            tokens_count,
+                        );
+
+                        let mut out = Vec::with_capacity(actual);
+
+                        // Process each line with serial MinHash
+                        for line_index in 0..batch_bytes_view.len() {
+                            let line_bytes: &[u8] = &batch_bytes_view[line_index];
+                            if !line_bytes.is_empty() {
+                                // Initialize minimum hash values for each hash function
+                                let mut min_hashes = vec![u64::MAX; dimensions];
+
+                                // Process all n-gram widths
+                                for &width in &NGRAM_WIDTHS {
+                                    if line_bytes.len() >= width {
+                                        // Generate n-grams of this width
+                                        for window in line_bytes.windows(width) {
+                                            // Compute base hash of the n-gram
+                                            let mut hasher = DefaultHasher::new();
+                                            window.hash(&mut hasher);
+                                            let base_hash = hasher.finish();
+
+                                            // Apply each independent hash function
+                                            for (hash_index, &(multiplier, offset)) in
+                                                hash_params.iter().enumerate()
+                                            {
+                                                let independent_hash = (multiplier
+                                                    .wrapping_mul(base_hash)
+                                                    .wrapping_add(offset))
+                                                    % MERSENNE_PRIME;
+                                                min_hashes[hash_index] =
+                                                    min_hashes[hash_index].min(independent_hash);
+                                            }
                                         }
                                     }
                                 }
-                            }
 
-                            out.push(min_hashes.clone());
+                                out.push(min_hashes.clone());
 
-                            // Fill quality matrix - direct memcpy
-                            if serial_document_index < total_documents
-                                && min_hashes.len() == dimensions
-                            {
-                                serial_matrix[serial_document_index].copy_from_slice(&min_hashes);
-                                serial_document_index += 1;
+                                // Fill quality matrix - direct memcpy
+                                if serial_document_index < total_documents
+                                    && min_hashes.len() == dimensions
+                                {
+                                    serial_matrix[serial_document_index]
+                                        .copy_from_slice(&min_hashes);
+                                    serial_document_index += 1;
+                                }
                             }
                         }
-                    }
 
-                    std::hint::black_box(&out);
-                    WorkUnits::new(
-                        actual as u64 * hash_ops_per_token,
-                        actual as u64 * avg_token_bytes,
-                    )
-                },
-            );
-        }
+                        std::hint::black_box(&out);
+                        WorkUnits::new(
+                            actual as u64 * hash_ops_per_token,
+                            actual as u64 * avg_token_bytes,
+                        )
+                    },
+                );
+            }
+        });
 
         // Compute and display quality metrics
         println!("\nHash Quality Analysis");

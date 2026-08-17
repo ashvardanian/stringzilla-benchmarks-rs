@@ -27,115 +27,107 @@ StringZilla scores every column with the same unary 32-class match/mismatch cost
 
 ### Intel Xeon4 Sapphire Rapids & NVIDIA H100
 
-| Library                                          |         ACGT 100B |            ACGT 1KB |   XLSum words |       XLSum lines |
-| ------------------------------------------------ | ----------------: | ------------------: | ------------: | ----------------: |
-| Rust                                             |                   |                     |               |                   |
-| `bio::levenshtein<1xSPR>`                        |         337 MCUPS |           674 MCUPS |     184 MCUPS |         124 MCUPS |
-| `rapidfuzz::levenshtein<Bytes><1xSPR>`           |       3,300 MCUPS |        12,390 MCUPS |   1,110 MCUPS |       9,990 MCUPS |
-| `rapidfuzz::levenshtein<Chars><1xSPR>`           |       2,300 MCUPS |         8,990 MCUPS |     181 MCUPS |      11,070 MCUPS |
-| `stringzillas::LevenshteinDistances<1xSPR>`      |  __15,680 MCUPS__ |        12,770 MCUPS |   3,360 MCUPS |       5,850 MCUPS |
-| `stringzillas::LevenshteinDistances<16xSPR>`     |     127,860 MCUPS |   __141,800 MCUPS__ |  20,820 MCUPS |      36,780 MCUPS |
-| `stringzillas::LevenshteinDistances<H100>`       |   5,980,110 MCUPS | __6,237,990 MCUPS__ | 139,850 MCUPS |      41,850 MCUPS |
-| `stringzillas::LevenshteinDistancesUtf8<1xSPR>`  |   __8,640 MCUPS__ |         8,310 MCUPS |     188 MCUPS |       7,750 MCUPS |
-| `stringzillas::LevenshteinDistancesUtf8<16xSPR>` |      67,870 MCUPS |   __100,460 MCUPS__ |   1,600 MCUPS |      43,260 MCUPS |
-|                                                  |                   |                     |               |                   |
-| Python                                           |                   |                     |               |                   |
-| `rapidfuzz.Levenshtein.distance`                 |       2,670 MCUPS |        15,720 MCUPS |   24.94 MCUPS |      14,020 MCUPS |
-| `Levenshtein.distance`                           |       2,520 MCUPS |        15,610 MCUPS |   22.10 MCUPS |      14,260 MCUPS |
-| `jellyfish.levenshtein_distance`                 |      107.50 MCUPS |        130.44 MCUPS |   16.19 MCUPS |      173.60 MCUPS |
-| `editdistance.eval`                              |       1,200 MCUPS |        377.29 MCUPS |   14.28 MCUPS |      545.27 MCUPS |
-| `nltk.edit_distance`                             |        1.29 MCUPS |          0.98 MCUPS |    0.89 MCUPS |        0.90 MCUPS |
-| `edlib.align`                                    |       1,480 MCUPS |         9,160 MCUPS |   11.40 MCUPS |               — ‖ |
-| `polyleven.levenshtein`                          |       2,490 MCUPS |         5,100 MCUPS |   89.30 MCUPS |      11,510 MCUPS |
-| `cudf.edit_distance<H100>` ‡                     |                 — |                   — |             — |                 — |
-| `stringzillas.LevenshteinDistances<1xSPR>`       |  __14,250 MCUPS__ |        11,930 MCUPS |   2,090 MCUPS |       6,950 MCUPS |
-| `stringzillas.LevenshteinDistances<16xSPR>`      | __176,770 MCUPS__ |       159,350 MCUPS |  11,290 MCUPS |      43,700 MCUPS |
-| `stringzillas.LevenshteinDistances<H100>`        |   4,074,700 MCUPS | __6,022,000 MCUPS__ |  26,960 MCUPS |     265,820 MCUPS |
-| `stringzillas.LevenshteinDistancesUTF8<1xSPR>`   |   __8,710 MCUPS__ |         7,460 MCUPS |  185.95 MCUPS |       6,970 MCUPS |
-| `stringzillas.LevenshteinDistancesUTF8<16xSPR>`  | __109,800 MCUPS__ |       106,210 MCUPS |   1,530 MCUPS |      63,090 MCUPS |
-| `stringzillas.LevenshteinDistancesUTF8<H100>`    |     232,970 MCUPS |        91,320 MCUPS |   7,870 MCUPS | __508,710 MCUPS__ |
-
-> Measured June 19, 2026.
+| Library                                          |           ACGT 100B |            ACGT 1KB |       XLSum words |       XLSum lines |
+| :----------------------------------------------- | ------------------: | ------------------: | ----------------: | ----------------: |
+| Rust                                             |                     |                     |                   |                   |
+| `bio::levenshtein<1xSPR>`                        |        590.86 MCUPS |         1,090 MCUPS |      327.67 MCUPS |      144.37 MCUPS |
+| `rapidfuzz::levenshtein<Bytes><1xSPR>`           |         7,100 MCUPS |        18,010 MCUPS |       2,010 MCUPS |      15,580 MCUPS |
+| `rapidfuzz::levenshtein<Chars><1xSPR>`           |         6,240 MCUPS |        17,730 MCUPS |      334.58 MCUPS |      15,260 MCUPS |
+| `stringzillas::LevenshteinDistances<1xSPR>`      |        20,420 MCUPS |        16,120 MCUPS |       4,800 MCUPS |      10,210 MCUPS |
+| `stringzillas::LevenshteinDistances<16xSPR>`     |       185,830 MCUPS |       161,390 MCUPS |      14,250 MCUPS |      58,630 MCUPS |
+| `stringzillas::LevenshteinDistances<H100>`       | __6,420,010 MCUPS__ | __6,248,560 MCUPS__ | __246,820 MCUPS__ |     358,160 MCUPS |
+| `stringzillas::LevenshteinDistancesUtf8<1xSPR>`  |        20,410 MCUPS |        15,990 MCUPS |      248.74 MCUPS |      10,620 MCUPS |
+| `stringzillas::LevenshteinDistancesUtf8<16xSPR>` |       182,660 MCUPS |       161,500 MCUPS |       1,600 MCUPS |      55,290 MCUPS |
+| `stringzillas::LevenshteinDistancesUtf8<H100>`   |       238,520 MCUPS |        80,690 MCUPS |      24,150 MCUPS | __522,420 MCUPS__ |
+|                                                  |                     |                     |                   |                   |
+| Python                                           |                     |                     |                   |                   |
+| `rapidfuzz.Levenshtein.distance`                 |         4,830 MCUPS |        24,070 MCUPS |       54.18 MCUPS |      25,380 MCUPS |
+| `Levenshtein.distance`                           |         4,570 MCUPS |        24,160 MCUPS |       45.28 MCUPS |      25,460 MCUPS |
+| `jellyfish.levenshtein_distance`                 |        155.79 MCUPS |        214.51 MCUPS |       26.12 MCUPS |      278.63 MCUPS |
+| `editdistance.eval`                              |         1,780 MCUPS |        454.75 MCUPS |       27.61 MCUPS |      453.58 MCUPS |
+| `nltk.edit_distance`                             |          3.41 MCUPS |          2.90 MCUPS |        2.29 MCUPS |        2.51 MCUPS |
+| `edlib.align`                                    |         2,830 MCUPS |        12,090 MCUPS |       13.38 MCUPS |                 — |
+| `polyleven.levenshtein`                          |         4,380 MCUPS |         6,460 MCUPS |      147.84 MCUPS |      16,240 MCUPS |
+| `stringzillas.LevenshteinDistances<1xSPR>`       |        17,470 MCUPS |        13,860 MCUPS |       2,340 MCUPS |       9,100 MCUPS |
+| `stringzillas.LevenshteinDistances<16xSPR>`      |       130,630 MCUPS |       128,130 MCUPS |       2,520 MCUPS |      51,970 MCUPS |
+| `stringzillas.LevenshteinDistances<H100>`        | __4,359,670 MCUPS__ | __6,079,630 MCUPS__ |  __43,210 MCUPS__ |     317,960 MCUPS |
+| `stringzillas.LevenshteinDistancesUTF8<1xSPR>`   |        17,490 MCUPS |        13,450 MCUPS |      155.97 MCUPS |       6,760 MCUPS |
+| `stringzillas.LevenshteinDistancesUTF8<16xSPR>`  |       133,340 MCUPS |       130,540 MCUPS |      656.42 MCUPS |      79,780 MCUPS |
+| `stringzillas.LevenshteinDistancesUTF8<H100>`    |       234,510 MCUPS |        81,110 MCUPS |      12,270 MCUPS | __524,520 MCUPS__ |
 
 ## Needleman-Wunsch for Global Alignment
 
 ### Intel Xeon4 Sapphire Rapids & NVIDIA H100
 
-| Library                                       |     ACGT 100B |          ACGT 1KB |  XLSum words |   XLSum lines |
-| --------------------------------------------- | ------------: | ----------------: | -----------: | ------------: |
-| Rust                                          |               |                   |              |               |
-| `bio::pairwise::global<1xSPR>`                |      30 MCUPS |          47 MCUPS |     35 MCUPS |      32 MCUPS |
-| `stringzillas::NeedlemanWunschScores<1xSPR>`  |   2,090 MCUPS |  __12,000 MCUPS__ |     46 MCUPS |     604 MCUPS |
-| `stringzillas::NeedlemanWunschScores<16xSPR>` |  15,280 MCUPS |  __90,450 MCUPS__ |    328 MCUPS |   6,520 MCUPS |
-| `stringzillas::NeedlemanWunschScores<H100>`   | 414,930 MCUPS | __701,760 MCUPS__ | 26,480 MCUPS | 234,810 MCUPS |
-|                                               |               |                   |              |               |
-| Python                                        |               |                   |              |               |
-| `biopython.PairwiseAligner.global`            |  374.82 MCUPS |      444.36 MCUPS |  18.49 MCUPS |  751.30 MCUPS |
-| `stringzillas.NeedlemanWunschScores<1xSPR>`   |   3,860 MCUPS |   __8,670 MCUPS__ |  43.69 MCUPS |  833.62 MCUPS |
-| `stringzillas.NeedlemanWunschScores<16xSPR>`  |  42,390 MCUPS | __111,580 MCUPS__ | 369.22 MCUPS |   5,190 MCUPS |
-| `stringzillas.NeedlemanWunschScores<H100>`    | 396,550 MCUPS | __700,900 MCUPS__ | 18,800 MCUPS | 203,490 MCUPS |
-
-> Measured June 19, 2026.
+| Library                                       |         ACGT 100B |          ACGT 1KB |      XLSum words |       XLSum lines |
+| :-------------------------------------------- | ----------------: | ----------------: | ---------------: | ----------------: |
+| Rust                                          |                   |                   |                  |                   |
+| `bio::pairwise::global<1xSPR>`                |       98.71 MCUPS |       91.81 MCUPS |      75.72 MCUPS |       28.77 MCUPS |
+| `stringzillas::NeedlemanWunschScores<1xSPR>`  |      18,440 MCUPS |      13,020 MCUPS |      3,200 MCUPS |      612.28 MCUPS |
+| `stringzillas::NeedlemanWunschScores<16xSPR>` |     135,550 MCUPS |     118,570 MCUPS |     14,460 MCUPS |       5,440 MCUPS |
+| `stringzillas::NeedlemanWunschScores<H100>`   | __410,840 MCUPS__ | __701,600 MCUPS__ | __19,970 MCUPS__ | __227,040 MCUPS__ |
+|                                               |                   |                   |                  |                   |
+| Python                                        |                   |                   |                  |                   |
+| `biopython.PairwiseAligner.global`            |      485.26 MCUPS |      462.33 MCUPS |      23.10 MCUPS |      970.86 MCUPS |
+| `stringzillas.NeedlemanWunschScores<1xSPR>`   |      16,080 MCUPS |      10,720 MCUPS |      1,060 MCUPS |       1,260 MCUPS |
+| `stringzillas.NeedlemanWunschScores<16xSPR>`  |     108,490 MCUPS |      94,360 MCUPS |      1,910 MCUPS |       2,830 MCUPS |
+| `stringzillas.NeedlemanWunschScores<H100>`    | __401,040 MCUPS__ | __701,650 MCUPS__ | __13,040 MCUPS__ | __228,370 MCUPS__ |
 
 ## Smith-Waterman for Local Alignment
 
 ### Intel Xeon4 Sapphire Rapids & NVIDIA H100
 
-| Library                                     |     ACGT 100B |          ACGT 1KB |  XLSum words |   XLSum lines |
-| ------------------------------------------- | ------------: | ----------------: | -----------: | ------------: |
-| Rust                                        |               |                   |              |               |
-| `bio::pairwise::local<1xSPR>`               |      51 MCUPS |          42 MCUPS |     34 MCUPS |      33 MCUPS |
-| `stringzillas::SmithWatermanScores<1xSPR>`  |   1,740 MCUPS |   __8,710 MCUPS__ |     44 MCUPS |     569 MCUPS |
-| `stringzillas::SmithWatermanScores<16xSPR>` |  14,560 MCUPS |  __76,170 MCUPS__ |    329 MCUPS |   5,880 MCUPS |
-| `stringzillas::SmithWatermanScores<H100>`   | 339,880 MCUPS | __607,390 MCUPS__ | 23,010 MCUPS | 225,600 MCUPS |
-|                                             |               |                   |              |               |
-| Python                                      |               |                   |              |               |
-| `biopython.PairwiseAligner.local`           |  247.40 MCUPS |      412.19 MCUPS |  19.80 MCUPS |  593.81 MCUPS |
-| `stringzillas.SmithWatermanScores<1xSPR>`   |   3,310 MCUPS |   __8,500 MCUPS__ |  45.51 MCUPS |  804.90 MCUPS |
-| `stringzillas.SmithWatermanScores<16xSPR>`  |  39,710 MCUPS | __102,950 MCUPS__ | 379.24 MCUPS |   5,860 MCUPS |
-| `stringzillas.SmithWatermanScores<H100>`    | 329,370 MCUPS | __607,900 MCUPS__ | 16,710 MCUPS | 195,370 MCUPS |
-
-> Measured June 19, 2026.
+| Library                                     |         ACGT 100B |          ACGT 1KB |      XLSum words |       XLSum lines |
+| :------------------------------------------ | ----------------: | ----------------: | ---------------: | ----------------: |
+| Rust                                        |                   |                   |                  |                   |
+| `bio::pairwise::local<1xSPR>`               |       85.69 MCUPS |       83.76 MCUPS |      63.43 MCUPS |       52.21 MCUPS |
+| `stringzillas::SmithWatermanScores<1xSPR>`  |      14,360 MCUPS |      11,430 MCUPS |      2,830 MCUPS |      581.24 MCUPS |
+| `stringzillas::SmithWatermanScores<16xSPR>` |     104,680 MCUPS |     115,110 MCUPS |     13,180 MCUPS |       5,630 MCUPS |
+| `stringzillas::SmithWatermanScores<H100>`   | __345,620 MCUPS__ | __605,930 MCUPS__ | __18,300 MCUPS__ | __213,850 MCUPS__ |
+|                                             |                   |                   |                  |                   |
+| Python                                      |                   |                   |                  |                   |
+| `biopython.PairwiseAligner.local`           |      343.43 MCUPS |      445.88 MCUPS |      22.16 MCUPS |      803.53 MCUPS |
+| `stringzillas.SmithWatermanScores<1xSPR>`   |      13,860 MCUPS |      10,240 MCUPS |     965.83 MCUPS |      911.30 MCUPS |
+| `stringzillas.SmithWatermanScores<16xSPR>`  |      84,130 MCUPS |      90,890 MCUPS |      1,980 MCUPS |       2,910 MCUPS |
+| `stringzillas.SmithWatermanScores<H100>`    | __337,690 MCUPS__ | __607,940 MCUPS__ | __11,760 MCUPS__ | __203,690 MCUPS__ |
 
 ## Needleman-Wunsch-Gotoh for Global Alignment
 
 ### Intel Xeon4 Sapphire Rapids & NVIDIA H100
 
-| Library                                       |       ACGT 100B |          ACGT 1KB |  XLSum words |   XLSum lines |
-| --------------------------------------------- | --------------: | ----------------: | -----------: | ------------: |
-| Rust                                          |                 |                   |              |               |
-| `bio::pairwise::global<1xSPR>`                |        51 MCUPS |          47 MCUPS |     40 MCUPS |      35 MCUPS |
-| `stringzillas::NeedlemanWunschScores<1xSPR>`  |     2,650 MCUPS |   __2,660 MCUPS__ |     75 MCUPS |     213 MCUPS |
-| `stringzillas::NeedlemanWunschScores<16xSPR>` |    17,760 MCUPS |  __33,300 MCUPS__ |    640 MCUPS |   2,110 MCUPS |
-| `stringzillas::NeedlemanWunschScores<H100>`   |   226,980 MCUPS | __397,400 MCUPS__ | 15,940 MCUPS | 115,650 MCUPS |
-|                                               |                 |                   |              |               |
-| Python                                        |                 |                   |              |               |
-| `biopython.PairwiseAligner.global`            |    218.68 MCUPS |      254.93 MCUPS |  18.89 MCUPS |  504.15 MCUPS |
-| `stringzillas.NeedlemanWunschScores<1xSPR>`   | __3,000 MCUPS__ |       3,280 MCUPS |  43.99 MCUPS |  301.87 MCUPS |
-| `stringzillas.NeedlemanWunschScores<16xSPR>`  |    34,260 MCUPS |  __60,840 MCUPS__ | 341.98 MCUPS |   2,560 MCUPS |
-| `stringzillas.NeedlemanWunschScores<H100>`    |   211,610 MCUPS | __395,760 MCUPS__ | 16,180 MCUPS | 119,740 MCUPS |
-
-> Measured June 19, 2026.
+| Library                                       |         ACGT 100B |          ACGT 1KB |      XLSum words |       XLSum lines |
+| :-------------------------------------------- | ----------------: | ----------------: | ---------------: | ----------------: |
+| Rust                                          |                   |                   |                  |                   |
+| `bio::pairwise::global<1xSPR>`                |       79.77 MCUPS |       75.63 MCUPS |      70.64 MCUPS |       62.73 MCUPS |
+| `stringzillas::NeedlemanWunschScores<1xSPR>`  |       9,170 MCUPS |       3,910 MCUPS |      2,020 MCUPS |      239.53 MCUPS |
+| `stringzillas::NeedlemanWunschScores<16xSPR>` |      67,870 MCUPS |      42,590 MCUPS |      8,630 MCUPS |       2,090 MCUPS |
+| `stringzillas::NeedlemanWunschScores<H100>`   | __221,520 MCUPS__ | __393,910 MCUPS__ | __12,380 MCUPS__ | __113,490 MCUPS__ |
+|                                               |                   |                   |                  |                   |
+| Python                                        |                   |                   |                  |                   |
+| `biopython.PairwiseAligner.global`            |      263.44 MCUPS |      266.76 MCUPS |      22.74 MCUPS |      563.38 MCUPS |
+| `stringzillas.NeedlemanWunschScores<1xSPR>`   |       7,440 MCUPS |       3,920 MCUPS |     958.66 MCUPS |      420.45 MCUPS |
+| `stringzillas.NeedlemanWunschScores<16xSPR>`  |      63,750 MCUPS |      48,570 MCUPS |      1,810 MCUPS |       1,310 MCUPS |
+| `stringzillas.NeedlemanWunschScores<H100>`    | __216,910 MCUPS__ | __393,380 MCUPS__ |  __9,130 MCUPS__ | __121,330 MCUPS__ |
 
 ## Smith-Waterman-Gotoh for Local Alignment
 
 ### Intel Xeon4 Sapphire Rapids & NVIDIA H100
 
-| Library                                     |       ACGT 100B |          ACGT 1KB |  XLSum words |   XLSum lines |
-| ------------------------------------------- | --------------: | ----------------: | -----------: | ------------: |
-| Rust                                        |                 |                   |              |               |
-| `bio::pairwise::local<1xSPR>`               |        48 MCUPS |          44 MCUPS |     33 MCUPS |      37 MCUPS |
-| `stringzillas::SmithWatermanScores<1xSPR>`  | __2,890 MCUPS__ |       2,550 MCUPS |     73 MCUPS |     213 MCUPS |
-| `stringzillas::SmithWatermanScores<16xSPR>` |    19,180 MCUPS |  __35,310 MCUPS__ |    614 MCUPS |   2,150 MCUPS |
-| `stringzillas::SmithWatermanScores<H100>`   |   226,790 MCUPS | __364,790 MCUPS__ | 17,340 MCUPS | 117,690 MCUPS |
-|                                             |                 |                   |              |               |
-| Python                                      |                 |                   |              |               |
-| `biopython.PairwiseAligner.local`           |    115.17 MCUPS |      165.71 MCUPS |  18.92 MCUPS |  342.68 MCUPS |
-| `stringzillas.SmithWatermanScores<1xSPR>`   | __2,670 MCUPS__ |       2,640 MCUPS |  41.97 MCUPS |  317.48 MCUPS |
-| `stringzillas.SmithWatermanScores<16xSPR>`  |    30,500 MCUPS |  __58,560 MCUPS__ | 370.97 MCUPS |   1,660 MCUPS |
-| `stringzillas.SmithWatermanScores<H100>`    |   216,750 MCUPS | __365,470 MCUPS__ | 14,030 MCUPS | 121,680 MCUPS |
+| Library                                     |         ACGT 100B |          ACGT 1KB |      XLSum words |       XLSum lines |
+| :------------------------------------------ | ----------------: | ----------------: | ---------------: | ----------------: |
+| Rust                                        |                   |                   |                  |                   |
+| `bio::pairwise::local<1xSPR>`               |       69.85 MCUPS |       59.95 MCUPS |      56.62 MCUPS |       51.54 MCUPS |
+| `stringzillas::SmithWatermanScores<1xSPR>`  |       8,350 MCUPS |       3,940 MCUPS |      1,930 MCUPS |      239.39 MCUPS |
+| `stringzillas::SmithWatermanScores<16xSPR>` |      68,280 MCUPS |      41,630 MCUPS |      9,610 MCUPS |       2,010 MCUPS |
+| `stringzillas::SmithWatermanScores<H100>`   | __219,970 MCUPS__ | __363,910 MCUPS__ | __12,100 MCUPS__ | __114,430 MCUPS__ |
+|                                             |                   |                   |                  |                   |
+| Python                                      |                   |                   |                  |                   |
+| `biopython.PairwiseAligner.local`           |      162.48 MCUPS |      214.67 MCUPS |      22.80 MCUPS |      560.02 MCUPS |
+| `stringzillas.SmithWatermanScores<1xSPR>`   |       7,920 MCUPS |       3,870 MCUPS |     907.42 MCUPS |      305.16 MCUPS |
+| `stringzillas.SmithWatermanScores<16xSPR>`  |      62,420 MCUPS |      43,280 MCUPS |      1,870 MCUPS |       1,550 MCUPS |
+| `stringzillas.SmithWatermanScores<H100>`    | __219,770 MCUPS__ | __364,020 MCUPS__ |  __9,590 MCUPS__ | __114,570 MCUPS__ |
 
-> Measured June 19, 2026.
+> Measured on a 16-core Xeon Platinum 8468 and one idle H100 80GB HBM3.
 
 ---
 

@@ -395,18 +395,12 @@ def load_dataset(
     if max_bytes == 0:
         max_bytes = None
 
-    if as_bytes:
-        with open(dataset_path, "rb") as f:
-            if max_bytes is not None:
-                return f.read(max_bytes)
-            else:
-                return f.read()
-    else:
-        with open(dataset_path, encoding="utf-8", errors="ignore") as f:
-            if max_bytes is not None:
-                return f.read(max_bytes)
-            else:
-                return f.read()
+    # Both branches bound the read in bytes. A text-mode `read(n)` counts codepoints rather than bytes,
+    # so on a multi-byte corpus it overshoots the limit by the average bytes per character, which is what
+    # makes the Rust and Python harnesses disagree about how much corpus they measured.
+    with open(dataset_path, "rb") as f:
+        raw = f.read(max_bytes) if max_bytes is not None else f.read()
+    return raw if as_bytes else raw.decode("utf-8", errors="ignore")
 
 
 def tokenize_dataset(

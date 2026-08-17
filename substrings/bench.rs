@@ -61,15 +61,16 @@ use forkunion as fu;
 use regex::bytes::RegexBuilder;
 use stringtape::BytesTape;
 use stringzilla::szs::{
-    AnyBytesTape, Bm25Params, CaseSensitivity, DeviceScope, OverlapPolicy, Substrings,
-    SubstringsMatch, UnifiedAlloc,
+    AnyBytesTape, Bm25Params, CaseSensitivity, OverlapPolicy, Substrings, SubstringsMatch,
+    UnifiedAlloc,
 };
 
 #[path = "../utils.rs"]
 mod utils;
 use utils::{
-    install_panic_hook, load_dataset, log_stringzilla_metadata, measure_throughput, BenchBudget,
-    ReportAs, ResultExt, WorkUnits, COMPUTE_BOUND_SLICE,
+    for_each_device_pass, install_panic_hook, load_dataset, log_stringzilla_metadata,
+    measure_throughput, report_skipped, BenchBudget, DeviceChoice, ReportAs, ResultExt, WorkUnits,
+    COMPUTE_BOUND_SLICE,
 };
 
 // region: Vocabulary
@@ -195,69 +196,72 @@ fn bench_counting(
     corpus: &Corpus,
     needles: &[&[u8]],
     slice: &str,
-    scopes: &[(String, DeviceScope)],
+    core_count: usize,
 ) {
     let haystacks = corpus.haystacks();
     let mut counts = vec![0usize; corpus.documents.len()];
 
-    for (scope_name, device) in scopes {
-        let Ok(engine) = Substrings::new(device, needles, CaseSensitivity::Cased) else {
-            continue;
-        };
-        measure_throughput(
-            &format!("count-{slice}/stringzillas::Substrings<{scope_name}>"),
-            ReportAs::Bytes,
-            budget,
-            || {
-                let total = engine
-                    .count_into(device, &haystacks, OverlapPolicy::Overlapping, &mut counts)
-                    .expect("counting failed");
-                report(total, corpus.bytes)
-            },
-        );
-    }
+    for_each_device_pass(core_count, |pass, scope_name, device, _cores| {
+        let name = format!("count-{slice}/stringzillas::Substrings<{scope_name}>");
+        match Substrings::new(device, needles, CaseSensitivity::Cased) {
+            Err(error) => report_skipped(&name, error),
+            Ok(engine) => {
+                measure_throughput(&name, ReportAs::Bytes, budget, || {
+                    let total = engine
+                        .count_into(device, &haystacks, OverlapPolicy::Overlapping, &mut counts)
+                        .expect("counting failed");
+                    report(total, corpus.bytes)
+                });
+            }
+        }
 
-    for (kind_name, kind) in [
-        ("DFA", AhoCorasickKind::DFA),
-        ("ContiguousNFA", AhoCorasickKind::ContiguousNFA),
-    ] {
-        let Ok(automaton) = AhoCorasick::builder()
-            .match_kind(MatchKind::Standard)
-            .kind(Some(kind))
-            .build(needles)
-        else {
-            continue;
-        };
-        measure_throughput(
-            &format!("count-{slice}/aho_corasick::find_overlapping_iter<{kind_name}>"),
-            ReportAs::Bytes,
-            budget,
-            || {
-                let total: usize = corpus
-                    .documents
-                    .iter()
-                    .map(|document| automaton.find_overlapping_iter(document).count())
-                    .sum();
-                report(total, corpus.bytes)
-            },
-        );
-    }
+        // Every rival is single-threaded, so it is measured in the pass that has no thread pool alive.
+        if !matches!(pass, DeviceChoice::OneCore) {
+            return;
+        }
 
-    if let Ok(automaton) = DoubleArrayAhoCorasick::<u32>::new(needles) {
-        measure_throughput(
-            &format!("count-{slice}/daachorse::find_overlapping_iter"),
-            ReportAs::Bytes,
-            budget,
-            || {
-                let total: usize = corpus
-                    .documents
-                    .iter()
-                    .map(|document| automaton.find_overlapping_iter(document).count())
-                    .sum();
-                report(total, corpus.bytes)
-            },
-        );
-    }
+        for (kind_name, kind) in [
+            ("DFA", AhoCorasickKind::DFA),
+            ("ContiguousNFA", AhoCorasickKind::ContiguousNFA),
+        ] {
+            let Ok(automaton) = AhoCorasick::builder()
+                .match_kind(MatchKind::Standard)
+                .kind(Some(kind))
+                .build(needles)
+            else {
+                continue;
+            };
+            measure_throughput(
+                &format!("count-{slice}/aho_corasick::find_overlapping_iter<{kind_name}>"),
+                ReportAs::Bytes,
+                budget,
+                || {
+                    let total: usize = corpus
+                        .documents
+                        .iter()
+                        .map(|document| automaton.find_overlapping_iter(document).count())
+                        .sum();
+                    report(total, corpus.bytes)
+                },
+            );
+        }
+
+        if let Ok(automaton) = DoubleArrayAhoCorasick::<u32>::new(needles) {
+            measure_throughput(
+                &format!("count-{slice}/daachorse::find_overlapping_iter"),
+                ReportAs::Bytes,
+                budget,
+                || {
+                    let total: usize = corpus
+                        .documents
+                        .iter()
+                        .map(|document| automaton.find_overlapping_iter(document).count())
+                        .sum();
+                    report(total, corpus.bytes)
+                },
+            );
+        }
+    });
 }
 
 /// Counts a leftmost cover, the walk a rewrite needs and the one every engine spells differently.
@@ -266,33 +270,41 @@ fn bench_cover(
     corpus: &Corpus,
     needles: &[&[u8]],
     slice: &str,
-    scopes: &[(String, DeviceScope)],
+    core_count: usize,
 ) {
     let haystacks = corpus.haystacks();
     let mut counts = vec![0usize; corpus.documents.len()];
 
-    for (scope_name, device) in scopes {
-        let Ok(engine) = Substrings::new(device, needles, CaseSensitivity::Cased) else {
-            continue;
-        };
-        measure_throughput(
-            &format!("cover-{slice}/stringzillas::Substrings<{scope_name}>"),
-            ReportAs::Bytes,
-            budget,
-            || {
-                let total = engine
-                    .count_into(
-                        device,
-                        &haystacks,
-                        OverlapPolicy::LeftmostLongest,
-                        &mut counts,
-                    )
-                    .expect("counting failed");
-                report(total, corpus.bytes)
-            },
-        );
-    }
+    for_each_device_pass(core_count, |pass, scope_name, device, _cores| {
+        let name = format!("cover-{slice}/stringzillas::Substrings<{scope_name}>");
+        match Substrings::new(device, needles, CaseSensitivity::Cased) {
+            Err(error) => report_skipped(&name, error),
+            Ok(engine) => {
+                measure_throughput(&name, ReportAs::Bytes, budget, || {
+                    let total = engine
+                        .count_into(
+                            device,
+                            &haystacks,
+                            OverlapPolicy::LeftmostLongest,
+                            &mut counts,
+                        )
+                        .expect("counting failed");
+                    report(total, corpus.bytes)
+                });
+            }
+        }
 
+        // Every rival is single-threaded, so it is measured in the pass that has no thread pool alive.
+        if !matches!(pass, DeviceChoice::OneCore) {
+            return;
+        }
+
+        bench_cover_rivals(budget, corpus, needles, slice);
+    });
+}
+
+/// The single-threaded leftmost-cover rivals, run only in the single-core pass.
+fn bench_cover_rivals(budget: &BenchBudget, corpus: &Corpus, needles: &[&[u8]], slice: &str) {
     if let Ok(automaton) = AhoCorasick::builder()
         .match_kind(MatchKind::LeftmostLongest)
         .build(needles)
@@ -366,65 +378,76 @@ fn bench_locating(
     corpus: &Corpus,
     needles: &[&[u8]],
     slice: &str,
-    scopes: &[(String, DeviceScope)],
+    core_count: usize,
 ) {
     let haystacks = corpus.haystacks();
     let mut counts = vec![0usize; corpus.documents.len()];
 
-    // Size the output once, outside every measured loop, exactly as a pipeline would.
-    let Some((_, probe_device)) = scopes.first() else {
-        return;
-    };
-    let Ok(probe) = Substrings::new(probe_device, needles, CaseSensitivity::Cased) else {
-        return;
-    };
-    let Ok(matches_total) = probe.count_into(
-        probe_device,
-        &haystacks,
-        OverlapPolicy::Overlapping,
-        &mut counts,
-    ) else {
-        return;
+    // Size the output once, outside every measured loop, exactly as a pipeline would. The probe runs on
+    // a single-core scope, which spawns no pool of its own, and is dropped before the passes begin.
+    let matches_total = {
+        let Some(probe_device) = DeviceChoice::OneCore.open_scope(core_count) else {
+            return;
+        };
+        let Ok(probe) = Substrings::new(&probe_device, needles, CaseSensitivity::Cased) else {
+            return;
+        };
+        let Ok(total) = probe.count_into(
+            &probe_device,
+            &haystacks,
+            OverlapPolicy::Overlapping,
+            &mut counts,
+        ) else {
+            return;
+        };
+        total
     };
     let mut matches = vec![SubstringsMatch::default(); matches_total];
 
-    for (scope_name, device) in scopes {
-        let Ok(engine) = Substrings::new(device, needles, CaseSensitivity::Cased) else {
-            continue;
-        };
-        measure_throughput(
-            &format!("find-{slice}/stringzillas::Substrings<{scope_name}>"),
-            ReportAs::Bytes,
-            budget,
-            || {
-                let found = engine
-                    .find_into(device, &haystacks, OverlapPolicy::Overlapping, &mut matches)
-                    .expect("locating failed");
-                report(found, corpus.bytes)
-            },
-        );
-    }
+    for_each_device_pass(core_count, |pass, scope_name, device, _cores| {
+        let name = format!("find-{slice}/stringzillas::Substrings<{scope_name}>");
+        match Substrings::new(device, needles, CaseSensitivity::Cased) {
+            Err(error) => report_skipped(&name, error),
+            Ok(engine) => {
+                measure_throughput(&name, ReportAs::Bytes, budget, || {
+                    let found = engine
+                        .find_into(device, &haystacks, OverlapPolicy::Overlapping, &mut matches)
+                        .expect("locating failed");
+                    report(found, corpus.bytes)
+                });
+            }
+        }
 
-    if let Ok(automaton) = AhoCorasick::builder()
-        .match_kind(MatchKind::Standard)
-        .build(needles)
-    {
-        let mut oracle_matches: Vec<(usize, usize, usize)> = Vec::with_capacity(matches_total);
-        measure_throughput(
-            &format!("find-{slice}/aho_corasick::find_overlapping_iter"),
-            ReportAs::Bytes,
-            budget,
-            || {
-                oracle_matches.clear();
-                for (document_index, document) in corpus.documents.iter().enumerate() {
-                    for one_match in automaton.find_overlapping_iter(document) {
-                        oracle_matches.push((document_index, one_match.start(), one_match.len()));
+        // Every rival is single-threaded, so it is measured in the pass that has no thread pool alive.
+        if !matches!(pass, DeviceChoice::OneCore) {
+            return;
+        }
+
+        if let Ok(automaton) = AhoCorasick::builder()
+            .match_kind(MatchKind::Standard)
+            .build(needles)
+        {
+            let mut oracle_matches: Vec<(usize, usize, usize)> = Vec::with_capacity(matches_total);
+            measure_throughput(
+                &format!("find-{slice}/aho_corasick::find_overlapping_iter"),
+                ReportAs::Bytes,
+                budget,
+                || {
+                    oracle_matches.clear();
+                    for (document_index, document) in corpus.documents.iter().enumerate() {
+                        for one_match in automaton.find_overlapping_iter(document) {
+                            oracle_matches.push((
+                                document_index,
+                                one_match.start(),
+                                one_match.len(),
+                            ));
+                        }
                     }
-                }
-                report(black_box(oracle_matches.len()), corpus.bytes)
-            },
-        );
-    }
+                    report(black_box(oracle_matches.len()), corpus.bytes)
+                },
+            );
+        }
+    });
 }
 
 // endregion: Locating
@@ -437,67 +460,75 @@ fn bench_rewriting(
     corpus: &Corpus,
     needles: &[&[u8]],
     slice: &str,
-    scopes: &[(String, DeviceScope)],
+    core_count: usize,
 ) {
     let haystacks = corpus.haystacks();
     // Replacing every needle with itself keeps the output the size of the input, so the cell measures
     // the rewrite rather than an expansion factor, and its result is checkable by eye.
     let replacements: Vec<&[u8]> = needles.to_vec();
 
-    let Some((_, probe_device)) = scopes.first() else {
-        return;
-    };
-    let Ok(probe) = Substrings::new(probe_device, needles, CaseSensitivity::Cased) else {
-        return;
-    };
-    let Ok(bound) = probe.replace_bound(&replacements, corpus.bytes as usize) else {
-        return;
+    // The output bound is probed on a single-core scope, which spawns no pool, and dropped before the
+    // passes begin.
+    let bound = {
+        let Some(probe_device) = DeviceChoice::OneCore.open_scope(core_count) else {
+            return;
+        };
+        let Ok(probe) = Substrings::new(&probe_device, needles, CaseSensitivity::Cased) else {
+            return;
+        };
+        let Ok(bound) = probe.replace_bound(&replacements, corpus.bytes as usize) else {
+            return;
+        };
+        bound
     };
     let mut output_data = vec![0u8; bound];
     let mut output_offsets = vec![0u64; corpus.documents.len() + 1];
 
-    for (scope_name, device) in scopes {
-        let Ok(engine) = Substrings::new(device, needles, CaseSensitivity::Cased) else {
-            continue;
-        };
-        measure_throughput(
-            &format!("replace-{slice}/stringzillas::Substrings<{scope_name}>"),
-            ReportAs::Bytes,
-            budget,
-            || {
-                let written = engine
-                    .replace_into(
-                        device,
-                        &haystacks,
-                        OverlapPolicy::LeftmostLongest,
-                        &replacements,
-                        &mut output_data,
-                        &mut output_offsets,
-                    )
-                    .expect("rewriting failed");
-                WorkUnits::new(written as u64, corpus.bytes)
-            },
-        );
-    }
+    for_each_device_pass(core_count, |pass, scope_name, device, _cores| {
+        let name = format!("replace-{slice}/stringzillas::Substrings<{scope_name}>");
+        match Substrings::new(device, needles, CaseSensitivity::Cased) {
+            Err(error) => report_skipped(&name, error),
+            Ok(engine) => {
+                measure_throughput(&name, ReportAs::Bytes, budget, || {
+                    let written = engine
+                        .replace_into(
+                            device,
+                            &haystacks,
+                            OverlapPolicy::LeftmostLongest,
+                            &replacements,
+                            &mut output_data,
+                            &mut output_offsets,
+                        )
+                        .expect("rewriting failed");
+                    WorkUnits::new(written as u64, corpus.bytes)
+                });
+            }
+        }
 
-    if let Ok(automaton) = AhoCorasick::builder()
-        .match_kind(MatchKind::LeftmostLongest)
-        .build(needles)
-    {
-        measure_throughput(
-            &format!("replace-{slice}/aho_corasick::replace_all_bytes"),
-            ReportAs::Bytes,
-            budget,
-            || {
-                let written: usize = corpus
-                    .documents
-                    .iter()
-                    .map(|document| automaton.replace_all_bytes(document, &replacements).len())
-                    .sum();
-                WorkUnits::new(black_box(written) as u64, corpus.bytes)
-            },
-        );
-    }
+        // Every rival is single-threaded, so it is measured in the pass that has no thread pool alive.
+        if !matches!(pass, DeviceChoice::OneCore) {
+            return;
+        }
+
+        if let Ok(automaton) = AhoCorasick::builder()
+            .match_kind(MatchKind::LeftmostLongest)
+            .build(needles)
+        {
+            measure_throughput(
+                &format!("replace-{slice}/aho_corasick::replace_all_bytes"),
+                ReportAs::Bytes,
+                budget,
+                || {
+                    let written: usize = corpus
+                        .documents
+                        .iter()
+                        .map(|document| automaton.replace_all_bytes(document, &replacements).len())
+                        .sum();
+                    WorkUnits::new(black_box(written) as u64, corpus.bytes)
+                },
+            );
+        }
+    });
 }
 
 // endregion: Rewriting
@@ -514,7 +545,7 @@ fn bench_scoring(
     corpus: &Corpus,
     needles: &[&[u8]],
     slice: &str,
-    scopes: &[(String, DeviceScope)],
+    core_count: usize,
 ) {
     let haystacks = corpus.haystacks();
     let weights = vec![1.0f32; needles.len()];
@@ -522,27 +553,24 @@ fn bench_scoring(
     let mean_document_length = corpus.bytes as f32 / corpus.documents.len().max(1) as f32;
     let parameters = Bm25Params::normalized(mean_document_length);
 
-    for (scope_name, device) in scopes {
-        let Ok(engine) = Substrings::new(device, needles, CaseSensitivity::Cased) else {
-            continue;
+    for_each_device_pass(core_count, |_pass, scope_name, device, _cores| {
+        let name = format!("bm25-{slice}/stringzillas::Substrings<{scope_name}>");
+        let engine = match Substrings::new(device, needles, CaseSensitivity::Cased) {
+            Ok(engine) => engine,
+            Err(error) => return report_skipped(&name, error),
         };
-        measure_throughput(
-            &format!("bm25-{slice}/stringzillas::Substrings<{scope_name}>"),
-            ReportAs::Bytes,
-            budget,
-            || {
-                engine
-                    .score_bm25_into(device, &haystacks, &weights, None, parameters, &mut scores)
-                    .expect("scoring failed");
-                report(black_box(scores.len()), corpus.bytes)
-            },
-        );
-    }
+        measure_throughput(&name, ReportAs::Bytes, budget, || {
+            engine
+                .score_bm25_into(device, &haystacks, &weights, None, parameters, &mut scores)
+                .expect("scoring failed");
+            report(black_box(scores.len()), corpus.bytes)
+        });
+    });
 }
 
 /// The index-then-query rival, measured on one slice only: its build is quadratically more expensive
 /// than the scan it replaces, so sweeping it across every dictionary size measures tokenization.
-fn bench_scoring_index(budget: &BenchBudget, corpus: &Corpus, slice: &str) {
+fn bench_scoring_index(budget: &BenchBudget, corpus: &Corpus, needles: &[&[u8]], slice: &str) {
     use bm25::{EmbedderBuilder, Scorer};
 
     let documents: Vec<String> = corpus
@@ -553,24 +581,32 @@ fn bench_scoring_index(budget: &BenchBudget, corpus: &Corpus, slice: &str) {
     let mean_document_length = corpus.bytes as f32 / corpus.documents.len().max(1) as f32;
     let embedder = EmbedderBuilder::<u32>::with_avgdl(mean_document_length).build();
 
-    measure_throughput(
-        &format!("bm25-{slice}/bm25::Scorer::build"),
-        ReportAs::Bytes,
-        budget,
-        || {
-            let mut scorer = Scorer::<usize>::new();
-            for (index, document) in documents.iter().enumerate() {
-                scorer.upsert(&index, embedder.embed(document));
-            }
-            report(black_box(documents.len()), corpus.bytes)
-        },
-    );
+    if slice == VocabularySlice::MostFrequentOnePercent.name() {
+        measure_throughput(
+            &format!("bm25-{slice}/bm25::Scorer::build"),
+            ReportAs::Bytes,
+            budget,
+            || {
+                let mut scorer = Scorer::<usize>::new();
+                for (index, document) in documents.iter().enumerate() {
+                    scorer.upsert(&index, embedder.embed(document));
+                }
+                report(black_box(documents.len()), corpus.bytes)
+            },
+        );
+    }
 
     let mut scorer = Scorer::<usize>::new();
     for (index, document) in documents.iter().enumerate() {
         scorer.upsert(&index, embedder.embed(document));
     }
-    let query = documents.first().cloned().unwrap_or_default();
+    // The query is the vocabulary slice itself, the same question the scan answers, so the cell widens
+    // with the dictionary instead of measuring one arbitrary document.
+    let query: String = needles
+        .iter()
+        .map(|needle| String::from_utf8_lossy(needle).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
     let query_embedding = embedder.embed(&query);
     measure_throughput(
         &format!("bm25-{slice}/bm25::Scorer::matches"),
@@ -631,16 +667,6 @@ fn main() {
 
     let topology = fu::Topology::new().expect("Failed to probe the CPU topology");
     let core_count = resolve_core_count(&topology);
-    let mut scopes: Vec<(String, DeviceScope)> = Vec::new();
-    if let Ok(scope) = DeviceScope::cpu_cores(1) {
-        scopes.push(("1cpu".to_string(), scope));
-    }
-    if let Ok(scope) = DeviceScope::cpu_cores(core_count) {
-        scopes.push((format!("{core_count}cpu"), scope));
-    }
-    if let Ok(scope) = DeviceScope::gpu_device(0) {
-        scopes.push(("1gpu".to_string(), scope));
-    }
 
     let budget = BenchBudget::from_env(1.0, 5.0);
     for slice in VOCABULARY_SLICES {
@@ -653,17 +679,11 @@ fn main() {
             needle_bytes
         );
 
-        bench_counting(&budget, &corpus, &needles, slice.name(), &scopes);
-        bench_cover(&budget, &corpus, &needles, slice.name(), &scopes);
-        bench_locating(&budget, &corpus, &needles, slice.name(), &scopes);
-        bench_rewriting(&budget, &corpus, &needles, slice.name(), &scopes);
-        bench_scoring(&budget, &corpus, &needles, slice.name(), &scopes);
+        bench_counting(&budget, &corpus, &needles, slice.name(), core_count);
+        bench_cover(&budget, &corpus, &needles, slice.name(), core_count);
+        bench_locating(&budget, &corpus, &needles, slice.name(), core_count);
+        bench_rewriting(&budget, &corpus, &needles, slice.name(), core_count);
+        bench_scoring(&budget, &corpus, &needles, slice.name(), core_count);
+        bench_scoring_index(&budget, &corpus, &needles, slice.name());
     }
-
-    println!("\n# index-then-query, for the scoring regime this engine does not occupy");
-    bench_scoring_index(
-        &budget,
-        &corpus,
-        VocabularySlice::MostFrequentOnePercent.name(),
-    );
 }

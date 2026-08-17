@@ -23,21 +23,28 @@ Fingerprint throughput is measured at __512 dimensions__.
 
 | Library                              |  ~100 bytes lines | ~1,000 bytes lines |
 | ------------------------------------ | ----------------: | -----------------: |
-| `serial::MinHash<ByteGrams><1xSPR>`  |         0.23 MB/s |          0.20 MB/s |
-|                                      | 54.72% collisions |  30.03% collisions |
+| Rust                                 |                   |                    |
+| `serial::MinHash<ByteGrams><1xSPR>`  |         0.38 MB/s |          0.38 MB/s |
+|                                      | 56.13% collisions |  31.81% collisions |
 |                                      |    0.8530 entropy |     0.7916 entropy |
 |                                      |                   |                    |
-| `pc::MinHash<ByteGrams><1xSPR>`      |         1.58 MB/s |          2.04 MB/s |
-|                                      | 63.68% collisions |  46.80% collisions |
-|                                      |    0.9343 entropy |     0.8704 entropy |
+| `pc::MinHash<ByteGrams><1xSPR>`      |         2.07 MB/s |          2.64 MB/s |
+|                                      | 63.90% collisions |  46.69% collisions |
+|                                      |    0.9341 entropy |     0.8687 entropy |
 |                                      |                   |                    |
-| `stringzillas::Fingerprints<1xSPR>`  |         0.31 MB/s |          0.26 MB/s |
-| `stringzillas::Fingerprints<16xSPR>` |         4.02 MB/s |          4.07 MB/s |
-| `stringzillas::Fingerprints<H100>`   |    __98.54 MB/s__ |    __706.64 MB/s__ |
-|                                      | 64.64% collisions |  48.30% collisions |
+| `stringzillas::Fingerprints<1xSPR>`  |         1.01 MB/s |          0.98 MB/s |
+| `stringzillas::Fingerprints<16xSPR>` |         6.69 MB/s |         11.72 MB/s |
+| `stringzillas::Fingerprints<H100>`   |   __137.04 MB/s__ |    __803.77 MB/s__ |
+|                                      | 64.64% collisions |  48.41% collisions |
 |                                      |    0.9980 entropy |     0.9977 entropy |
+|                                      |                   |                    |
+| Python                               |                   |                    |
+| `datasketch.MinHash`                 |         0.03 MB/s |          0.03 MB/s |
+| `stringzillas.Fingerprints<1xSPR>`   |         0.99 MB/s |          0.97 MB/s |
+| `stringzillas.Fingerprints<16xSPR>`  |         4.68 MB/s |         10.88 MB/s |
+| `stringzillas.Fingerprints<H100>`    |        35.44 MB/s |        259.23 MB/s |
 
-> Measured June 17, 2026.
+> Measured on a 16-core Xeon Platinum 8468 and one idle H100 80GB HBM3, over `acgt_100` and `acgt_1k`.
 
 ## Quality Analysis
 
