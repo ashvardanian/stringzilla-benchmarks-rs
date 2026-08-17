@@ -255,6 +255,12 @@ stringzilla<H100>                                    ██████         
 
 See [similarities/README.md](similarities/README.md) for details
 
+### Repeated Levenshtein Dictionary Search
+
+Repeated fuzzy search has a different shape from a distance matrix: one dictionary is built once, then searched many times. The benchmark separates full-output comparisons from tools that return only unique terms, IDs, counts, or native suggestion distances.
+
+See [levenshtein/README.md](levenshtein/README.md) for the workloads, timing modes, correctness checks, and reproduction commands.
+
 ### Fingerprinting
 
 Converting variable-length strings into fixed-length sketches (like Min-Hashing) enables fast approximate matching in large-scale retrieval.
