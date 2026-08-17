@@ -6,7 +6,9 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -40,6 +42,24 @@ struct sparse_matches_t {
         distances.resize(count);
     }
 };
+
+static bool mode_enabled(std::string_view modes, std::string_view requested) {
+    while (!modes.empty()) {
+        std::size_t const separator = modes.find(',');
+        std::string_view const mode = modes.substr(0, separator);
+        if (mode == requested) return true;
+        if (separator == std::string_view::npos) break;
+        modes.remove_prefix(separator + 1);
+    }
+    return false;
+}
+
+static double percentile(std::vector<double> values, double fraction) {
+    if (values.empty()) return 0;
+    std::sort(values.begin(), values.end());
+    std::size_t const rank = static_cast<std::size_t>(fraction * (values.size() - 1));
+    return values[rank];
+}
 
 static bool dump_matches(std::size_t dictionary_size, std::size_t queries_size, std::uint8_t bound,
                          sparse_matches_t const &matches, std::string const &path) {
@@ -106,7 +126,7 @@ template <bool utf8_>
 static int run(std::vector<std::string> const &dictionary, std::vector<std::string> const &queries,
                std::vector<std::uint8_t> const &max_distances, std::string const &dump_prefix,
                int query_repeats, std::size_t query_threads, std::size_t batches_per_repeat,
-               std::size_t cache_evict_bytes) {
+               std::size_t cache_evict_bytes, std::string_view modes, bool shared_index) {
     std::vector<sz_string_view_t> dictionary_views = make_views(dictionary);
     std::vector<sz_string_view_t> query_views = make_views(queries);
     sz_sequence_t dictionary_sequence, query_sequence;
@@ -135,8 +155,56 @@ static int run(std::vector<std::string> const &dictionary, std::vector<std::stri
             std::chrono::duration<double>(std::chrono::steady_clock::now() - build_start).count();
         std::cout << "k=" << unsigned(max_distance) << " build=" << build_seconds << "s\n";
 
-        std::uint8_t const first_bound = max_distance <= 2 ? max_distance : 3;
+        std::uint8_t const first_bound = shared_index ? 1 : max_distance <= 2 ? max_distance : 3;
         for (std::uint8_t bound = first_bound; bound <= max_distance; ++bound) {
+            if (mode_enabled(modes, "cold")) {
+                for (int repeat = 0; repeat != query_repeats; ++repeat) {
+                    void *cold_index = NULL;
+                    auto const cold_build_start = std::chrono::steady_clock::now();
+                    if (sz_status_t status = index_init<utf8_>(&dictionary_sequence, max_distance, &cold_index, &error);
+                        status != sz_success_k) {
+                        std::cerr << "cold build failed: " << int(status) << " " << (error ? error : "") << '\n';
+                        index_free<utf8_>(index);
+                        szs_device_scope_free(device);
+                        return 5;
+                    }
+                    double const cold_build_seconds =
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - cold_build_start).count();
+                    for (std::size_t offset = 0; offset < cache_evict_buffer.size(); offset += 64) {
+                        ++cache_evict_buffer[offset];
+                        cache_evict_checksum += cache_evict_buffer[offset];
+                    }
+                    sparse_matches_t cold_matches;
+                    auto const start = std::chrono::steady_clock::now();
+                    sz_size_t cold_required = 0;
+                    sz_status_t status = index_find<utf8_>(cold_index, device, &query_sequence, bound, cold_matches,
+                                                            &cold_required, &error);
+                    if (status != sz_success_k && status != sz_unexpected_dimensions_k) {
+                        std::cerr << "cold sizing failed: " << int(status) << " " << (error ? error : "") << '\n';
+                        index_free<utf8_>(cold_index);
+                        index_free<utf8_>(index);
+                        szs_device_scope_free(device);
+                        return 5;
+                    }
+                    cold_matches.resize(cold_required);
+                    sz_size_t cold_count = 0;
+                    status = index_find<utf8_>(cold_index, device, &query_sequence, bound, cold_matches, &cold_count,
+                                               &error);
+                    double const elapsed =
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                    index_free<utf8_>(cold_index);
+                    if (status != sz_success_k || cold_count != cold_required) {
+                        std::cerr << "cold search failed: " << int(status) << " " << (error ? error : "") << '\n';
+                        index_free<utf8_>(index);
+                        szs_device_scope_free(device);
+                        return 5;
+                    }
+                    std::cout << "k=" << unsigned(bound) << " mode=cold_end_to_end repeat=" << repeat
+                              << " query=" << elapsed << "s matches=" << cold_count
+                              << " prep_build=" << cold_build_seconds << "s threads=" << query_threads << '\n';
+                }
+            }
+
             sparse_matches_t matches;
             sz_size_t required = 0;
             sz_status_t sizing_status = index_find<utf8_>(index, device, &query_sequence, bound, matches,
@@ -148,8 +216,18 @@ static int run(std::vector<std::string> const &dictionary, std::vector<std::stri
                 return 5;
             }
             matches.resize(required);
+            sz_size_t materialized = 0;
+            if (sz_status_t status = index_find<utf8_>(index, device, &query_sequence, bound, matches, &materialized,
+                                                        &error);
+                status != sz_success_k || materialized != required) {
+                std::cerr << "correctness materialization failed: " << int(status) << " " << (error ? error : "")
+                          << '\n';
+                index_free<utf8_>(index);
+                szs_device_scope_free(device);
+                return 6;
+            }
 
-            for (int repeat = 0; repeat != query_repeats; ++repeat) {
+            for (int repeat = 0; mode_enabled(modes, "warm") && repeat != query_repeats; ++repeat) {
                 for (std::size_t offset = 0; offset < cache_evict_buffer.size(); offset += 64) {
                     ++cache_evict_buffer[offset];
                     cache_evict_checksum += cache_evict_buffer[offset];
@@ -176,11 +254,89 @@ static int run(std::vector<std::string> const &dictionary, std::vector<std::stri
                 }
                 double const elapsed =
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-                std::cout << "k=" << unsigned(bound) << " query=" << elapsed / batches_per_repeat
-                          << "s matches=" << matches_count / batches_per_repeat << " threads=" << query_threads
-                          << " batches=" << batches_per_repeat << " cache_evict_bytes=" << cache_evict_bytes
+                std::cout << "k=" << unsigned(bound) << " mode=warm_presized repeat=" << repeat
+                          << " query=" << elapsed / batches_per_repeat << "s matches="
+                          << matches_count / batches_per_repeat << " threads=" << query_threads << " batches="
+                          << batches_per_repeat << " cache_evict_bytes=" << cache_evict_bytes
                           << " output_element_bytes="
                           << sizeof(sz_u64_t) + sizeof(sz_u32_t) + sizeof(sz_u8_t) << '\n';
+            }
+
+            for (int repeat = 0; mode_enabled(modes, "steady") && repeat != query_repeats; ++repeat) {
+                for (std::size_t offset = 0; offset < cache_evict_buffer.size(); offset += 64) {
+                    ++cache_evict_buffer[offset];
+                    cache_evict_checksum += cache_evict_buffer[offset];
+                }
+                sparse_matches_t growable;
+                if (queries.size() > std::numeric_limits<std::size_t>::max() / 8) {
+                    std::cerr << "query count is too large for the starting output estimate\n";
+                    index_free<utf8_>(index);
+                    szs_device_scope_free(device);
+                    return 6;
+                }
+                auto const start = std::chrono::steady_clock::now();
+                growable.resize(queries.size() * 8);
+                sz_size_t found = 0;
+                sz_status_t status = index_find<utf8_>(index, device, &query_sequence, bound, growable, &found, &error);
+                bool const retried = status == sz_unexpected_dimensions_k && found > growable.query_ids.size();
+                if (retried) {
+                    growable.resize(found);
+                    status = index_find<utf8_>(index, device, &query_sequence, bound, growable, &found, &error);
+                }
+                double const elapsed =
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                if (status != sz_success_k || found != required) {
+                    std::cerr << "steady search failed: " << int(status) << " " << (error ? error : "") << '\n';
+                    index_free<utf8_>(index);
+                    szs_device_scope_free(device);
+                    return 6;
+                }
+                std::cout << "k=" << unsigned(bound) << " mode=steady_growable repeat=" << repeat
+                          << " query=" << elapsed << "s matches=" << found << " retried=" << retried
+                          << " threads=" << query_threads << '\n';
+            }
+
+            if (mode_enabled(modes, "latency")) {
+                std::vector<double> latencies;
+                latencies.reserve(queries.size());
+                sparse_matches_t service_matches;
+                service_matches.resize(8);
+                std::size_t service_capacity = 8;
+                sz_size_t service_matches_count = 0;
+                for (std::size_t query_index = 0; query_index != queries.size(); ++query_index) {
+                    sz_string_view_t one_view = query_views[query_index];
+                    sz_sequence_t one_query;
+                    sz_sequence_from_string_views(&one_view, 1, &one_query);
+                    auto const start = std::chrono::steady_clock::now();
+                    sz_size_t found = 0;
+                    sz_status_t status = index_find<utf8_>(index, device, &one_query, bound, service_matches, &found,
+                                                            &error);
+                    if (status == sz_unexpected_dimensions_k && found > service_capacity) {
+                        service_capacity = found;
+                        service_matches.resize(service_capacity);
+                        status = index_find<utf8_>(index, device, &one_query, bound, service_matches, &found, &error);
+                    }
+                    double const elapsed =
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+                    if (status != sz_success_k) {
+                        std::cerr << "latency search failed: " << int(status) << " " << (error ? error : "") << '\n';
+                        index_free<utf8_>(index);
+                        szs_device_scope_free(device);
+                        return 6;
+                    }
+                    latencies.push_back(elapsed);
+                    service_matches_count += found;
+                }
+                if (service_matches_count != required) {
+                    std::cerr << "latency search returned a different result count\n";
+                    index_free<utf8_>(index);
+                    szs_device_scope_free(device);
+                    return 6;
+                }
+                std::cout << "k=" << unsigned(bound) << " mode=single_query_latency samples=" << latencies.size()
+                          << " p50=" << percentile(latencies, 0.50) << "s p95=" << percentile(latencies, 0.95)
+                          << "s p99=" << percentile(latencies, 0.99) << "s matches=" << service_matches_count
+                          << " final_capacity=" << service_capacity << '\n';
             }
             if (!dump_prefix.empty()) {
                 std::string const path = dump_prefix + ".k" + std::to_string(bound) + ".bin";
@@ -209,6 +365,10 @@ int main(int argc, char **argv) {
     auto const dictionary = load_lines(argv[1]);
     auto const queries = load_lines(argv[2], query_limit);
     bool const utf8 = std::getenv("SZ_LEVENSHTEIN_UTF8") != nullptr;
+    std::string const modes = std::getenv("SZ_LEVENSHTEIN_MODES") ? std::getenv("SZ_LEVENSHTEIN_MODES")
+                                                                   : "warm,steady,latency";
+    bool const shared_index = std::getenv("SZ_LEVENSHTEIN_INDEX_PLAN") &&
+                              std::string_view(std::getenv("SZ_LEVENSHTEIN_INDEX_PLAN")) == "shared";
     std::cout << "dictionary=" << dictionary.size() << " queries=" << queries.size()
               << " semantics=" << (utf8 ? "utf8-codepoints" : "bytes") << '\n';
 
@@ -232,15 +392,21 @@ int main(int argc, char **argv) {
     }
     if (char const *requested_max = std::getenv("SZ_LEVENSHTEIN_MAX_DISTANCE")) {
         int const parsed = std::stoi(requested_max);
-        if (parsed != 1 && parsed != 2 && parsed != 4) {
-            std::cerr << "SZ_LEVENSHTEIN_MAX_DISTANCE must be 1, 2, or 4\n";
+        if (parsed < 1 || parsed >= std::numeric_limits<std::uint8_t>::max()) {
+            std::cerr << "SZ_LEVENSHTEIN_MAX_DISTANCE must be between 1 and 254\n";
             return 2;
         }
         max_distances = {static_cast<std::uint8_t>(parsed)};
     }
+    if (shared_index && !std::getenv("SZ_LEVENSHTEIN_MAX_DISTANCE")) max_distances = {4};
+    if (!mode_enabled(modes, "cold") && !mode_enabled(modes, "warm") && !mode_enabled(modes, "steady") &&
+        !mode_enabled(modes, "latency")) {
+        std::cerr << "SZ_LEVENSHTEIN_MODES must include cold, warm, steady, or latency\n";
+        return 2;
+    }
     std::size_t const cache_evict_bytes = cache_evict_mb * 1024 * 1024;
     return utf8 ? run<true>(dictionary, queries, max_distances, dump_prefix, query_repeats, query_threads,
-                            batches_per_repeat, cache_evict_bytes)
+                            batches_per_repeat, cache_evict_bytes, modes, shared_index)
                 : run<false>(dictionary, queries, max_distances, dump_prefix, query_repeats, query_threads,
-                             batches_per_repeat, cache_evict_bytes);
+                             batches_per_repeat, cache_evict_bytes, modes, shared_index);
 }
