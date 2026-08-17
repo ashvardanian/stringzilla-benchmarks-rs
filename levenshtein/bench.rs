@@ -51,9 +51,7 @@ fn load_lines(path: &str, limit: usize) -> Result<Vec<String>, AnyError> {
 }
 
 fn checksum_id(checksum: u64, id: u64) -> u64 {
-    checksum
-        .wrapping_mul(0x9E37_79B1_85EB_CA87)
-        .wrapping_add(id)
+    checksum.wrapping_mul(0x9E37_79B1_85EB_CA87).wrapping_add(id)
 }
 
 fn evict_cache(buffer: &mut [u8], checksum: &mut u64) {
@@ -64,68 +62,96 @@ fn evict_cache(buffer: &mut [u8], checksum: &mut u64) {
     std::hint::black_box(*checksum);
 }
 
-fn levenshtein_within(first: &str, second: &str, bound: usize) -> Option<usize> {
-    let first: Vec<char> = first.chars().collect();
-    let second: Vec<char> = second.chars().collect();
+struct DistanceScratch {
+    previous: Vec<usize>,
+    current: Vec<usize>,
+}
+
+fn levenshtein_within(first: &[char], second: &[char], bound: usize, scratch: &mut DistanceScratch) -> Option<usize> {
     if first.len().abs_diff(second.len()) > bound {
         return None;
     }
 
-    let mut previous: Vec<usize> = (0..=first.len()).collect();
-    let mut current = vec![0; first.len() + 1];
+    scratch.previous.resize(first.len() + 1, 0);
+    scratch.current.resize(first.len() + 1, 0);
+    for (column, value) in scratch.previous.iter_mut().enumerate() {
+        *value = column;
+    }
     for (row, &second_char) in second.iter().enumerate() {
-        current[0] = row + 1;
-        let mut row_min = current[0];
+        scratch.current[0] = row + 1;
+        let mut row_min = scratch.current[0];
         for (column, &first_char) in first.iter().enumerate() {
-            current[column + 1] = (previous[column + 1] + 1)
-                .min(current[column] + 1)
-                .min(previous[column] + usize::from(first_char != second_char));
-            row_min = row_min.min(current[column + 1]);
+            scratch.current[column + 1] = (scratch.previous[column + 1] + 1)
+                .min(scratch.current[column] + 1)
+                .min(scratch.previous[column] + usize::from(first_char != second_char));
+            row_min = row_min.min(scratch.current[column + 1]);
         }
         if row_min > bound {
             return None;
         }
-        std::mem::swap(&mut previous, &mut current);
+        std::mem::swap(&mut scratch.previous, &mut scratch.current);
     }
-    (previous[first.len()] <= bound).then_some(previous[first.len()])
+    (scratch.previous[first.len()] <= bound).then_some(scratch.previous[first.len()])
 }
 
 fn symspell_search(
     symspell: &SymSpell,
     ids: &HashMap<String, u32>,
+    decoded_dictionary: &[Vec<char>],
     query: &str,
+    decoded_query: &[char],
     bound: usize,
-) -> Vec<Match> {
-    symspell
-        .lookup(query, Verbosity::All, bound, &None, None, false)
-        .into_iter()
-        .filter_map(|suggestion| {
-            levenshtein_within(query, &suggestion.term, bound).map(|distance| Match {
-                id: ids[&suggestion.term],
+    distance_scratch: &mut DistanceScratch,
+    matches: &mut Vec<Match>,
+) {
+    matches.clear();
+    for suggestion in symspell.lookup(query, Verbosity::All, bound, &None, None, false) {
+        let id = ids[&suggestion.term];
+        if let Some(distance) =
+            levenshtein_within(decoded_query, &decoded_dictionary[id as usize], bound, distance_scratch)
+        {
+            matches.push(Match {
+                id,
                 distance: distance as u8,
-            })
-        })
-        .collect()
+            });
+        }
+    }
 }
 
 fn dump_symspell_matches(
     symspell: &SymSpell,
     ids: &HashMap<String, u32>,
+    decoded_dictionary: &[Vec<char>],
+    decoded_queries: &[Vec<char>],
     dictionary_size: usize,
     queries: &[String],
     bound: usize,
     path: &str,
 ) -> Result<(), AnyError> {
     let mut output = BufWriter::new(File::create(path)?);
+    let mut distance_scratch = DistanceScratch {
+        previous: Vec::new(),
+        current: Vec::new(),
+    };
+    let mut matches = Vec::new();
     output.write_all(b"SZLEV001")?;
     output.write_all(&(dictionary_size as u64).to_ne_bytes())?;
     output.write_all(&(queries.len() as u64).to_ne_bytes())?;
     output.write_all(&[bound as u8])?;
-    for query in queries {
-        let mut matches = symspell_search(symspell, ids, query, bound);
+    for (query, decoded_query) in queries.iter().zip(decoded_queries) {
+        symspell_search(
+            symspell,
+            ids,
+            decoded_dictionary,
+            query,
+            decoded_query,
+            bound,
+            &mut distance_scratch,
+            &mut matches,
+        );
         matches.sort_unstable_by_key(|found| (found.id, found.distance));
         output.write_all(&(matches.len() as u64).to_ne_bytes())?;
-        for found in matches {
+        for found in &matches {
             output.write_all(&found.id.to_ne_bytes())?;
             output.write_all(&[found.distance])?;
         }
@@ -133,11 +159,7 @@ fn dump_symspell_matches(
     Ok(())
 }
 
-fn run_symspell(
-    dictionary: &[String],
-    queries: &[String],
-    settings: &Settings,
-) -> Result<(), AnyError> {
+fn run_symspell(dictionary: &[String], queries: &[String], settings: &Settings) -> Result<(), AnyError> {
     if dictionary
         .iter()
         .chain(queries)
@@ -146,16 +168,24 @@ fn run_symspell(
         return Err("SymSpell requires lowercase input for case-sensitive comparison".into());
     }
 
+    let setup_start = Instant::now();
     let mut ids = HashMap::with_capacity(dictionary.len());
     for (id, word) in dictionary.iter().enumerate() {
         if ids.insert(word.clone(), id as u32).is_some() {
             return Err("SymSpell cannot preserve duplicate dictionary entries".into());
         }
     }
+    let decoded_dictionary: Vec<Vec<char>> = dictionary.iter().map(|word| word.chars().collect()).collect();
+    let decoded_queries: Vec<Vec<char>> = queries.iter().map(|query| query.chars().collect()).collect();
+    let setup_seconds = setup_start.elapsed().as_secs_f64();
+    let requested_mode = env::var("STRINGWARS_SYMSPELL_MODE").unwrap_or_else(|_| "both".to_owned());
+    if requested_mode != "raw" && requested_mode != "exact" && requested_mode != "both" {
+        return Err("STRINGWARS_SYMSPELL_MODE must be raw, exact, or both".into());
+    }
 
     println!("# levenshtein/symspell");
     println!(
-        "dictionary={} queries={} semantics=utf8-codepoints+exact-levenshtein-filter output=id+distance",
+        "dictionary={} queries={} adapter_setup={setup_seconds:.6}s",
         dictionary.len(),
         queries.len()
     );
@@ -174,31 +204,72 @@ fn run_symspell(
             symspell.get_dictionary_size()
         );
 
-        for repeat in 0..settings.repeats {
-            evict_cache(&mut cache, &mut cache_checksum);
-            let start = Instant::now();
-            let mut matches_count = 0usize;
-            let mut checksum = 0u64;
-            for query in queries {
-                for found in symspell_search(&symspell, &ids, query, bound) {
-                    matches_count += 1;
-                    checksum = checksum.wrapping_add(
-                        ((found.id as u64) << 8 | found.distance as u64)
-                            .wrapping_mul(0x9E37_79B1_85EB_CA87),
-                    );
+        if requested_mode == "raw" || requested_mode == "both" {
+            for repeat in 0..settings.repeats {
+                evict_cache(&mut cache, &mut cache_checksum);
+                let start = Instant::now();
+                let mut matches_count = 0usize;
+                let mut checksum = 0u64;
+                for query in queries {
+                    for suggestion in symspell.lookup(query, Verbosity::All, bound, &None, None, false) {
+                        matches_count += 1;
+                        checksum = checksum.wrapping_add(
+                            ((ids[&suggestion.term] as u64) << 8 | suggestion.distance as u64)
+                                .wrapping_mul(0x9E37_79B1_85EB_CA87),
+                        );
+                    }
                 }
+                println!(
+                    "k={bound} mode=native repeat={repeat} query={:.6}s matches={matches_count} checksum={checksum:016x} cache_evict_bytes={} semantics=symspell output=id+native-distance",
+                    start.elapsed().as_secs_f64(),
+                    cache.len()
+                );
             }
-            println!(
-                "k={bound} repeat={repeat} query={:.6}s matches={matches_count} checksum={checksum:016x} cache_evict_bytes={}",
-                start.elapsed().as_secs_f64(),
-                cache.len()
-            );
+        }
+
+        if requested_mode == "exact" || requested_mode == "both" {
+            for repeat in 0..settings.repeats {
+                evict_cache(&mut cache, &mut cache_checksum);
+                let start = Instant::now();
+                let mut matches_count = 0usize;
+                let mut checksum = 0u64;
+                let mut distance_scratch = DistanceScratch {
+                    previous: Vec::new(),
+                    current: Vec::new(),
+                };
+                let mut matches = Vec::new();
+                for (query, decoded_query) in queries.iter().zip(&decoded_queries) {
+                    symspell_search(
+                        &symspell,
+                        &ids,
+                        &decoded_dictionary,
+                        query,
+                        decoded_query,
+                        bound,
+                        &mut distance_scratch,
+                        &mut matches,
+                    );
+                    for found in &matches {
+                        matches_count += 1;
+                        checksum = checksum.wrapping_add(
+                            ((found.id as u64) << 8 | found.distance as u64).wrapping_mul(0x9E37_79B1_85EB_CA87),
+                        );
+                    }
+                }
+                println!(
+                    "k={bound} mode=exact_compatibility repeat={repeat} query={:.6}s matches={matches_count} checksum={checksum:016x} cache_evict_bytes={} semantics=unicode-codepoints output=id+exact-distance",
+                    start.elapsed().as_secs_f64(),
+                    cache.len()
+                );
+            }
         }
 
         if let Some(prefix) = &settings.dump_prefix {
             dump_symspell_matches(
                 &symspell,
                 &ids,
+                &decoded_dictionary,
+                &decoded_queries,
                 dictionary.len(),
                 queries,
                 bound,
@@ -222,10 +293,9 @@ fn verify_fst_unicode_contract() -> Result<(), AnyError> {
         }
     }
     if matches != 9 {
-        return Err(format!(
-            "fst Unicode smoke test failed: expected 9 one-character matches, observed {matches}"
-        )
-        .into());
+        return Err(
+            format!("fst Unicode smoke test failed: expected 9 one-character matches, observed {matches}").into(),
+        );
     }
     Ok(())
 }
@@ -234,11 +304,7 @@ fn run_fst(dictionary: &[String], queries: &[String], settings: &Settings) -> Re
     let allow_unicode = env::var_os("STRINGWARS_ALLOW_FST_UNICODE").is_some();
     if allow_unicode {
         verify_fst_unicode_contract()?;
-    } else if dictionary
-        .iter()
-        .chain(queries)
-        .any(|text| !text.is_ascii())
-    {
+    } else if dictionary.iter().chain(queries).any(|text| !text.is_ascii()) {
         return Err("fst requires ASCII input for byte-for-byte semantic parity".into());
     }
 
@@ -313,11 +379,7 @@ fn run_fst(dictionary: &[String], queries: &[String], settings: &Settings) -> Re
     Ok(())
 }
 
-fn run_tantivy(
-    dictionary: &[String],
-    queries: &[String],
-    settings: &Settings,
-) -> Result<(), AnyError> {
+fn run_tantivy(dictionary: &[String], queries: &[String], settings: &Settings) -> Result<(), AnyError> {
     let mut schema_builder = Schema::builder();
     let word_field = schema_builder.add_text_field("word", STRING);
     let index = Index::create_in_ram(schema_builder.build());
@@ -382,9 +444,7 @@ fn run_tantivy(
 }
 
 fn main() -> Result<(), AnyError> {
-    let args: Vec<String> = env::args()
-        .filter(|argument| argument != "--bench")
-        .collect();
+    let args: Vec<String> = env::args().filter(|argument| argument != "--bench").collect();
     if args.len() < 3 || args.len() > 4 {
         eprintln!("usage: bench_levenshtein DICTIONARY QUERIES [QUERY_LIMIT]");
         std::process::exit(2);
@@ -408,9 +468,7 @@ fn main() -> Result<(), AnyError> {
         || settings.min_distance > settings.max_distance
         || settings.max_distance > 4
     {
-        return Err(
-            "expected positive repeats and 1 <= minimum distance <= maximum distance <= 4".into(),
-        );
+        return Err("expected positive repeats and 1 <= minimum distance <= maximum distance <= 4".into());
     }
 
     if should_run("levenshtein/fst") {
