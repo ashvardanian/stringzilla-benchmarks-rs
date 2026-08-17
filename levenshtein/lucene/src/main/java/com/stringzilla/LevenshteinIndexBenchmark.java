@@ -47,6 +47,12 @@ public final class LevenshteinIndexBenchmark {
             System.err.printf("MAX_DISTANCE must be between 1 and %d%n", FuzzyQuery.defaultMaxEdits);
             System.exit(2);
         }
+        String repeatsVariable = System.getenv("STRINGWARS_REPEATS");
+        int repeats = repeatsVariable == null ? 3 : Integer.parseInt(repeatsVariable);
+        if (repeats < 1) {
+            System.err.println("STRINGWARS_REPEATS must be positive");
+            System.exit(2);
+        }
 
         long buildStart = System.nanoTime();
         ByteBuffersDirectory directory = new ByteBuffersDirectory();
@@ -65,7 +71,7 @@ public final class LevenshteinIndexBenchmark {
         System.out.printf("dictionary=%d queries=%d build=%.6fs%n", dictionary.size(), queries.size(), buildSeconds);
 
         for (int bound = 1; bound <= maxDistance; ++bound) {
-            for (int repeat = 0; repeat != 3; ++repeat) {
+            for (int repeat = 0; repeat != repeats; ++repeat) {
                 long matches = 0;
                 long start = System.nanoTime();
                 for (String query : queries) {
