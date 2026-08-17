@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -106,7 +107,7 @@ int main(int argc, char **argv) {
     auto const queries = load_lines(argv[2], query_limit);
     int const repeats = std::getenv("RF_REPEATS") ? std::stoi(std::getenv("RF_REPEATS")) : 3;
     int const max_distance = std::getenv("RF_MAX_DISTANCE") ? std::stoi(std::getenv("RF_MAX_DISTANCE")) : 4;
-    if (max_distance < 1 || max_distance > 4) return 2;
+    if (max_distance < 1 || max_distance >= std::numeric_limits<std::uint8_t>::max()) return 2;
     std::cout << "dictionary=" << dictionary.size() << " queries=" << queries.size()
               << " semantics=utf8-codepoints\n";
 
