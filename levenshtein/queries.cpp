@@ -1,13 +1,14 @@
 /**
  *  @brief Deterministic query generator for immutable-dictionary Levenshtein benchmarks.
  *
- *  Generates exact, one-edit, two-edit, five-symbol length-extended, or mixed queries by sampling lines from an
- *  existing dictionary. The extension is guaranteed beyond four edits from its sampled source, not necessarily from
- *  every other dictionary entry. Mutations use bytes by default or validated Unicode codepoints when
- *  `SZ_LEVENSHTEIN_UTF8` is set.
+ *  Samples dictionary entries and applies a named edit operation. The mixed workload gives equal weight to exact
+ *  queries, substitutions, insertions, deletions, adjacent swaps, and several two-edit combinations. Labels describe
+ *  how a query was made from its source word; the result oracle still decides which dictionary entries match.
+ *  Mutations use bytes by default or validated Unicode codepoints when `SZ_LEVENSHTEIN_UTF8` is set.
  */
 #include <stringzilla/utf8_runes/serial.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -35,16 +36,6 @@ static std::uint64_t splitmix64(std::uint64_t &state) {
     return value ^ (value >> 31);
 }
 
-static std::size_t substitute(std::string &query, std::uint64_t random) {
-    if (query.empty()) {
-        query.push_back('~');
-        return 0;
-    }
-    std::size_t const position = random % query.size();
-    query[position] = query[position] == '~' ? '^' : '~';
-    return position;
-}
-
 static bool decode_utf8(std::string const &encoded, std::vector<sz_rune_t> &decoded) {
     decoded.clear();
     char const *position = encoded.data(), *end = position + encoded.size();
@@ -70,19 +61,92 @@ static std::string encode_utf8(std::vector<sz_rune_t> const &decoded) {
     return encoded;
 }
 
-static std::size_t substitute(std::vector<sz_rune_t> &query, std::uint64_t random) {
-    if (query.empty()) {
-        query.push_back('~');
-        return 0;
-    }
+template <typename sequence_type_>
+static std::size_t substitute(sequence_type_ &query, std::uint64_t random) {
     std::size_t const position = random % query.size();
     query[position] = query[position] == '~' ? '^' : '~';
     return position;
 }
 
+static bool known_mode(std::string_view mode) {
+    return mode == "exact" || mode == "substitute1" || mode == "insert1" || mode == "delete1" ||
+           mode == "substitute2" || mode == "insert_delete" || mode == "insert2" || mode == "delete2" ||
+           mode == "transpose" || mode == "source_plus_5" || mode == "mixed";
+}
+
+template <typename sequence_type_>
+static bool supports_mode(sequence_type_ const &query, std::string_view mode) {
+    if ((mode == "substitute1" || mode == "delete1" || mode == "insert_delete") && query.empty()) return false;
+    if ((mode == "substitute2" || mode == "delete2") && query.size() < 2) return false;
+    if (mode == "transpose") {
+        for (std::size_t index = 1; index != query.size(); ++index)
+            if (query[index - 1] != query[index]) return true;
+        return false;
+    }
+    return true;
+}
+
+template <typename sequence_type_>
+static void mutate(sequence_type_ &query, std::string_view mode, std::uint64_t &random_state) {
+    using symbol_t = typename sequence_type_::value_type;
+    auto const marker = [](symbol_t symbol) { return symbol == symbol_t('~') ? symbol_t('^') : symbol_t('~'); };
+    auto const insert_one = [&] {
+        std::size_t const position = splitmix64(random_state) % (query.size() + 1);
+        symbol_t const inserted = position < query.size() ? marker(query[position]) : symbol_t('~');
+        query.insert(query.begin() + position, inserted);
+    };
+    auto const delete_one = [&] {
+        std::size_t const position = splitmix64(random_state) % query.size();
+        query.erase(query.begin() + position);
+    };
+
+    if (mode == "exact") return;
+    if (mode == "substitute1") {
+        substitute(query, splitmix64(random_state));
+        return;
+    }
+    if (mode == "insert1") {
+        insert_one();
+        return;
+    }
+    if (mode == "delete1") {
+        delete_one();
+        return;
+    }
+    if (mode == "substitute2") {
+        std::size_t const first = substitute(query, splitmix64(random_state));
+        std::size_t second = splitmix64(random_state) % (query.size() - 1);
+        if (second >= first) ++second;
+        query[second] = marker(query[second]);
+        return;
+    }
+    if (mode == "insert_delete") {
+        delete_one();
+        insert_one();
+        return;
+    }
+    if (mode == "insert2") {
+        insert_one();
+        insert_one();
+        return;
+    }
+    if (mode == "delete2") {
+        delete_one();
+        delete_one();
+        return;
+    }
+    if (mode == "transpose") {
+        std::size_t position = splitmix64(random_state) % (query.size() - 1);
+        while (query[position] == query[position + 1]) position = (position + 1) % (query.size() - 1);
+        std::swap(query[position], query[position + 1]);
+        return;
+    }
+    query.insert(query.begin(), 5, symbol_t('~'));
+}
+
 int main(int argc, char **argv) {
     if (argc != 6) {
-        std::cerr << "usage: levenshtein_index_queries DICTIONARY OUTPUT COUNT exact|edit1|edit2|reject|mixed SEED\n";
+        std::cerr << "usage: levenshtein_index_queries DICTIONARY OUTPUT COUNT MODE SEED\n";
         return 2;
     }
     auto const dictionary = load_lines(argv[1]);
@@ -97,57 +161,58 @@ int main(int argc, char **argv) {
     }
     std::size_t const count = std::stoull(argv[3]);
     std::string_view const requested_mode = argv[4];
+    if (!known_mode(requested_mode)) {
+        std::cerr << "unknown mode: " << requested_mode << '\n';
+        return 5;
+    }
     std::uint64_t random_state = std::stoull(argv[5]);
     bool const utf8 = std::getenv("SZ_LEVENSHTEIN_UTF8") != nullptr;
     for (std::size_t query_index = 0; query_index != count; ++query_index) {
-        std::uint64_t const sample_random = splitmix64(random_state);
-        std::string query = dictionary[sample_random % dictionary.size()];
         std::string_view mode = requested_mode;
         if (mode == "mixed") {
-            static constexpr std::string_view modes[] = {"exact", "edit1", "edit2", "reject"};
-            mode = modes[query_index % 4];
+            static constexpr std::string_view modes[] = {"exact",       "substitute1", "insert1",   "delete1",
+                                                         "substitute2", "insert_delete", "insert2",   "delete2",
+                                                         "transpose",   "source_plus_5"};
+            mode = modes[query_index % (sizeof(modes) / sizeof(modes[0]))];
         }
         if (utf8) {
             std::vector<sz_rune_t> decoded;
-            if (!decode_utf8(query, decoded)) {
-                std::cerr << "invalid UTF-8 dictionary entry\n";
+            bool selected = false;
+            for (std::size_t attempt = 0; attempt != dictionary.size(); ++attempt) {
+                std::string const &source = dictionary[splitmix64(random_state) % dictionary.size()];
+                if (!decode_utf8(source, decoded)) {
+                    std::cerr << "invalid UTF-8 dictionary entry\n";
+                    return 6;
+                }
+                if (supports_mode(decoded, mode)) {
+                    selected = true;
+                    break;
+                }
+            }
+            if (!selected) {
+                std::cerr << "dictionary has no entry suitable for mode " << mode << '\n';
                 return 6;
             }
-            if (mode == "edit1" || mode == "edit2") {
-                std::size_t const first_position = substitute(decoded, splitmix64(random_state));
-                if (mode == "edit2") {
-                    if (decoded.size() > 1) {
-                        std::size_t second_position = splitmix64(random_state) % (decoded.size() - 1);
-                        if (second_position >= first_position) ++second_position;
-                        decoded[second_position] = decoded[second_position] == '~' ? '^' : '~';
-                    }
-                    else
-                        decoded.push_back('~');
-                }
-            }
-            if (mode == "reject") decoded.insert(decoded.begin(), 5, '~');
-            query = encode_utf8(decoded);
+            mutate(decoded, mode, random_state);
+            output << encode_utf8(decoded) << '\n';
         }
         else {
-            if (mode == "edit1" || mode == "edit2") {
-                std::size_t const first_position = substitute(query, splitmix64(random_state));
-                if (mode == "edit2") {
-                    if (query.size() > 1) {
-                        std::size_t second_position = splitmix64(random_state) % (query.size() - 1);
-                        if (second_position >= first_position) ++second_position;
-                        query[second_position] = query[second_position] == '~' ? '^' : '~';
-                    }
-                    else
-                        query.push_back('~');
+            std::string query;
+            bool selected = false;
+            for (std::size_t attempt = 0; attempt != dictionary.size(); ++attempt) {
+                query = dictionary[splitmix64(random_state) % dictionary.size()];
+                if (supports_mode(query, mode)) {
+                    selected = true;
+                    break;
                 }
             }
-            if (mode == "reject") query.insert(0, "~~~~~"); // Beyond four edits from the sampled source word.
+            if (!selected) {
+                std::cerr << "dictionary has no entry suitable for mode " << mode << '\n';
+                return 6;
+            }
+            mutate(query, mode, random_state);
+            output << query << '\n';
         }
-        if (mode != "exact" && mode != "edit1" && mode != "edit2" && mode != "reject") {
-            std::cerr << "unknown mode: " << mode << '\n';
-            return 5;
-        }
-        output << query << '\n';
     }
     return output.good() ? 0 : 6;
 }
