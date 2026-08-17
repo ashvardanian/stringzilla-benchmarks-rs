@@ -426,7 +426,9 @@ fn run_tantivy(dictionary: &[String], queries: &[String], settings: &Settings) -
                 matches_count += matches.len();
                 for address in matches {
                     let id = (u64::from(address.segment_ord) << 32) | u64::from(address.doc_id);
-                    checksum = checksum_id(checksum, id);
+                    // `DocSetCollector` does not promise iteration order. Hash the set commutatively so
+                    // identical matches produce one reproducible checksum across repeats.
+                    checksum = checksum.wrapping_add(id.wrapping_mul(0x9E37_79B1_85EB_CA87));
                 }
             }
             if let Some(error) = failed {
