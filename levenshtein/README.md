@@ -46,63 +46,23 @@ The same complete-output comparison can sweep larger bounds by setting both runn
 
 Published runs use at least 20 measured repetitions, keep raw output, randomize runner order, pin CPU and memory placement, and record compiler versions, dependency revisions, CPU frequency settings, result counts, output bytes, build time, retained index size, peak build memory, and reader scratch. Warm and cold results are never combined into one number.
 
-## Reproducing the correctness check
+## Running the comparison
 
-Build StringZilla first, then compile the query generator and the two complete-output runners from the StringWars root. Pin the RapidFuzz revision used by the final run.
-
-```bash
-cmake -S ../StringZilla -B ../StringZilla/build -DCMAKE_BUILD_TYPE=Release
-cmake --build ../StringZilla/build -j --target stringzillas_cpus_static
-
-g++ -std=c++20 -O3 -DNDEBUG -I ../StringZilla/include \
-    levenshtein/queries.cpp -o levenshtein_queries
-
-g++ -std=c++20 -O3 -DNDEBUG -march=native -DSZ_DYNAMIC_DISPATCH=1 \
-    -I ../StringZilla/include -I ../StringZilla/forkunion/include \
-    levenshtein/stringzilla.cpp ../StringZilla/build/libstringzillas_cpus_static.a \
-    ../StringZilla/build/forkunion/libforkunion_static.a -pthread -o stringzilla_levenshtein
-
-g++ -std=c++20 -O3 -DNDEBUG -march=native -I ../rapidfuzz-cpp \
-    levenshtein/rapidfuzz.cpp -o rapidfuzz_levenshtein
-
-./levenshtein_queries words_alpha.txt queries.txt 10000 mixed 243
-
-SZ_LEVENSHTEIN_MAX_DISTANCE=1 SZ_LEVENSHTEIN_REPEATS=20 \
-    SZ_LEVENSHTEIN_MODES=warm,steady,latency \
-    ./stringzilla_levenshtein words_alpha.txt queries.txt 10000 stringzilla-results
-
-SZ_LEVENSHTEIN_MAX_DISTANCE=2 SZ_LEVENSHTEIN_REPEATS=20 \
-    SZ_LEVENSHTEIN_MODES=warm,steady,latency \
-    ./stringzilla_levenshtein words_alpha.txt queries.txt 10000 stringzilla-results
-
-RF_MAX_DISTANCE=2 RF_REPEATS=20 RF_MODE=materialized \
-    ./rapidfuzz_levenshtein words_alpha.txt queries.txt 10000 rapidfuzz-results
-
-cmp stringzilla-results.k1.bin rapidfuzz-results.k1.bin
-cmp stringzilla-results.k2.bin rapidfuzz-results.k2.bin
-```
-
-To check the larger-bound crossover with one index, run:
+The shared low-bound track expects a unique lowercase ASCII dictionary because that is the common contract supported by all six adapters. From the StringWars root:
 
 ```bash
-SZ_LEVENSHTEIN_INDEX_PLAN=shared SZ_LEVENSHTEIN_MAX_DISTANCE=10 \
-    SZ_LEVENSHTEIN_REPEATS=20 SZ_LEVENSHTEIN_MODES=warm,steady \
-    ./stringzilla_levenshtein words_alpha.txt queries.txt 10000 stringzilla-wide
-
-RF_MAX_DISTANCE=10 RF_REPEATS=20 RF_MODE=materialized \
-    ./rapidfuzz_levenshtein words_alpha.txt queries.txt 10000 rapidfuzz-wide
-
-for k in 1 2 3 4 5 6 7 8 9 10; do
-    cmp "stringzilla-wide.k${k}.bin" "rapidfuzz-wide.k${k}.bin"
-done
+python3 levenshtein/run.py words_alpha.txt \
+    --stringzilla-root ../StringZilla \
+    --rapidfuzz-root ../rapidfuzz-cpp \
+    --cpu 2
 ```
 
-Run the Rust adapters through the normal benchmark target:
+The command builds every adapter, generates 10,000 mixed queries with seed 243, and validates results before recording timings. StringZilla, RapidFuzz, and exact SymSpell must write identical result files at `k=1` and `k=2`. FST, Tantivy, and Lucene must return the same totals. Missing output, zero work, or any mismatch stops the run.
 
-```bash
-RUSTFLAGS="-C target-cpu=native" STRINGWARS_REPEATS=20 \
-    cargo bench --features bench_levenshtein --bench bench_levenshtein -- \
-    words_alpha.txt queries.txt 10000
-```
+The default 20 repetitions run each adapter in a deterministic shuffled order. Every repetition starts a new process. StringZilla uses separate threshold-specific indexes for `k=1` and `k=2` and keeps cold, warm, growable, and single-query latency measurements separate.
 
-The final result tables and raw run artifacts are added only after this protocol passes on every reported machine.
+`target/levenshtein/manifest.json` records input hashes, repository revisions, tool versions, execution order, commands, relevant environment settings, wall time, and peak process memory. The neighboring `logs/` directory keeps the runners' original key-value output. These generated files are archived with a published run instead of committed to the repository.
+
+CI uses the same command with the small dictionary under `levenshtein/data/`, one repetition, and `--validation-only`. `--skip-build` is available when the expected products already exist under the selected build directory.
+
+The larger-bound crossover remains a separate StringZilla and RapidFuzz run. It is not mixed into this command because SymSpell, Tantivy, and Lucene stop at small bounds, and because high-result sweeps answer a different performance question.
