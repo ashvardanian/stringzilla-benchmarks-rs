@@ -1,0 +1,67 @@
+name: Levenshtein dictionary search
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/levenshtein.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "levenshtein/**"
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/levenshtein.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "levenshtein/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: levenshtein-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  exact-results:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: grouville/StringZilla
+          ref: 19b7faed60051867cb3bf8b1367d3da84bc1b209
+          path: dependencies/StringZilla
+          submodules: recursive
+
+      - uses: actions/checkout@v4
+        with:
+          repository: rapidfuzz/rapidfuzz-cpp
+          ref: b5830af53bd1b3c7460a8de1e9f7095df99b3470
+          path: dependencies/rapidfuzz-cpp
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Validate every adapter
+        run: |
+          python3 levenshtein/run.py levenshtein/data/ci-dictionary.txt \
+            --stringzilla-root dependencies/StringZilla \
+            --rapidfuzz-root dependencies/rapidfuzz-cpp \
+            --build-dir target/levenshtein-ci \
+            --query-count 100 \
+            --repeats 1 \
+            --validation-only
+
+      - name: Keep validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: levenshtein-validation
+          path: |
+            target/levenshtein-ci/manifest.json
+            target/levenshtein-ci/logs/
